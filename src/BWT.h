@@ -1,0 +1,1 @@
+#include "../index/BWT.h"
