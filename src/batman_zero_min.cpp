@@ -12,6 +12,7 @@
 #include <iostream>
 #include <iomanip>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <chrono>
 
@@ -26,6 +27,7 @@ constexpr int MAXTAG = 4096;
 constexpr int MAX_MISMATCHES_BOUND = 16;
 constexpr int SAINTERVAL = 8;
 constexpr int BRANCHTHRESHOLD = 0;
+constexpr unsigned char NO_BASE = 4;
 
 struct SARange {
     unsigned long Start;
@@ -33,6 +35,7 @@ struct SARange {
     int Level;
     char Mismatches;
     unsigned char Skip;
+    unsigned char Forbidden_Base = NO_BASE;  // threshold reject: base already tried at Level
     int Tag;
     unsigned char Mismatch_Pos[MAX_MISMATCHES_BOUND];
     unsigned Mismatch_Char;
@@ -44,10 +47,10 @@ struct Range {
     int Label;
 };
 
-// Output of Search_Forwards. The caller clears it before each search.
+// Output of Extend_Right/Extend_Left. The caller clears it before each search.
 struct ForwardResults {
     std::vector<SARange> hits;        // exactly Count mismatches
-    std::vector<SARange> mismatches;  // Count+1 mismatches; resume at Level+1 (complete if Level == StringLength)
+    std::vector<SARange> mismatches;  // deferred parents at Count mismatches: resume at Level, skipping Forbidden_Base
     unsigned long hitCount = 0;       // locations in hits
 };
 
@@ -193,8 +196,50 @@ void Build_Tables(ActiveBWT* fmi) {
     }
 }
 
-bool Search_Forwards_Exact(const unsigned char* currentTag, SARange& tag, int stringLength, ActiveBWT* fmi) {
-    unsigned long index,first, last;
+// Search_Right along a single SA path (tag.End == tag.Start or tag.Skip).
+// Kept out of line: inlining it into the read loop costs ~10%.
+__attribute__((noinline)) bool Search_Right_Singleton(std::string_view currentTag, SARange& tag, ActiveBWT* fmi) {
+    const int stringLength = static_cast<int>(currentTag.size());
+    unsigned long index;
+    unsigned int now;
+
+    if (tag.Start % SAINTERVAL == 0 && !tag.Skip) {
+        tag.Skip++;
+        tag.End = tag.Start;
+    }
+
+    for (;;) {
+        index = tag.Start;
+        if (index >= fmi->inverseSa0) {
+            index--;
+        }
+        now = fmi->bwtCode[index / 16] << ((index % 16) * 2) >> (BITS_IN_WORD - 2);
+        if (static_cast<unsigned char>(currentTag[tag.Level - 1]) == now) {
+            tag.Start = fmi->cumulativeFreq[now] + BWTOccValue(fmi, tag.Start, now) + 1;
+            if (tag.Skip) {
+                tag.Skip++;
+            } else if (tag.Start % SAINTERVAL == 0) {
+                tag.Skip++;
+                tag.End = tag.Start;
+            }
+
+            if (tag.Level == stringLength) {
+                //if (!tag.Skip) {
+                    tag.End = tag.Start;
+                //}
+                return true;
+            }
+            tag.Level++;
+            continue;
+        }
+        return false;
+    }
+}
+
+// Extends tag to the right over currentTag[Level-1] with no mismatches.
+bool Search_Right(std::string_view currentTag, SARange& tag, ActiveBWT* fmi) {
+    const int stringLength = static_cast<int>(currentTag.size());
+    unsigned long first, last;
     unsigned int now;
 
     if (!tag.Start) {
@@ -203,37 +248,7 @@ bool Search_Forwards_Exact(const unsigned char* currentTag, SARange& tag, int st
 
     for (;;) {
         if (tag.End == tag.Start || tag.Skip) {
-            if (tag.Start % SAINTERVAL == 0 && !tag.Skip) {
-                tag.Skip++;
-                tag.End = tag.Start;
-            }
-
-            for (;;) {
-                index = tag.Start;
-                if (index >= fmi->inverseSa0) {
-                    index--;
-                }
-                now = fmi->bwtCode[index / 16] << ((index % 16) * 2) >> (BITS_IN_WORD - 2);
-                if (currentTag[tag.Level - 1] == now) {
-                    tag.Start = fmi->cumulativeFreq[now] + BWTOccValue(fmi, tag.Start, now) + 1;
-                    if (tag.Skip) {
-                        tag.Skip++;
-                    } else if (tag.Start % SAINTERVAL == 0) {
-                        tag.Skip++;
-                        tag.End = tag.Start;
-                    }
-
-                    if (tag.Level == stringLength) {
-                        //if (!tag.Skip) {
-                            tag.End = tag.Start;
-                        //}
-                        return true;
-                    }
-                    tag.Level++;
-                    continue;
-                }
-                return false;
-            }
+            return Search_Right_Singleton(currentTag, tag, fmi);
         } else {
             if (tag.End - tag.Start < BRANCHTHRESHOLD) {
                 Branch_Characters[0] = 0;
@@ -314,8 +329,9 @@ void Branch_Detect (const struct SARange Tag,BWT *fmi,int Start)
 
 	}
 }
-void Search_Forwards_OneSA(const unsigned char* Current_Tag,struct SARange & Tag,int Count,int Start,int StringLength,BWT *fmi,ForwardResults& Out)
+void Extend_Right_Singleton(std::string_view Current_Tag,int Offset,struct SARange & Tag,int Count,BWT *fmi,ForwardResults& Out)
 {
+	const int StringLength=static_cast<int>(Current_Tag.size());
 	unsigned long Index,Now;
 	if (Tag.Start==0) return;
 	if(Tag.Start % SAINTERVAL == 0 && !Tag.Skip) 
@@ -330,6 +346,16 @@ void Search_Forwards_OneSA(const unsigned char* Current_Tag,struct SARange & Tag
 		Index=Tag.Start;
 		if (Index >= fmi->inverseSa0) Index--;//adjust for missing $
 		Now=fmi->bwtCode[(Index) / 16] << (((Index) % 16) * 2)>> (BITS_IN_WORD - 2);
+		if (Now==Tag.Forbidden_Base) return;//already tried by the pass that deferred this range
+		const unsigned char Expected=Current_Tag[Tag.Level-1];
+		if (Now!=Expected && Tag.Mismatches==Count)//at threshold: defer the parent
+		{
+			if (!Tag.Skip) Tag.End=Tag.Start;
+			Tag.Forbidden_Base=Expected;
+			Out.mismatches.push_back(Tag);
+			return;
+		}
+		Tag.Forbidden_Base=NO_BASE;
 		Tag.Start = fmi->cumulativeFreq[Now] + BWTOccValue(fmi, Tag.Start, Now) + 1;
 
 		if (Tag.Skip) Tag.Skip++;
@@ -339,11 +365,11 @@ void Search_Forwards_OneSA(const unsigned char* Current_Tag,struct SARange & Tag
 			Tag.End=Tag.Start;
 		}
 
-		if (Current_Tag[Tag.Level+Start]!=Now)
+		if (Expected!=Now)
 		{
 
 			Tag.Mismatch_Char=Tag.Mismatch_Char | (Now<<Tag.Mismatches*2);
-			Tag.Mismatch_Pos[Tag.Mismatches]=(Start+Tag.Level);
+			Tag.Mismatch_Pos[Tag.Mismatches]=(Offset+Tag.Level-1);
 			Tag.Mismatches++;
 			
 		}
@@ -363,22 +389,20 @@ void Search_Forwards_OneSA(const unsigned char* Current_Tag,struct SARange & Tag
 			}
 			else {Tag.Level++;continue;}
 		}
-		else//log 2 mismatches
-		{
-			if (!Tag.Skip) Tag.End=Tag.Start;
-			Out.mismatches.push_back(Tag);
-			return;
-		}
 	}
 }
 
-// Extends Tag allowing up to Count mismatches. Ranges with exactly Count
-// mismatches go to Out.hits, ranges needing one more to Out.mismatches.
+// Extends Tag to the right over Current_Tag[Level-1] allowing up to Count
+// mismatches. Offset is Current_Tag's position in the read (for Mismatch_Pos).
+// Ranges with exactly Count mismatches go to Out.hits. Ranges already at Count
+// mismatches only extend with the read's base; where that loses rows, the
+// parent goes to Out.mismatches with Forbidden_Base set, to be resumed with a
+// larger Count (as minimal_bwt/src/mismatch_search.cpp).
 // Stops once Out.hitCount reaches MaxHits (0 = no limit).
-void Search_Forwards(const unsigned char* Current_Tag,const struct SARange & Tag,int Count,int Start,int StringLength,BWT *fmi,ForwardResults& Out,unsigned MaxHits)
+void Extend_Right(std::string_view Current_Tag,int Offset,const struct SARange & Tag,int Count,BWT *fmi,ForwardResults& Out,unsigned MaxHits)
 {
 	if (!Tag.Start) return;
-	Start=Start-2;//Adjust for offset difference
+	const int StringLength=static_cast<int>(Current_Tag.size());
 	std::vector<SARange> Stack;
 	Stack.push_back(Tag);
 	struct SARange Range,Temp_Range;
@@ -388,25 +412,50 @@ void Search_Forwards(const unsigned char* Current_Tag,const struct SARange & Tag
 		Stack.pop_back();		//Pop the range
 		if (Range.End==Range.Start || Range.Skip)//does this SArange have only one branch?
 		{
-			Search_Forwards_OneSA(Current_Tag,Range,Count,Start,StringLength,fmi,Out);
+			Extend_Right_Singleton(Current_Tag,Offset,Range,Count,fmi,Out);
 			if(MaxHits && Out.hitCount>=MaxHits) return;
+		}
+		else if (Range.Mismatches==Count)//at threshold: exact step only
+		{
+			const unsigned char Expected=Current_Tag[Range.Level-1];
+			Temp_Range=Range;
+			Get_SARange_Fast(Expected,Temp_Range,fmi);
+			if (!Temp_Range.Start || Temp_Range.End-Temp_Range.Start!=Range.End-Range.Start)
+			{
+				Range.Forbidden_Base=Expected;//other bases remain: defer the parent
+				Out.mismatches.push_back(Range);
+			}
+			if (!Temp_Range.Start) continue;
+			Temp_Range.Forbidden_Base=NO_BASE;
+			if(Temp_Range.Level== StringLength)
+			{
+				Out.hits.push_back(Temp_Range);
+				Out.hitCount += Temp_Range.Skip ? 1 : Temp_Range.End-Temp_Range.Start+1;
+				if (MaxHits && Out.hitCount>=MaxHits) return;
+			}
+			else
+			{
+				Temp_Range.Level++;
+				Stack.push_back(Temp_Range);
+			}
 		}
 		else
 		{
-			Branch_Detect(Range,fmi,Start);//One_Branch(Range,revfmi);
+			Branch_Detect(Range,fmi,Offset);//One_Branch(Range,revfmi);
 			for(int Branch=0;Branch<4;Branch++)
 			{
-				if (Branch_Characters[Branch])//This character actually branches
+				if (Branch_Characters[Branch] && Branch!=Range.Forbidden_Base)//This character actually branches
 				{
 					Temp_Range=Range;
+					Temp_Range.Forbidden_Base=NO_BASE;
 					Temp_Range.Start = Branch_Ranges[Branch].Start;//fmi->cumulativeFreq[Branch] + BWTOccValue(fmi, Temp_Range.Start, Branch) + 1;
 					Temp_Range.End = Branch_Ranges[Branch].End;//Temp_Range.Start + Branch_Characters[Branch]-1;// Calculate SAranges
 
-					if (Current_Tag[Temp_Range.Level+Start]!=Branch)
+					if (Current_Tag[Temp_Range.Level-1]!=Branch)
 					{
 
 						Temp_Range.Mismatch_Char=Temp_Range.Mismatch_Char | (Branch<<Temp_Range.Mismatches*2);
-						Temp_Range.Mismatch_Pos[Temp_Range.Mismatches]=(Start+Temp_Range.Level);
+						Temp_Range.Mismatch_Pos[Temp_Range.Mismatches]=(Offset+Temp_Range.Level-1);
 						Temp_Range.Mismatches++;
 
 					}
@@ -431,11 +480,6 @@ void Search_Forwards(const unsigned char* Current_Tag,const struct SARange & Tag
 							Stack.push_back(Temp_Range);//Push range
 						}
 					}
-					else
-					{
-						Out.mismatches.push_back(Temp_Range);
-						continue;
-					}
 				} 
 			}
 		}
@@ -443,53 +487,64 @@ void Search_Forwards(const unsigned char* Current_Tag,const struct SARange & Tag
 	return;
 }
 
-// Extends Tag backwards over Current_Tag[Start-Level] with no mismatches.
-// On return Tag.Start==0 if there is no match, otherwise Tag holds the SA range.
-void Search_Backwards_Exact(const unsigned char* Current_Tag,struct SARange & Tag,int Start,int StringLength,BWT *fmi)
+// Search_Left along a single SA path (Tag.End==Tag.Start or Tag.Skip).
+// Kept out of line, as Search_Right_Singleton.
+__attribute__((noinline)) void Search_Left_Singleton(std::string_view Current_Tag,struct SARange & Tag,BWT *fmi)
 {
+	const int StringLength=static_cast<int>(Current_Tag.size());
+	int Level=Tag.Level;
+	unsigned long Index,Now;
 
-	int Level;
-	unsigned long Index,Now,First,Last;
+	if(Tag.Start % SAINTERVAL == 0 && !Tag.Skip)
+	{
+		Tag.Skip++;
+		Tag.End=Tag.Start;
+	}
+	for(;;)
+	{
+		Index=Tag.Start;
+		if (Index >= fmi->inverseSa0) Index--;//adjust for missing $
+		Now=fmi->bwtCode[(Index) / 16] << (((Index) % 16) * 2)>> (BITS_IN_WORD - 2);//FMIBwtValue(fmi,Index);
+		if (static_cast<unsigned char>(Current_Tag[StringLength-Level]) == Now)
+		{
+			Tag.Start = fmi->cumulativeFreq[Now] + BWTOccValue(fmi, Tag.Start, Now) + 1;
+
+			if (Tag.Skip) Tag.Skip++;
+			else if(Tag.Start % SAINTERVAL == 0)
+			{
+				Tag.Skip++;Tag.End=Tag.Start;
+			}
+
+			if(Level== StringLength)//no need to print as we are still halfway..
+			{
+				if (!Tag.Skip) Tag.End=Tag.Start;
+				return;
+			}
+			else {Level++;continue;}
+		}
+		else
+		{
+			Tag.Start=0;//Tag.End=0;
+			return;
+		}
+	}
+}
+
+// Extends Tag to the left over Current_Tag[size-Level] with no mismatches.
+// On return Tag.Start==0 if there is no match, otherwise Tag holds the SA range.
+void Search_Left(std::string_view Current_Tag,struct SARange & Tag,BWT *fmi)
+{
+	const int StringLength=static_cast<int>(Current_Tag.size());
+
+	unsigned long Now,First,Last;
 	if (!Tag.Start) return;
 
 	for(;;)
 	{
 		if(Tag.End==Tag.Start || Tag.Skip)//Only one branch?
 		{
-			Level=Tag.Level;
-			if(Tag.Start % SAINTERVAL == 0 && !Tag.Skip)
-			{
-				Tag.Skip++;
-				Tag.End=Tag.Start;
-			}
-			for(;;)
-			{
-				Index=Tag.Start;
-				if (Index >= fmi->inverseSa0) Index--;//adjust for missing $
-				Now=fmi->bwtCode[(Index) / 16] << (((Index) % 16) * 2)>> (BITS_IN_WORD - 2);//FMIBwtValue(fmi,Index);
-				if (Current_Tag[Start-Level] == Now)
-				{
-					Tag.Start = fmi->cumulativeFreq[Now] + BWTOccValue(fmi, Tag.Start, Now) + 1;
-
-					if (Tag.Skip) Tag.Skip++;
-					else if(Tag.Start % SAINTERVAL == 0)
-					{
-						Tag.Skip++;Tag.End=Tag.Start;
-					}
-
-					if(Level== StringLength)//no need to print as we are still halfway..
-					{
-						if (!Tag.Skip) Tag.End=Tag.Start;
-						return;
-					}
-					else {Level++;continue;}
-				}
-				else
-				{
-					Tag.Start=0;//Tag.End=0;
-					return;
-				}
-			}
+			Search_Left_Singleton(Current_Tag,Tag,fmi);
+			return;
 		}
 		else
 		{
@@ -504,7 +559,7 @@ void Search_Backwards_Exact(const unsigned char* Current_Tag,struct SARange & Ta
 					Branch_Characters[Now]++;
 				}
 
-				Now=Current_Tag[Start-Tag.Level];
+				Now=Current_Tag[StringLength-Tag.Level];
 				if (Branch_Characters[Now])//we have a match...
 				{
 
@@ -517,7 +572,7 @@ void Search_Backwards_Exact(const unsigned char* Current_Tag,struct SARange & Ta
 					Tag.Start=0;//Tag.End=0;
 				}
 			}
-			else Get_SARange_Fast(Current_Tag[Start-Tag.Level],Tag,fmi);
+			else Get_SARange_Fast(Current_Tag[StringLength-Tag.Level],Tag,fmi);
 
 			if (Tag.Start!=0)
 			{
@@ -536,8 +591,9 @@ void Search_Backwards_Exact(const unsigned char* Current_Tag,struct SARange & Ta
 	}
 }
 
-void Search_Backwards_OneSA(const unsigned char* Current_Tag,struct SARange & Tag,int Count,int Start,int StringLength,BWT *fmi,ForwardResults& Out)
+void Extend_Left_Singleton(std::string_view Current_Tag,int Offset,struct SARange & Tag,int Count,BWT *fmi,ForwardResults& Out)
 {
+	const int StringLength=static_cast<int>(Current_Tag.size());
 	unsigned long Index,Now;
 	if (Tag.Start==0) return;
 	if(Tag.Start % SAINTERVAL == 0 && !Tag.Skip)
@@ -551,6 +607,16 @@ void Search_Backwards_OneSA(const unsigned char* Current_Tag,struct SARange & Ta
 		Index=Tag.Start;
 		if (Index >= fmi->inverseSa0) Index--;//adjust for missing $
 		Now=fmi->bwtCode[(Index) / 16] << (((Index) % 16) * 2)>> (BITS_IN_WORD - 2);//FMIBwtValue(fmi,Index);
+		if (Now==Tag.Forbidden_Base) return;//already tried by the pass that deferred this range
+		const unsigned char Expected=Current_Tag[StringLength-Tag.Level];
+		if (Now!=Expected && Tag.Mismatches==Count)//at threshold: defer the parent
+		{
+			if (!Tag.Skip) Tag.End=Tag.Start;
+			Tag.Forbidden_Base=Expected;
+			Out.mismatches.push_back(Tag);
+			return;
+		}
+		Tag.Forbidden_Base=NO_BASE;
 		Tag.Start = fmi->cumulativeFreq[Now] + BWTOccValue(fmi, Tag.Start, Now) + 1;
 
 		if (Tag.Skip) Tag.Skip++;
@@ -560,10 +626,10 @@ void Search_Backwards_OneSA(const unsigned char* Current_Tag,struct SARange & Ta
 			Tag.End=Tag.Start;
 		}
 
-		if (Current_Tag[Start-Tag.Level] != Now)
+		if (Expected!=Now)
 		{
 			Tag.Mismatch_Char=Tag.Mismatch_Char | (Now<<Tag.Mismatches*2);
-			Tag.Mismatch_Pos[Tag.Mismatches]=(Start-Tag.Level);
+			Tag.Mismatch_Pos[Tag.Mismatches]=(Offset+StringLength-Tag.Level);
 			Tag.Mismatches++;
 
 		}
@@ -583,20 +649,15 @@ void Search_Backwards_OneSA(const unsigned char* Current_Tag,struct SARange & Ta
 			}
 			else {Tag.Level++;continue;}
 		}
-		else
-		{
-			if (!Tag.Skip) Tag.End=Tag.Start;
-			Out.mismatches.push_back(Tag);
-			return;
-		}
 	}
 }
 
-// Extends Tag backwards over Current_Tag[Start-Level] allowing up to Count
-// mismatches. Results as for Search_Forwards.
-void Search_Backwards(const unsigned char* Current_Tag,const struct SARange & Tag,int Count,int Start,int StringLength,BWT *fmi,ForwardResults& Out,unsigned MaxHits)
+// Extends Tag to the left over Current_Tag[size-Level] allowing up to Count
+// mismatches. Offset and results as for Extend_Right.
+void Extend_Left(std::string_view Current_Tag,int Offset,const struct SARange & Tag,int Count,BWT *fmi,ForwardResults& Out,unsigned MaxHits)
 {
 	if (!Tag.Start) return;
+	const int StringLength=static_cast<int>(Current_Tag.size());
 	std::vector<SARange> Stack;
 	Stack.push_back(Tag);
 	struct SARange Range,Temp_Range;
@@ -606,24 +667,49 @@ void Search_Backwards(const unsigned char* Current_Tag,const struct SARange & Ta
 		Stack.pop_back();	//Pop the range
 		if (Range.End==Range.Start || Range.Skip)//does this SArange have only one branch?
 		{
-			Search_Backwards_OneSA(Current_Tag,Range,Count,Start,StringLength,fmi,Out);
+			Extend_Left_Singleton(Current_Tag,Offset,Range,Count,fmi,Out);
 			if(MaxHits && Out.hitCount>=MaxHits) return;
+		}
+		else if (Range.Mismatches==Count)//at threshold: exact step only
+		{
+			const unsigned char Expected=Current_Tag[StringLength-Range.Level];
+			Temp_Range=Range;
+			Get_SARange_Fast(Expected,Temp_Range,fmi);
+			if (!Temp_Range.Start || Temp_Range.End-Temp_Range.Start!=Range.End-Range.Start)
+			{
+				Range.Forbidden_Base=Expected;//other bases remain: defer the parent
+				Out.mismatches.push_back(Range);
+			}
+			if (!Temp_Range.Start) continue;
+			Temp_Range.Forbidden_Base=NO_BASE;
+			if(Temp_Range.Level== StringLength)
+			{
+				Out.hits.push_back(Temp_Range);
+				Out.hitCount += Temp_Range.Skip ? 1 : Temp_Range.End-Temp_Range.Start+1;
+				if (MaxHits && Out.hitCount>=MaxHits) return;
+			}
+			else
+			{
+				Temp_Range.Level++;
+				Stack.push_back(Temp_Range);
+			}
 		}
 		else
 		{
-			Branch_Detect(Range,fmi,Start);
+			Branch_Detect(Range,fmi,Offset);
 			for(int Branch=0;Branch<4;Branch++)
 			{
-				if (Branch_Characters[Branch])//This character actually branches
+				if (Branch_Characters[Branch] && Branch!=Range.Forbidden_Base)//This character actually branches
 				{
 					Temp_Range=Range;//adjust
+					Temp_Range.Forbidden_Base=NO_BASE;
 					Temp_Range.Start = Branch_Ranges[Branch].Start;//fmi->cumulativeFreq[Branch] + BWTOccValue(fmi, Temp_Range.Start, Branch) + 1;
 					Temp_Range.End = Branch_Ranges[Branch].End;//Temp_Range.Start + Branch_Characters[Branch]-1;// Calculate SAranges
 
-					if (Current_Tag[Start-Temp_Range.Level] != Branch)
+					if (Current_Tag[StringLength-Temp_Range.Level] != Branch)
 					{
 						Temp_Range.Mismatch_Char=Temp_Range.Mismatch_Char | (Branch<<Temp_Range.Mismatches*2);
-						Temp_Range.Mismatch_Pos[Temp_Range.Mismatches]=Start-Temp_Range.Level;
+						Temp_Range.Mismatch_Pos[Temp_Range.Mismatches]=Offset+StringLength-Temp_Range.Level;
 						Temp_Range.Mismatches++;
 					}
 
@@ -644,11 +730,6 @@ void Search_Backwards(const unsigned char* Current_Tag,const struct SARange & Ta
 							Temp_Range.Level++;
 							Stack.push_back(Temp_Range);//Push range
 						}
-					}
-					else
-					{
-						Out.mismatches.push_back(Temp_Range);
-						continue;
 					}
 				}
 			}
@@ -844,7 +925,7 @@ int main(int argc, char** argv) {
 
     std::string id;
     std::string seq;
-    unsigned char encoded[MAXTAG] = {0};
+    std::string read;  // base codes 0-3
     bool initialized = false;
     uint64_t records = 0;
     uint64_t reportedHits = 0;
@@ -865,6 +946,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
             const auto tableStart = Clock::now();
+            read.resize(STRINGLENGTH);
             Build_Tables(revfmi);
             tableBuildSeconds += std::chrono::duration<double>(Clock::now() - tableStart).count();
             initialized = true;
@@ -887,7 +969,7 @@ int main(int argc, char** argv) {
                 valid = false;
                 break;
             }
-            encoded[i] = static_cast<unsigned char>(code);
+            read[i] = static_cast<char>(code);
         }
 
         if (!valid) {
@@ -900,11 +982,12 @@ int main(int argc, char** argv) {
             continue;
         }
 
+        const std::string_view all(read);
         int c;
         if (LOOKUPSIZE == 3) {
-            c = encoded[0] | (encoded[1] << 2) | (encoded[2] << 4);
+            c = read[0] | (read[1] << 2) | (read[2] << 4);
         } else {
-            c = encoded[0] | (encoded[1] << 2) | (encoded[2] << 4) | (encoded[3] << 6) | (encoded[4] << 8) | (encoded[5] << 10);
+            c = read[0] | (read[1] << 2) | (read[2] << 4) | (read[3] << 6) | (read[4] << 8) | (read[5] << 10);
         }
 
         SARange range{};
@@ -917,6 +1000,8 @@ int main(int argc, char** argv) {
 
         const int LH = STRINGLENGTH / 2;
         const int RH = STRINGLENGTH - LH;
+        const std::string_view lh = all.substr(0, LH);
+        const std::string_view rh = all.substr(LH);
         if (maxMismatches == 1 && LH > LOOKUPSIZE) {
             // BatMis one-mismatch scan: exact 0|0, then left half exact with a
             // mismatch in the right half (0|1), then right half exact with a
@@ -926,11 +1011,11 @@ int main(int argc, char** argv) {
 
             // 0|0, stopping at the left half to keep its exact range for 0|1.
             SARange leftRange{};
-            bool found = Search_Forwards_Exact(encoded, range, LH, revfmi) && range.Start != 0;
+            bool found = Search_Right(lh, range, revfmi) && range.Start != 0;
             if (found) {
                 leftRange = range;
-                range.Level++;
-                found = Search_Forwards_Exact(encoded, range, STRINGLENGTH, revfmi) && range.Start != 0;
+                range.Level = 1;
+                found = Search_Right(rh, range, revfmi) && range.Start != 0;
             }
             if (found) {
                 unsigned long hitCount = range.Skip ? 1UL : (range.End >= range.Start ? (range.End - range.Start + 1UL) : 0UL);
@@ -953,25 +1038,25 @@ int main(int argc, char** argv) {
                 leftRange.Level = 1;
                 leftRange.Mismatches = 0;
                 leftRange.Mismatch_Char = 0;
-                Search_Forwards(encoded, leftRange, 1, LH + 1, RH, revfmi, rightMismatch,
-                                maxHits ? maxHits - readHits : 0);
+                Extend_Right(rh, LH, leftRange, 1, revfmi, rightMismatch,
+                             maxHits ? maxHits - readHits : 0);
             }
 
             // 1|0
             if (maxHits == 0 || readHits + rightMismatch.hitCount < maxHits) {
                 int bc = 0;
                 for (int i = 0; i < LOOKUPSIZE; i++) {
-                    bc |= encoded[STRINGLENGTH - 1 - i] << (2 * i);
+                    bc |= rh[RH - 1 - i] << (2 * i);
                 }
                 SARange rightRange{};
                 rightRange.Start = Backward_Start_LookupX[bc];
                 rightRange.End = Backward_End_LookupX[bc];
                 rightRange.Level = LOOKUPSIZE + 1;
-                Search_Backwards_Exact(encoded, rightRange, STRINGLENGTH, RH, fwfmi);
+                Search_Left(rh, rightRange, fwfmi);
                 if (rightRange.Start) {
                     rightRange.Level = 1;
-                    Search_Backwards(encoded, rightRange, 1, LH, LH, fwfmi, leftMismatch,
-                                     maxHits ? maxHits - readHits - rightMismatch.hitCount : 0);
+                    Extend_Left(lh, 0, rightRange, 1, fwfmi, leftMismatch,
+                                maxHits ? maxHits - readHits - rightMismatch.hitCount : 0);
                 }
             }
 
@@ -1004,7 +1089,7 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        bool found = Search_Forwards_Exact(encoded, range, STRINGLENGTH, revfmi);
+        bool found = Search_Right(all, range, revfmi);
         if (!found || range.Start == 0) {
             searchSeconds += std::chrono::duration<double>(Clock::now() - searchStart).count();
             if (!quiet) {
