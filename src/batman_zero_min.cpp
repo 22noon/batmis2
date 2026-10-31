@@ -1,8 +1,12 @@
 // batman_zero_min: exact-match search using the native BatMis FM index
 // (rev<genome>.bwt/.fmv built by index/bwt_build_index). With -n 1 it also
 // finds one-mismatch hits, using the forward index <genome>.bwt/.fmv too.
+// By default it also loads the SA samples (.sa) and the packed genome (.pac):
+// a single-row path that reaches a sampled row is finished by comparing the read
+// with the genome there (see Locate). --no-ref skips them to save memory.
 // The BWA-index variant lives in batman_zero_min_bwa.cpp.
 // Optional build variant: -DBATMAN_ZERO_MIN_USE_PAIRED_RANK.
+#include <algorithm>
 #include <cassert>
 #include <cctype>
 #include <cstdio>
@@ -42,11 +46,12 @@ struct SARange {
     unsigned long End;
     int Level;
     char Mismatches;
-    unsigned char Skip;
+    unsigned char Skip;          // nonzero: single row; with the reference, located (Pos valid)
     unsigned char Forbidden_Base = NO_BASE;  // threshold reject: base already tried at Level
     int Tag;
     unsigned char Mismatch_Pos[MAX_MISMATCHES_BOUND];
     unsigned Mismatch_Char;
+    unsigned long Pos;           // located: forward-genome start of the read
 };
 
 struct Range {
@@ -77,6 +82,12 @@ unsigned* Backward_End_LookupX = nullptr;
 unsigned Branch_Characters[4] = {0, 0, 0, 0};
 SARange Branch_Ranges[4];
 
+// Reference for located singletons (see Locate). Off with --no-ref.
+bool Use_Ref = false;
+std::vector<uint8_t> Pac;             // forward genome (.pac): 2 bits a base, first base in bits 7-6, 16 bytes of padding
+unsigned long Text_Length = 0;
+uint64_t Read_Packed[MAXTAG / 32 + 1];  // current read: 32 bases a word, first base in bits 63-62
+
 int EncodeBase(char c) {
     switch (std::toupper(static_cast<unsigned char>(c))) {
         case 'A': return 0;
@@ -87,11 +98,79 @@ int EncodeBase(char c) {
     }
 }
 
-ActiveBWT* initFMI(const char* bwtCodeFileName, const char* bwtOccValueFileName) {
+ActiveBWT* initFMI(const char* bwtCodeFileName, const char* bwtOccValueFileName, const char* saValueFileName = nullptr) {
     const int poolSize = 524288;
     MMMasterInitialize(3, 0, FALSE, nullptr);
     mmPool = MMPoolCreate(poolSize);
-    return BWTLoad(mmPool, bwtCodeFileName, bwtOccValueFileName, nullptr, nullptr, nullptr, nullptr);
+    return BWTLoad(mmPool, bwtCodeFileName, bwtOccValueFileName, saValueFileName, nullptr, nullptr, nullptr);
+}
+
+void Pack_Read(std::string_view Read) {
+    std::memset(Read_Packed, 0, (Read.size() + 31) / 32 * sizeof(uint64_t));
+    for (std::size_t i = 0; i < Read.size(); i++) {
+        Read_Packed[i / 32] |= static_cast<uint64_t>(Read[i]) << (62 - 2 * (i % 32));
+    }
+}
+
+// Mismatches between read[A..B) and genome[S+A..S+B), 32 bases at a time:
+// XOR with the genome, fold each base's two bits into one, popcount.
+unsigned Genome_Mismatches(unsigned long S, int A, int B) {
+    unsigned D = 0;
+    for (int W = A / 32; W * 32 < B; W++) {
+        const unsigned long G0 = S + W * 32;
+        const uint8_t* P = Pac.data() + G0 / 4;
+        uint64_t G;
+        std::memcpy(&G, P, 8);
+        G = __builtin_bswap64(G);
+        const unsigned Shift = 2 * (G0 % 4);
+        if (Shift) G = (G << Shift) | (P[8] >> (8 - Shift));
+        uint64_t X = G ^ Read_Packed[W];
+        X = (X | (X >> 1)) & 0x5555555555555555ULL;	// low bit of each pair: base differs
+        const int Lo = std::max(A - W * 32, 0), Hi = std::min(B - W * 32, 32);
+        const uint64_t Mask = (~0ULL >> (2 * Lo)) & (Hi == 32 ? ~0ULL : ~(~0ULL >> (2 * Hi)));
+        D += __builtin_popcountll(X & Mask);
+    }
+    return D;
+}
+
+// A singleton path at a sampled row (Start % SAINTERVAL == 0) can stop walking: the
+// stored SA value gives the read's genome position, and the rest of the read is
+// compared with the packed genome. Done bases of the segment read[Offset..Offset+Len)
+// are matched. Right: revfmi, which indexes the reversed genome; the row stands for
+// read[0..Offset+Done). Otherwise fwfmi; the row stands for read[Offset+Len-Done..).
+// Returns false if the read would run off the genome (where the walk meets $).
+bool Locate(const ActiveBWT* fmi, SARange& Tag, bool Right, int Offset, int Len, int Done) {
+    const long P = fmi->saValue[Tag.Start / SAINTERVAL];
+    const long S = Right ? static_cast<long>(Text_Length) - (Offset + Done) - P : P - (Offset + Len - Done);
+    Tag.Skip = 1;
+    Tag.End = Tag.Start;
+    if (S < 0 || S + STRINGLENGTH > static_cast<long>(Text_Length)) return false;
+    Tag.Pos = S;
+    return true;
+}
+
+// Mismatches in the part of the segment a located Tag has not matched yet.
+unsigned Rest_Mismatches(const SARange& Tag, bool Right, int Offset, int Len, int Done) {
+    return Right ? Genome_Mismatches(Tag.Pos, Offset + Done, Offset + Len)
+                 : Genome_Mismatches(Tag.Pos, Offset, Offset + Len - Done);
+}
+
+// Search_Right/Search_Left at a sampled row: matches if the rest of the segment does.
+bool Search_Located(const ActiveBWT* fmi, SARange& Tag, bool Right, int Offset, int Len, int Done) {
+    return Locate(fmi, Tag, Right, Offset, Len, Done) && Rest_Mismatches(Tag, Right, Offset, Len, Done) == 0;
+}
+
+// Extend_Right/Extend_Left for a located Tag, whose first Level-1 segment bases are
+// matched with Mismatches mismatches. As the walk would: a hit at exactly Count
+// mismatches; above Count, deferred to be resumed with a larger Count.
+void Extend_Located(const SARange& Tag, bool Right, int Offset, int Len, int Count, ForwardResults& Out) {
+    const unsigned D = Tag.Mismatches + Rest_Mismatches(Tag, Right, Offset, Len, Tag.Level - 1);
+    if (D == static_cast<unsigned>(Count)) {
+        Out.hits.push_back(Tag);
+        Out.hitCount++;
+    } else if (D > static_cast<unsigned>(Count)) {
+        Out.mismatches.push_back(Tag);
+    }
 }
 
 // Prefetches the occurrence and BWT words BWTOccValue reads for row Index
@@ -277,12 +356,17 @@ void Build_Tables(ActiveBWT* fmi) {
 
 // Search_Right along a single SA path (tag.End == tag.Start or tag.Skip).
 // Kept out of line: inlining it into the read loop costs ~10%.
-__attribute__((noinline)) bool Search_Right_Singleton(std::string_view currentTag, SARange& tag, ActiveBWT* fmi) {
+__attribute__((noinline)) bool Search_Right_Singleton(std::string_view currentTag, int offset, SARange& tag, ActiveBWT* fmi) {
     const int stringLength = static_cast<int>(currentTag.size());
     unsigned long index;
     unsigned int now;
 
     if (tag.Start % SAINTERVAL == 0 && !tag.Skip) {
+        if (Use_Ref) {
+            if (!Search_Located(fmi, tag, true, offset, stringLength, tag.Level - 1)) return false;
+            tag.Level = stringLength;
+            return true;
+        }
         tag.Skip++;
         tag.End = tag.Start;
     }
@@ -298,9 +382,12 @@ __attribute__((noinline)) bool Search_Right_Singleton(std::string_view currentTa
         const unsigned base = Read_Base(expected);
         if (expected == now) {
             tag.Start = fmi->cumulativeFreq[base] + BWTOccValue(fmi, tag.Start, base) + 1;
-            if (tag.Skip) {
-                tag.Skip++;
-            } else if (tag.Start % SAINTERVAL == 0) {
+            if (!tag.Skip && tag.Start % SAINTERVAL == 0) {
+                if (Use_Ref) {
+                    if (!Search_Located(fmi, tag, true, offset, stringLength, tag.Level)) return false;
+                    tag.Level = stringLength;
+                    return true;
+                }
                 tag.Skip++;
                 tag.End = tag.Start;
             }
@@ -319,7 +406,7 @@ __attribute__((noinline)) bool Search_Right_Singleton(std::string_view currentTa
 }
 
 // Extends tag to the right over currentTag[Level-1] with no mismatches.
-bool Search_Right(std::string_view currentTag, SARange& tag, ActiveBWT* fmi) {
+bool Search_Right(std::string_view currentTag, int offset, SARange& tag, ActiveBWT* fmi) {
     const int stringLength = static_cast<int>(currentTag.size());
 
     if (!tag.Start) {
@@ -328,7 +415,7 @@ bool Search_Right(std::string_view currentTag, SARange& tag, ActiveBWT* fmi) {
 
     for (;;) {
         if (tag.End == tag.Start || tag.Skip) {
-            return Search_Right_Singleton(currentTag, tag, fmi);
+            return Search_Right_Singleton(currentTag, offset, tag, fmi);
         } else {
             Get_SARange(currentTag[tag.Level - 1], tag, fmi);
 
@@ -384,8 +471,10 @@ void Extend_Right_Singleton(std::string_view Current_Tag,int Offset,struct SARan
 	const int StringLength=static_cast<int>(Current_Tag.size());
 	unsigned long Index,Now;
 	if (Tag.Start==0) return;
-	if(Tag.Start % SAINTERVAL == 0 && !Tag.Skip) 
+	if (Use_Ref && Tag.Skip) {Extend_Located(Tag,true,Offset,StringLength,Count,Out);return;}//located earlier
+	if(Tag.Start % SAINTERVAL == 0 && !Tag.Skip)
 	{
+		if (Use_Ref) {if (Locate(fmi,Tag,true,Offset,StringLength,Tag.Level-1)) Extend_Located(Tag,true,Offset,StringLength,Count,Out);return;}
 		Tag.Skip++;
 		Tag.End=Tag.Start;
 	}
@@ -411,8 +500,7 @@ void Extend_Right_Singleton(std::string_view Current_Tag,int Offset,struct SARan
 		if (Now==Expected) Tag.Start = fmi->cumulativeFreq[Base] + BWTOccValue(fmi, Tag.Start, Base) + 1;
 		else Tag.Start = fmi->cumulativeFreq[Now] + BWTOccValue(fmi, Tag.Start, Now) + 1;
 
-		if (Tag.Skip) Tag.Skip++;
-		else if(Tag.Start % SAINTERVAL == 0) 
+		if(!Tag.Skip && Tag.Start % SAINTERVAL == 0)
 		{
 			Tag.Skip++;
 			Tag.End=Tag.Start;
@@ -425,6 +513,12 @@ void Extend_Right_Singleton(std::string_view Current_Tag,int Offset,struct SARan
 			Tag.Mismatch_Pos[Tag.Mismatches]=(Offset+Tag.Level-1);
 			Tag.Mismatches++;
 			
+		}
+		if (Use_Ref && Tag.Skip)//just reached a sampled row
+		{
+			Tag.Level++;
+			if (Locate(fmi,Tag,true,Offset,StringLength,Tag.Level-1)) Extend_Located(Tag,true,Offset,StringLength,Count,Out);
+			return;
 		}
 
 		if (Tag.Mismatches<=Count)
@@ -543,7 +637,7 @@ void Extend_Right(std::string_view Current_Tag,int Offset,const struct SARange &
 
 // Search_Left along a single SA path (Tag.End==Tag.Start or Tag.Skip).
 // Kept out of line, as Search_Right_Singleton.
-__attribute__((noinline)) void Search_Left_Singleton(std::string_view Current_Tag,struct SARange & Tag,BWT *fmi)
+__attribute__((noinline)) void Search_Left_Singleton(std::string_view Current_Tag,int Offset,struct SARange & Tag,BWT *fmi)
 {
 	const int StringLength=static_cast<int>(Current_Tag.size());
 	int Level=Tag.Level;
@@ -551,6 +645,11 @@ __attribute__((noinline)) void Search_Left_Singleton(std::string_view Current_Ta
 
 	if(Tag.Start % SAINTERVAL == 0 && !Tag.Skip)
 	{
+		if (Use_Ref)
+		{
+			if (!Search_Located(fmi,Tag,false,Offset,StringLength,Level-1)) Tag.Start=0;
+			return;
+		}
 		Tag.Skip++;
 		Tag.End=Tag.Start;
 	}
@@ -565,9 +664,13 @@ __attribute__((noinline)) void Search_Left_Singleton(std::string_view Current_Ta
 		{
 			Tag.Start = fmi->cumulativeFreq[Base] + BWTOccValue(fmi, Tag.Start, Base) + 1;
 
-			if (Tag.Skip) Tag.Skip++;
-			else if(Tag.Start % SAINTERVAL == 0)
+			if(!Tag.Skip && Tag.Start % SAINTERVAL == 0)
 			{
+				if (Use_Ref)
+				{
+					if (!Search_Located(fmi,Tag,false,Offset,StringLength,Level)) Tag.Start=0;
+					return;
+				}
 				Tag.Skip++;Tag.End=Tag.Start;
 			}
 
@@ -588,7 +691,7 @@ __attribute__((noinline)) void Search_Left_Singleton(std::string_view Current_Ta
 
 // Extends Tag to the left over Current_Tag[size-Level] with no mismatches.
 // On return Tag.Start==0 if there is no match, otherwise Tag holds the SA range.
-void Search_Left(std::string_view Current_Tag,struct SARange & Tag,BWT *fmi)
+void Search_Left(std::string_view Current_Tag,int Offset,struct SARange & Tag,BWT *fmi)
 {
 	const int StringLength=static_cast<int>(Current_Tag.size());
 
@@ -598,7 +701,7 @@ void Search_Left(std::string_view Current_Tag,struct SARange & Tag,BWT *fmi)
 	{
 		if(Tag.End==Tag.Start || Tag.Skip)//Only one branch?
 		{
-			Search_Left_Singleton(Current_Tag,Tag,fmi);
+			Search_Left_Singleton(Current_Tag,Offset,Tag,fmi);
 			return;
 		}
 		else
@@ -627,8 +730,10 @@ void Extend_Left_Singleton(std::string_view Current_Tag,int Offset,struct SARang
 	const int StringLength=static_cast<int>(Current_Tag.size());
 	unsigned long Index,Now;
 	if (Tag.Start==0) return;
+	if (Use_Ref && Tag.Skip) {Extend_Located(Tag,false,Offset,StringLength,Count,Out);return;}//located earlier
 	if(Tag.Start % SAINTERVAL == 0 && !Tag.Skip)
 	{
+		if (Use_Ref) {if (Locate(fmi,Tag,false,Offset,StringLength,Tag.Level-1)) Extend_Located(Tag,false,Offset,StringLength,Count,Out);return;}
 		Tag.Skip++;
 		Tag.End=Tag.Start;
 	}
@@ -653,8 +758,7 @@ void Extend_Left_Singleton(std::string_view Current_Tag,int Offset,struct SARang
 		if (Now==Expected) Tag.Start = fmi->cumulativeFreq[Base] + BWTOccValue(fmi, Tag.Start, Base) + 1;
 		else Tag.Start = fmi->cumulativeFreq[Now] + BWTOccValue(fmi, Tag.Start, Now) + 1;
 
-		if (Tag.Skip) Tag.Skip++;
-		else if(Tag.Start % SAINTERVAL == 0)
+		if(!Tag.Skip && Tag.Start % SAINTERVAL == 0)
 		{
 			Tag.Skip++;
 			Tag.End=Tag.Start;
@@ -666,6 +770,12 @@ void Extend_Left_Singleton(std::string_view Current_Tag,int Offset,struct SARang
 			Tag.Mismatch_Pos[Tag.Mismatches]=(Offset+StringLength-Tag.Level);
 			Tag.Mismatches++;
 
+		}
+		if (Use_Ref && Tag.Skip)//just reached a sampled row
+		{
+			Tag.Level++;
+			if (Locate(fmi,Tag,false,Offset,StringLength,Tag.Level-1)) Extend_Located(Tag,false,Offset,StringLength,Count,Out);
+			return;
 		}
 
 		if (Tag.Mismatches<=Count)
@@ -773,6 +883,15 @@ void Extend_Left(std::string_view Current_Tag,int Offset,const struct SARange & 
 	return;
 }
 
+// "\t<dir>\t<start>\t<end>" for an SA range, or "\tP\t<pos>\t<pos>" for a located hit.
+std::string Hit_Text(const SARange& hit, const char* dir) {
+    if (Use_Ref && hit.Skip) {
+        const std::string pos = std::to_string(hit.Pos);
+        return "\tP\t" + pos + "\t" + pos;
+    }
+    return std::string("\t") + dir + "\t" + std::to_string(hit.Start) + "\t" + std::to_string(hit.Skip ? hit.Start : hit.End);
+}
+
 bool ReadNextRecord(std::ifstream& in, std::string& id, std::string& seq) {
     std::string line;
     while (std::getline(in, line)) {
@@ -816,7 +935,7 @@ bool ReadNextRecord(std::ifstream& in, std::string& id, std::string& seq) {
 }
 
 void BuildIndexPaths(const std::string& genomePrefix, std::string& revBwt, std::string& revOcc,
-                     std::string& fwBwt, std::string& fwOcc) {
+                     std::string& fwBwt, std::string& fwOcc, std::string* revSa = nullptr, std::string* fwSa = nullptr) {
     std::size_t slash = genomePrefix.find_last_of('/');
     std::string dir;
     std::string base;
@@ -833,17 +952,36 @@ void BuildIndexPaths(const std::string& genomePrefix, std::string& revBwt, std::
     revOcc = dir + "rev" + base + ".fmv";
     fwBwt = genomePrefix + ".bwt";
     fwOcc = genomePrefix + ".fmv";
+    if (revSa) *revSa = dir + "rev" + base + ".sa";
+    if (fwSa) *fwSa = genomePrefix + ".sa";
+}
+
+bool FileExists(const std::string& name) {
+    return std::ifstream(name.c_str()).good();
+}
+
+// Reads <genome>.pac, padded so that Genome_Mismatches can load 9 bytes anywhere.
+bool LoadPac(const std::string& name) {
+    std::ifstream in(name.c_str(), std::ios::binary | std::ios::ate);
+    if (!in) return false;
+    const std::streamsize size = in.tellg();
+    in.seekg(0);
+    Pac.assign(static_cast<std::size_t>(size) + 16, 0);
+    return static_cast<bool>(in.read(reinterpret_cast<char*>(Pac.data()), size));
 }
 
 void Usage(const char* prog) {
     std::fprintf(stderr,
-    "Usage: %s -q <reads.fa/fq> -g <genome_prefix> [-n <0|1>] [-o <hits.txt>] [-m <maxhits>] [--quiet|-Q] [--timing]\n"
+    "Usage: %s -q <reads.fa/fq> -g <genome_prefix> [-n <0|1>] [-o <hits.txt>] [-m <maxhits>] [--no-ref] [--quiet|-Q] [--timing]\n"
         "  -n  maximum mismatches (default 0); 1 also needs the forward index <genome_prefix>.bwt/.fmv\n"
         "  -m  maximum hits per read (default 1, 0 = all)\n"
-        "Output, one line per SA range:\n"
+        "  --no-ref  do not load the SA samples (.sa) and packed genome (.pac); single-row\n"
+        "            paths then walk the index to the end (less memory, slower)\n"
+        "Output, one line per SA range or located hit:\n"
         "  exact:      query_id\tF\tSA_start\tSA_end\thit_count\n"
         "  1 mismatch: query_id\tF|B\tSA_start\tSA_end\thit_count\t1\n"
         "  F = range in the reverse index (rev<genome_prefix>), B = range in the forward index\n"
+        "  P = located hit: query_id\tP\tpos\tpos\t1[\t1], pos = 0-based start in the genome\n"
         "  query_id\tF\t0\t0\t0 when a read has no hits\n",
         prog);
 }
@@ -858,6 +996,7 @@ int main(int argc, char** argv) {
     int maxMismatches = 0;
     bool quiet = false;
     bool timing = false;
+    bool useRef = true;
 
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "-q") == 0 && i + 1 < argc) {
@@ -882,6 +1021,8 @@ int main(int argc, char** argv) {
             quiet = true;
         } else if (std::strcmp(argv[i], "--timing") == 0) {
             timing = true;
+        } else if (std::strcmp(argv[i], "--no-ref") == 0) {
+            useRef = false;
         } else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
             Usage(argv[0]);
             return 0;
@@ -908,21 +1049,44 @@ int main(int argc, char** argv) {
     std::string revOcc;
     std::string fwBwt;
     std::string fwOcc;
-    BuildIndexPaths(genomePrefix, revBwt, revOcc, fwBwt, fwOcc);
+    std::string revSa;
+    std::string fwSa;
+    BuildIndexPaths(genomePrefix, revBwt, revOcc, fwBwt, fwOcc, &revSa, &fwSa);
+    const std::string pacName = genomePrefix + ".pac";
+    if (useRef) {
+        for (const std::string* name : std::initializer_list<const std::string*>{&revSa, &fwSa, &pacName}) {
+            if ((name != &fwSa || maxMismatches > 0) && !FileExists(*name)) {
+                std::fprintf(stderr, "Warning: %s not found; walking single-row paths instead (as --no-ref)\n", name->c_str());
+                useRef = false;
+                break;
+            }
+        }
+    }
 
     const auto loadStart = Clock::now();
-    revfmi = initFMI(revBwt.c_str(), revOcc.c_str());
+    revfmi = initFMI(revBwt.c_str(), revOcc.c_str(), useRef ? revSa.c_str() : nullptr);
     if (!revfmi) {
         std::fprintf(stderr, "Failed to load reverse index: %s / %s\n", revBwt.c_str(), revOcc.c_str());
         return 1;
     }
     if (maxMismatches > 0) {
-        fwfmi = BWTLoad(mmPool, fwBwt.c_str(), fwOcc.c_str(), nullptr, nullptr, nullptr, nullptr);
+        fwfmi = BWTLoad(mmPool, fwBwt.c_str(), fwOcc.c_str(), useRef ? fwSa.c_str() : nullptr, nullptr, nullptr, nullptr);
         if (!fwfmi) {
             std::fprintf(stderr, "Failed to load forward index: %s / %s\n", fwBwt.c_str(), fwOcc.c_str());
             return 1;
         }
     }
+    if (useRef) {
+        if (revfmi->saInterval != SAINTERVAL || (fwfmi && fwfmi->saInterval != SAINTERVAL)) {
+            std::fprintf(stderr, "Warning: SA sample interval is not %d; walking single-row paths instead\n", SAINTERVAL);
+            useRef = false;
+        } else if (!LoadPac(pacName)) {
+            std::fprintf(stderr, "Warning: cannot read %s; walking single-row paths instead\n", pacName.c_str());
+            useRef = false;
+        }
+    }
+    Use_Ref = useRef;
+    Text_Length = revfmi->textLength;
     indexLoadSeconds = std::chrono::duration<double>(Clock::now() - loadStart).count();
 
     const unsigned lookupArraySize = (2u << (2 * LOOKUPSIZE));
@@ -1019,6 +1183,7 @@ int main(int argc, char** argv) {
         }
 
         const std::string_view all(read);
+        if (Use_Ref) Pack_Read(all);
         int c;
         if (LOOKUPSIZE == 3) {
             c = read[0] | (read[1] << 2) | (read[2] << 4);
@@ -1051,7 +1216,7 @@ int main(int argc, char** argv) {
             exactRight.hitCount = 0;
 
             // 0|0
-            if (Search_Right(lh, range, revfmi) && range.Start != 0) {
+            if (Search_Right(lh, 0, range, revfmi) && range.Start != 0) {
                 range.Level = 1;
                 range.Mismatches = 0;
                 range.Mismatch_Char = 0;
@@ -1063,7 +1228,7 @@ int main(int argc, char** argv) {
                     hitCount = maxHits;
                 }
                 readHits += hitCount;
-                lines += id + "\tF\t" + std::to_string(hit.Start) + "\t" + std::to_string(hit.Skip ? hit.Start : hit.End) + "\t" + std::to_string(hitCount) + "\n";
+                lines += id + Hit_Text(hit, "F") + "\t" + std::to_string(hitCount) + "\n";
             }
 
             rightMismatch.hits.clear();
@@ -1076,6 +1241,10 @@ int main(int argc, char** argv) {
             // 0|1, resuming the ranges the exact extension deferred. Their rows
             // have usually left the cache, so fetch them all before resuming.
             for (const SARange& parent : exactRight.mismatches) {
+                if (Use_Ref && parent.Skip) {
+                    __builtin_prefetch(Pac.data() + (parent.Pos + LH) / 4);  // located: only the genome is read
+                    continue;
+                }
                 Prefetch_Row(revfmi, parent.Start);
                 if (!parent.Skip && parent.End != parent.Start) Prefetch_Row(revfmi, parent.End + 1);
             }
@@ -1095,7 +1264,7 @@ int main(int argc, char** argv) {
                 rightRange.Start = Backward_Start_LookupX[bc];
                 rightRange.End = Backward_End_LookupX[bc];
                 rightRange.Level = LOOKUPSIZE + 1;
-                Search_Left(rh, rightRange, fwfmi);
+                Search_Left(rh, LH, rightRange, fwfmi);
                 if (rightRange.Start) {
                     rightRange.Level = 1;
                     Extend_Left(lh, 0, rightRange, 1, fwfmi, leftMismatch,
@@ -1113,8 +1282,7 @@ int main(int argc, char** argv) {
                         hitCount = maxHits - readHits;
                     }
                     readHits += hitCount;
-                    lines += id + "\t" + dirs[s] + "\t" + std::to_string(hit.Start) + "\t" +
-                             std::to_string(hit.Skip ? hit.Start : hit.End) + "\t" + std::to_string(hitCount) + "\t1\n";
+                    lines += id + Hit_Text(hit, dirs[s]) + "\t" + std::to_string(hitCount) + "\t1\n";
                 }
             }
             reportedHits += readHits;
@@ -1132,7 +1300,7 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        bool found = Search_Right(all, range, revfmi);
+        bool found = Search_Right(all, 0, range, revfmi);
         if (!found || range.Start == 0) {
             searchSeconds += std::chrono::duration<double>(Clock::now() - searchStart).count();
             if (!quiet) {
@@ -1152,7 +1320,7 @@ int main(int argc, char** argv) {
 
         if (!quiet) {
             const auto outputStart = Clock::now();
-            *out << id << "\tF\t" << range.Start << "\t" << range.End << "\t" << hitCount << "\n";
+            *out << id << Hit_Text(range, "F") << "\t" << hitCount << "\n";
             outputSeconds += std::chrono::duration<double>(Clock::now() - outputStart).count();
         }
     }
