@@ -94,28 +94,6 @@ ActiveBWT* initFMI(const char* bwtCodeFileName, const char* bwtOccValueFileName)
     return BWTLoad(mmPool, bwtCodeFileName, bwtOccValueFileName, nullptr, nullptr, nullptr, nullptr);
 }
 
-void ExtendRange(unsigned long& start, unsigned long& end,
-                 long newChar, ActiveBWT* fmi) {
-#ifdef BATMAN_ZERO_MIN_USE_PAIRED_RANK
-    unsigned int occValue[2];
-    BWTOccValueTwoIndex(fmi, static_cast<unsigned int>(start),
-                        static_cast<unsigned int>(end + 1),
-                        static_cast<unsigned int>(newChar), occValue);
-    start = fmi->cumulativeFreq[newChar] + occValue[0] + 1;
-    end = fmi->cumulativeFreq[newChar] + occValue[1];
-#else
-    start = fmi->cumulativeFreq[newChar] + BWTOccValue(fmi, start, newChar) + 1;
-    end = fmi->cumulativeFreq[newChar] + BWTOccValue(fmi, end + 1, newChar);
-#endif
-    if (end < start) {
-        start = 0;
-    }
-}
-
-void Get_SARange_Fast(long newChar, SARange& range, ActiveBWT* fmi) {
-    ExtendRange(range.Start, range.End, newChar, fmi);
-}
-
 // Prefetches the occurrence and BWT words BWTOccValue reads for row Index
 // (as BWTPrefetchOccValueExplicit/BWTPrefetchBWT in index/BWT.c).
 inline void Prefetch_Row(const ActiveBWT* fmi, unsigned long Index) {
@@ -166,6 +144,41 @@ inline void Count_Range(const ActiveBWT* fmi, unsigned long Start, unsigned long
     Count[3] = T; Count[1] = CT - T; Count[2] = GT - T; Count[0] = N - CT - GT + T;
 }
 
+// Narrows Start..End to the rows preceded by newChar (Start=0 if none). Ranges
+// with End-Start below BRANCHTHRESHOLD count their characters directly (Count_Range)
+// instead of a second occurrence lookup; see benchmark/branch_threshold.md.
+void Get_SARange(long newChar, unsigned long& start, unsigned long& end, ActiveBWT* fmi) {
+    if (end - start < BRANCHTHRESHOLD) {
+        unsigned count[4];
+        Count_Range(fmi, start, end, count);
+        if (!count[newChar]) {
+            start = 0;
+            return;
+        }
+        start = fmi->cumulativeFreq[newChar] + BWTOccValue(fmi, start, newChar) + 1;
+        end = start + count[newChar] - 1;
+        return;
+    }
+#ifdef BATMAN_ZERO_MIN_USE_PAIRED_RANK
+    unsigned int occValue[2];
+    BWTOccValueTwoIndex(fmi, static_cast<unsigned int>(start),
+                        static_cast<unsigned int>(end + 1),
+                        static_cast<unsigned int>(newChar), occValue);
+    start = fmi->cumulativeFreq[newChar] + occValue[0] + 1;
+    end = fmi->cumulativeFreq[newChar] + occValue[1];
+#else
+    start = fmi->cumulativeFreq[newChar] + BWTOccValue(fmi, start, newChar) + 1;
+    end = fmi->cumulativeFreq[newChar] + BWTOccValue(fmi, end + 1, newChar);
+#endif
+    if (end < start) {
+        start = 0;
+    }
+}
+
+inline void Get_SARange(long newChar, SARange& range, ActiveBWT* fmi) {
+    Get_SARange(newChar, range.Start, range.End, fmi);
+}
+
 // Returns Base unchanged, as a value the compiler cannot relate to anything
 // else. Take it from the read's base before comparing with the BWT character:
 // the LF step on a match then uses the read's register, which is ready before
@@ -189,7 +202,7 @@ void Build_Preindex_Forward(Range range, int level, int bit) {
         if (range.Start) {
             unsigned long start = range.Start;
             unsigned long end = range.End;
-            ExtendRange(start, end, bit, revfmi);
+            Get_SARange(bit, start, end, revfmi);
             range.Start = static_cast<unsigned>(start);
             range.End = static_cast<unsigned>(end);
         }
@@ -202,7 +215,7 @@ void Build_Preindex_Forward(Range range, int level, int bit) {
         if (range.Start) {
             unsigned long start = range.Start;
             unsigned long end = range.End;
-            ExtendRange(start, end, bit, revfmi);
+            Get_SARange(bit, start, end, revfmi);
             range.Start = static_cast<unsigned>(start);
             range.End = static_cast<unsigned>(end);
         }
@@ -221,7 +234,7 @@ void Build_Preindex_Backward(Range range, int level, int bit) {
     if (range.Start) {
         unsigned long start = range.Start;
         unsigned long end = range.End;
-        ExtendRange(start, end, bit, fwfmi);
+        Get_SARange(bit, start, end, fwfmi);
         range.Start = static_cast<unsigned>(start);
         range.End = static_cast<unsigned>(end);
     }
@@ -308,7 +321,6 @@ __attribute__((noinline)) bool Search_Right_Singleton(std::string_view currentTa
 // Extends tag to the right over currentTag[Level-1] with no mismatches.
 bool Search_Right(std::string_view currentTag, SARange& tag, ActiveBWT* fmi) {
     const int stringLength = static_cast<int>(currentTag.size());
-    unsigned int now;
 
     if (!tag.Start) {
         return false;
@@ -318,19 +330,7 @@ bool Search_Right(std::string_view currentTag, SARange& tag, ActiveBWT* fmi) {
         if (tag.End == tag.Start || tag.Skip) {
             return Search_Right_Singleton(currentTag, tag, fmi);
         } else {
-            if (tag.End - tag.Start < BRANCHTHRESHOLD) {
-                unsigned count[4];
-                Count_Range(fmi, tag.Start, tag.End, count);
-                now = currentTag[tag.Level - 1];
-                if (count[now]) {
-                    tag.Start = fmi->cumulativeFreq[now] + BWTOccValue(fmi, tag.Start, now) + 1;
-                    tag.End = tag.Start + count[now] - 1;
-                } else {
-                    tag.Start = 0;
-                }
-            } else {
-                Get_SARange_Fast(currentTag[tag.Level - 1], tag, fmi);
-            }
+            Get_SARange(currentTag[tag.Level - 1], tag, fmi);
 
             if (tag.Start != 0) {
                 if (tag.Level == stringLength) {
@@ -472,7 +472,7 @@ void Extend_Right(std::string_view Current_Tag,int Offset,const struct SARange &
 		{
 			const unsigned char Expected=Current_Tag[Range.Level-1];
 			Temp_Range=Range;
-			Get_SARange_Fast(Expected,Temp_Range,fmi);
+			Get_SARange(Expected,Temp_Range,fmi);
 			// A parent holding the $ row also differs in size; deferring it is harmless (its resume finds nothing).
 			if (!Temp_Range.Start || Temp_Range.End-Temp_Range.Start!=Range.End-Range.Start)
 			{
@@ -592,7 +592,6 @@ void Search_Left(std::string_view Current_Tag,struct SARange & Tag,BWT *fmi)
 {
 	const int StringLength=static_cast<int>(Current_Tag.size());
 
-	unsigned long Now;
 	if (!Tag.Start) return;
 
 	for(;;)
@@ -604,24 +603,7 @@ void Search_Left(std::string_view Current_Tag,struct SARange & Tag,BWT *fmi)
 		}
 		else
 		{
-			if(Tag.End-Tag.Start<BRANCHTHRESHOLD)//only small number of branches
-			{
-				unsigned Count[4];
-				Count_Range(fmi, Tag.Start, Tag.End, Count);
-				Now=Current_Tag[StringLength-Tag.Level];
-				if (Count[Now])//we have a match...
-				{
-
-					Tag.Start = fmi->cumulativeFreq[Now] + BWTOccValue(fmi, Tag.Start, Now) + 1;
-					Tag.End = Tag.Start + Count[Now]-1;// Calculate SAranges
-
-				}
-				else
-				{
-					Tag.Start=0;//Tag.End=0;
-				}
-			}
-			else Get_SARange_Fast(Current_Tag[StringLength-Tag.Level],Tag,fmi);
+			Get_SARange(Current_Tag[StringLength-Tag.Level],Tag,fmi);
 
 			if (Tag.Start!=0)
 			{
@@ -726,7 +708,7 @@ void Extend_Left(std::string_view Current_Tag,int Offset,const struct SARange & 
 		{
 			const unsigned char Expected=Current_Tag[StringLength-Range.Level];
 			Temp_Range=Range;
-			Get_SARange_Fast(Expected,Temp_Range,fmi);
+			Get_SARange(Expected,Temp_Range,fmi);
 			// A parent holding the $ row also differs in size; deferring it is harmless (its resume finds nothing).
 			if (!Temp_Range.Start || Temp_Range.End-Temp_Range.Start!=Range.End-Range.Start)
 			{
