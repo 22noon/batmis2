@@ -12,7 +12,7 @@ INDEX_DIR ?= ../index
 FMINDEX_LIB = $(INDEX_DIR)/libfmindex_core.a
 BWA_ROOT ?= ../../../bwa-fmd
 
-.PHONY: all batman_zero_min_fmindex batman_zero_structured test_exact_search_intervals test-structured install clean FORCE
+.PHONY: all batman_zero_min_fmindex batman_zero_structured test_exact_search_intervals test-structured test-located install clean FORCE
 
 all: batman_zero_min
 
@@ -44,6 +44,13 @@ test-structured: batman_zero_min batman_zero_structured test_exact_search_interv
 	$(MAKE) -C $(INDEX_DIR) bwt_build_index
 	../tests/test_structured_exact_search.sh . $(INDEX_DIR)/bwt_build_index ./test_exact_search_intervals
 
+test_located_hits: ../tests/test_located_hits.cpp batman_zero_min.cpp $(FMINDEX_LIB)
+	$(CXX) -std=c++17 -fpermissive -I. -I$(INDEX_DIR) $(CXXFLAGS) $(DEFS) -o $@ $< $(FMINDEX_LIB) -lm
+
+test-located: batman_zero_min test_located_hits
+	$(MAKE) -C $(INDEX_DIR) bwt_build_index
+	../tests/test_located_hits.sh . $(INDEX_DIR)/bwt_build_index ./test_located_hits
+
 # index/ owns the library; let its Makefile decide whether it is up to date.
 $(FMINDEX_LIB): FORCE
 	$(MAKE) -C $(INDEX_DIR) libfmindex_core.a
@@ -64,6 +71,6 @@ clean:
 	rm -f batman_zero_min.o batman_zero_min_bwa.o batman_zero_min batman_zero_min_bwa \
 	      batman_zero_min_spot.o batman_zero_min_spot batman_zero_structured.o \
 	      exact_search.o batman_zero_structured test_exact_search_intervals.o \
-	      test_exact_search_intervals
+	      test_exact_search_intervals test_located_hits
 
 FORCE:

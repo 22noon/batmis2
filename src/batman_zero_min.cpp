@@ -41,6 +41,15 @@ constexpr int BRANCHTHRESHOLD = 128;
 #endif
 constexpr unsigned char NO_BASE = 4;
 
+// An SA range during the search. Level-1 bases of the current segment (lh, rh or
+// the whole read) are accounted for, with Mismatches mismatches at Mismatch_Pos
+// (read positions) against the genome bases in Mismatch_Char (2 bits each).
+// Skip marks a single-row path (Start == End). With the reference loaded (Use_Ref)
+// it also means located: Start = End stay on the sampled row (never 0) and Pos is
+// the read's 0-based start in the forward genome, the same for revfmi and fwfmi.
+// A located tag needs no rows any more: Search_* hands it to Extend_* (main
+// resets Level to 1 for the next segment), and a deferred one is compared again
+// at Pos when resumed. Only a finished hit has the rest of its mismatches recorded.
 struct SARange {
     unsigned long Start;
     unsigned long End;
@@ -112,25 +121,64 @@ void Pack_Read(std::string_view Read) {
     }
 }
 
+// The 32 genome bases from G0, packed as Read_Packed (first base in bits 63-62).
+inline uint64_t Genome_Word(unsigned long G0) {
+    const uint8_t* P = Pac.data() + G0 / 4;
+    uint64_t G;
+    std::memcpy(&G, P, 8);
+    G = __builtin_bswap64(G);
+    const unsigned Shift = 2 * (G0 % 4);
+    if (Shift) G = (G << Shift) | (P[8] >> (8 - Shift));
+    return G;
+}
+
+// For read word W against genome word G: the low bit of each base's pair (bit
+// 62-2k for base k) is set where the bases differ, for bases k in [Lo, Hi) only.
+inline uint64_t Mismatch_Bits(uint64_t G, int W, int Lo, int Hi) {
+    uint64_t X = G ^ Read_Packed[W];
+    X = (X | (X >> 1)) & 0x5555555555555555ULL;
+    return X & (~0ULL >> (2 * Lo)) & (Hi == 32 ? ~0ULL : ~(~0ULL >> (2 * Hi)));
+}
+
 // Mismatches between read[A..B) and genome[S+A..S+B), 32 bases at a time:
 // XOR with the genome, fold each base's two bits into one, popcount.
 unsigned Genome_Mismatches(unsigned long S, int A, int B) {
     unsigned D = 0;
     for (int W = A / 32; W * 32 < B; W++) {
-        const unsigned long G0 = S + W * 32;
-        const uint8_t* P = Pac.data() + G0 / 4;
-        uint64_t G;
-        std::memcpy(&G, P, 8);
-        G = __builtin_bswap64(G);
-        const unsigned Shift = 2 * (G0 % 4);
-        if (Shift) G = (G << Shift) | (P[8] >> (8 - Shift));
-        uint64_t X = G ^ Read_Packed[W];
-        X = (X | (X >> 1)) & 0x5555555555555555ULL;	// low bit of each pair: base differs
-        const int Lo = std::max(A - W * 32, 0), Hi = std::min(B - W * 32, 32);
-        const uint64_t Mask = (~0ULL >> (2 * Lo)) & (Hi == 32 ? ~0ULL : ~(~0ULL >> (2 * Hi)));
-        D += __builtin_popcountll(X & Mask);
+        D += __builtin_popcountll(Mismatch_Bits(Genome_Word(S + W * 32), W, std::max(A - W * 32, 0), std::min(B - W * 32, 32)));
     }
     return D;
+}
+
+// Appends the mismatches of read[A..B) against the genome at Tag.Pos to Tag's
+// Mismatch_Pos/Mismatch_Char, in the order a walk would meet them: ascending
+// read position for Right, descending otherwise.
+void Record_Mismatches(SARange& Tag, bool Right, int A, int B) {
+    auto Add = [&](int ReadPos, unsigned GenomeBase) {
+        if (Tag.Mismatches >= MAX_MISMATCHES_BOUND) return;
+        Tag.Mismatch_Char |= GenomeBase << (Tag.Mismatches * 2);
+        Tag.Mismatch_Pos[Tag.Mismatches] = ReadPos;
+        Tag.Mismatches++;
+    };
+    if (A >= B) return;
+    if (Right) {
+        for (int W = A / 32; W * 32 < B; W++) {
+            const uint64_t G = Genome_Word(Tag.Pos + W * 32);
+            for (uint64_t Bits = Mismatch_Bits(G, W, std::max(A - W * 32, 0), std::min(B - W * 32, 32)); Bits; ) {
+                const int K = (__builtin_clzll(Bits) - 1) / 2;	// lowest read position first
+                Add(W * 32 + K, (G >> (62 - 2 * K)) & 3);
+                Bits &= ~(1ULL << (62 - 2 * K));
+            }
+        }
+    } else {
+        for (int W = (B - 1) / 32; W >= A / 32; W--) {
+            const uint64_t G = Genome_Word(Tag.Pos + W * 32);
+            for (uint64_t Bits = Mismatch_Bits(G, W, std::max(A - W * 32, 0), std::min(B - W * 32, 32)); Bits; Bits &= Bits - 1) {
+                const int K = (62 - __builtin_ctzll(Bits)) / 2;	// highest read position first
+                Add(W * 32 + K, (G >> (62 - 2 * K)) & 3);
+            }
+        }
+    }
 }
 
 // A singleton path at a sampled row (Start % SAINTERVAL == 0) can stop walking: the
@@ -162,11 +210,16 @@ bool Search_Located(const ActiveBWT* fmi, SARange& Tag, bool Right, int Offset, 
 
 // Extend_Right/Extend_Left for a located Tag, whose first Level-1 segment bases are
 // matched with Mismatches mismatches. As the walk would: a hit at exactly Count
-// mismatches; above Count, deferred to be resumed with a larger Count.
+// mismatches (with the rest of its mismatches recorded); above Count, deferred
+// unchanged, to be compared again when resumed with a larger Count.
 void Extend_Located(const SARange& Tag, bool Right, int Offset, int Len, int Count, ForwardResults& Out) {
-    const unsigned D = Tag.Mismatches + Rest_Mismatches(Tag, Right, Offset, Len, Tag.Level - 1);
+    const int Done = Tag.Level - 1;
+    const unsigned D = Tag.Mismatches + Rest_Mismatches(Tag, Right, Offset, Len, Done);
     if (D == static_cast<unsigned>(Count)) {
-        Out.hits.push_back(Tag);
+        SARange Hit = Tag;
+        if (Right) Record_Mismatches(Hit, true, Offset + Done, Offset + Len);
+        else Record_Mismatches(Hit, false, Offset, Offset + Len - Done);
+        Out.hits.push_back(Hit);
         Out.hitCount++;
     } else if (D > static_cast<unsigned>(Count)) {
         Out.mismatches.push_back(Tag);
@@ -545,8 +598,8 @@ void Extend_Right_Singleton(std::string_view Current_Tag,int Offset,struct SARan
 // mismatches only extend with the read's base; where that loses rows, the
 // parent goes to Out.mismatches with Forbidden_Base set, to be resumed with a
 // larger Count (as minimal_bwt/src/mismatch_search.cpp).
-// Stops once Out.hitCount reaches MaxHits (0 = no limit).
-void Extend_Right(std::string_view Current_Tag,int Offset,const struct SARange & Tag,int Count,BWT *fmi,ForwardResults& Out,unsigned MaxHits)
+// Stops once Out.hitCount reaches MaxHits (0 = no limit). Kept out of line, as Extend_Left.
+__attribute__((noinline)) void Extend_Right(std::string_view Current_Tag,int Offset,const struct SARange & Tag,int Count,BWT *fmi,ForwardResults& Out,unsigned MaxHits)
 {
 	if (!Tag.Start) return;
 	const int StringLength=static_cast<int>(Current_Tag.size());
@@ -798,7 +851,8 @@ void Extend_Left_Singleton(std::string_view Current_Tag,int Offset,struct SARang
 
 // Extends Tag to the left over Current_Tag[size-Level] allowing up to Count
 // mismatches. Offset and results as for Extend_Right.
-void Extend_Left(std::string_view Current_Tag,int Offset,const struct SARange & Tag,int Count,BWT *fmi,ForwardResults& Out,unsigned MaxHits)
+// Kept out of line: inlined into the read loop, r24 searches ran ~15% slower.
+__attribute__((noinline)) void Extend_Left(std::string_view Current_Tag,int Offset,const struct SARange & Tag,int Count,BWT *fmi,ForwardResults& Out,unsigned MaxHits)
 {
 	if (!Tag.Start) return;
 	const int StringLength=static_cast<int>(Current_Tag.size());
@@ -881,6 +935,98 @@ void Extend_Left(std::string_view Current_Tag,int Offset,const struct SARange & 
 		}
 	}
 	return;
+}
+
+// BatMis one-mismatch scan of one read split into lh|rh, starting from range
+// (lh's lookup-table range): lh exact, then rh extended with no mismatches (0|0,
+// into exactRight). The ranges that extension defers are resumed with one
+// mismatch (0|1, into rightMismatch). Finally rh exact with a mismatch in lh
+// (1|0, into leftMismatch). Returns the locations of the 0|0 hits (each range
+// capped at MaxHits, 0 = no limit), which bound the later passes.
+__attribute__((noinline)) unsigned long One_Mismatch_Search(std::string_view lh, std::string_view rh, SARange range, unsigned MaxHits,
+                                                            ForwardResults& exactRight, ForwardResults& rightMismatch, ForwardResults& leftMismatch) {
+    const int LH = static_cast<int>(lh.size());
+    const int RH = static_cast<int>(rh.size());
+    unsigned long readHits = 0;
+    for (ForwardResults* r : {&exactRight, &rightMismatch, &leftMismatch}) {
+        r->hits.clear();
+        r->mismatches.clear();
+        r->hitCount = 0;
+    }
+
+    // 0|0
+    if (Search_Right(lh, 0, range, revfmi) && range.Start != 0) {
+        range.Level = 1;
+        range.Mismatches = 0;
+        range.Mismatch_Char = 0;
+        Extend_Right(rh, LH, range, 0, revfmi, exactRight, 0);
+    }
+    for (const SARange& hit : exactRight.hits) {
+        unsigned long hitCount = hit.Skip ? 1UL : (hit.End >= hit.Start ? (hit.End - hit.Start + 1UL) : 0UL);
+        if (MaxHits > 0 && hitCount > MaxHits) {
+            hitCount = MaxHits;
+        }
+        readHits += hitCount;
+    }
+
+    // 0|1, resuming the ranges the exact extension deferred. Their rows
+    // have usually left the cache, so fetch them all before resuming.
+    for (const SARange& parent : exactRight.mismatches) {
+        if (Use_Ref && parent.Skip) {
+            __builtin_prefetch(Pac.data() + (parent.Pos + LH) / 4);  // located: only the genome is read
+            continue;
+        }
+        Prefetch_Row(revfmi, parent.Start);
+        if (!parent.Skip && parent.End != parent.Start) Prefetch_Row(revfmi, parent.End + 1);
+    }
+    for (const SARange& parent : exactRight.mismatches) {
+        if (MaxHits && readHits + rightMismatch.hitCount >= MaxHits) break;
+        Extend_Right(rh, LH, parent, 1, revfmi, rightMismatch,
+                     MaxHits ? MaxHits - readHits : 0);
+    }
+
+    // 1|0
+    if (MaxHits == 0 || readHits + rightMismatch.hitCount < MaxHits) {
+        int bc = 0;
+        for (int i = 0; i < LOOKUPSIZE; i++) {
+            bc |= rh[RH - 1 - i] << (2 * i);
+        }
+        SARange rightRange{};
+        rightRange.Start = Backward_Start_LookupX[bc];
+        rightRange.End = Backward_End_LookupX[bc];
+        rightRange.Level = LOOKUPSIZE + 1;
+        Search_Left(rh, LH, rightRange, fwfmi);
+        if (rightRange.Start) {
+            rightRange.Level = 1;
+            Extend_Left(lh, 0, rightRange, 1, fwfmi, leftMismatch,
+                        MaxHits ? MaxHits - readHits - rightMismatch.hitCount : 0);
+        }
+    }
+    return readHits;
+}
+
+// Range of the read's first LOOKUPSIZE bases in revfmi, from the lookup table,
+// with Level at the next base to match. A read no longer than the lookup key is
+// matched whole from its first base instead (the table is keyed on LOOKUPSIZE
+// bases); its Level is then past the end of the read, and there is nothing left
+// to search.
+SARange Start_Range(std::string_view read) {
+    SARange range{};
+    const int length = static_cast<int>(read.size());
+    if (length <= LOOKUPSIZE) {
+        const Range first = InitialBaseRange(revfmi, read[0]);
+        range.Start = first.Start;
+        range.End = first.End;
+        for (int i = 1; i < length && range.Start; i++) Get_SARange(read[i], range, revfmi);
+        range.Level = length + 1;
+        return range;
+    }
+    int c = 0;
+    for (int i = 0; i < LOOKUPSIZE; i++) c |= read[i] << (2 * i);
+    range.Start = Forward_Start_LookupX[c];
+    range.End = Forward_End_LookupX[c];
+    range.Level = LOOKUPSIZE + 1;
+    return range;
 }
 
 // "\t<dir>\t<start>\t<end>" for an SA range, or "\tP\t<pos>\t<pos>" for a located hit.
@@ -1184,92 +1330,20 @@ int main(int argc, char** argv) {
 
         const std::string_view all(read);
         if (Use_Ref) Pack_Read(all);
-        int c;
-        if (LOOKUPSIZE == 3) {
-            c = read[0] | (read[1] << 2) | (read[2] << 4);
-        } else {
-            c = read[0] | (read[1] << 2) | (read[2] << 4) | (read[3] << 6) | (read[4] << 8) | (read[5] << 10);
-        }
-
-        SARange range{};
-        range.Start = Forward_Start_LookupX[c];
-        range.End = Forward_End_LookupX[c];
-        range.Tag = 0;
-        range.Mismatches = 0;
-        range.Level = LOOKUPSIZE + 1;
-        range.Skip = 0;
+        SARange range = Start_Range(all);
 
         const int LH = STRINGLENGTH / 2;
-        const int RH = STRINGLENGTH - LH;
         const std::string_view lh = all.substr(0, LH);
         const std::string_view rh = all.substr(LH);
         if (maxMismatches == 1 && LH > LOOKUPSIZE) {
-            // BatMis one-mismatch scan: left half exact, then the right half
-            // extended with no mismatches (0|0). The ranges that extension
-            // defers are resumed with one mismatch (0|1). Finally right half
-            // exact with a mismatch in the left half (1|0).
+            unsigned long readHits = One_Mismatch_Search(lh, rh, range, maxHits, exactRight, rightMismatch, leftMismatch);
             std::string lines;
-            unsigned long readHits = 0;
-
-            exactRight.hits.clear();
-            exactRight.mismatches.clear();
-            exactRight.hitCount = 0;
-
-            // 0|0
-            if (Search_Right(lh, 0, range, revfmi) && range.Start != 0) {
-                range.Level = 1;
-                range.Mismatches = 0;
-                range.Mismatch_Char = 0;
-                Extend_Right(rh, LH, range, 0, revfmi, exactRight, 0);
-            }
             for (const SARange& hit : exactRight.hits) {
                 unsigned long hitCount = hit.Skip ? 1UL : (hit.End >= hit.Start ? (hit.End - hit.Start + 1UL) : 0UL);
                 if (maxHits > 0 && hitCount > maxHits) {
                     hitCount = maxHits;
                 }
-                readHits += hitCount;
                 lines += id + Hit_Text(hit, "F") + "\t" + std::to_string(hitCount) + "\n";
-            }
-
-            rightMismatch.hits.clear();
-            rightMismatch.mismatches.clear();
-            rightMismatch.hitCount = 0;
-            leftMismatch.hits.clear();
-            leftMismatch.mismatches.clear();
-            leftMismatch.hitCount = 0;
-
-            // 0|1, resuming the ranges the exact extension deferred. Their rows
-            // have usually left the cache, so fetch them all before resuming.
-            for (const SARange& parent : exactRight.mismatches) {
-                if (Use_Ref && parent.Skip) {
-                    __builtin_prefetch(Pac.data() + (parent.Pos + LH) / 4);  // located: only the genome is read
-                    continue;
-                }
-                Prefetch_Row(revfmi, parent.Start);
-                if (!parent.Skip && parent.End != parent.Start) Prefetch_Row(revfmi, parent.End + 1);
-            }
-            for (const SARange& parent : exactRight.mismatches) {
-                if (maxHits && readHits + rightMismatch.hitCount >= maxHits) break;
-                Extend_Right(rh, LH, parent, 1, revfmi, rightMismatch,
-                             maxHits ? maxHits - readHits : 0);
-            }
-
-            // 1|0
-            if (maxHits == 0 || readHits + rightMismatch.hitCount < maxHits) {
-                int bc = 0;
-                for (int i = 0; i < LOOKUPSIZE; i++) {
-                    bc |= rh[RH - 1 - i] << (2 * i);
-                }
-                SARange rightRange{};
-                rightRange.Start = Backward_Start_LookupX[bc];
-                rightRange.End = Backward_End_LookupX[bc];
-                rightRange.Level = LOOKUPSIZE + 1;
-                Search_Left(rh, LH, rightRange, fwfmi);
-                if (rightRange.Start) {
-                    rightRange.Level = 1;
-                    Extend_Left(lh, 0, rightRange, 1, fwfmi, leftMismatch,
-                                maxHits ? maxHits - readHits - rightMismatch.hitCount : 0);
-                }
             }
 
             const ForwardResults* stages[2] = {&rightMismatch, &leftMismatch};
@@ -1300,7 +1374,7 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        bool found = Search_Right(all, 0, range, revfmi);
+        bool found = range.Level > STRINGLENGTH ? range.Start != 0 : Search_Right(all, 0, range, revfmi);
         if (!found || range.Start == 0) {
             searchSeconds += std::chrono::duration<double>(Clock::now() - searchStart).count();
             if (!quiet) {
