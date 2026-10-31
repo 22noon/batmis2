@@ -108,6 +108,25 @@ void Get_SARange_Fast(long newChar, SARange& range, ActiveBWT* fmi) {
     ExtendRange(range.Start, range.End, newChar, fmi);
 }
 
+// Prefetches the occurrence and BWT words BWTOccValue reads for row Index
+// (as BWTPrefetchOccValueExplicit/BWTPrefetchBWT in index/BWT.c).
+inline void Prefetch_Row(const ActiveBWT* fmi, unsigned long Index) {
+    Index -= (Index > fmi->inverseSa0);
+    const unsigned long Explicit = (Index + OCC_INTERVAL / 2 - 1) / OCC_INTERVAL;
+    __builtin_prefetch(fmi->occValue + Explicit / OCC_VALUE_PER_WORD * ALPHABET_SIZE);
+    __builtin_prefetch(fmi->occValueMajor + Explicit * OCC_INTERVAL / OCC_INTERVAL_MAJOR * ALPHABET_SIZE);
+    __builtin_prefetch(fmi->bwtCode + Index / CHAR_PER_WORD);
+    __builtin_prefetch(fmi->bwtCode + Explicit * OCC_INTERVAL / CHAR_PER_WORD);
+}
+
+// Returns Base unchanged, as a value the compiler cannot relate to anything
+// else. Take it from the read's base before comparing with the BWT character:
+// the LF step on a match then uses the read's register, which is ready before
+// the BWT load completes, so the occurrence lookup can start in parallel
+// instead of waiting for that load (~2x faster singleton walks). Without it the
+// compiler may pass the (equal) BWT character instead.
+inline unsigned Read_Base(unsigned Base) { asm("" : "+r"(Base)); return Base; }
+
 Range InitialBaseRange(ActiveBWT* fmi, int base) {
     Range range{};
     range.Start = fmi->cumulativeFreq[base] + 1;
@@ -214,8 +233,10 @@ __attribute__((noinline)) bool Search_Right_Singleton(std::string_view currentTa
             index--;
         }
         now = fmi->bwtCode[index / 16] << ((index % 16) * 2) >> (BITS_IN_WORD - 2);
-        if (static_cast<unsigned char>(currentTag[tag.Level - 1]) == now) {
-            tag.Start = fmi->cumulativeFreq[now] + BWTOccValue(fmi, tag.Start, now) + 1;
+        const unsigned int expected = static_cast<unsigned char>(currentTag[tag.Level - 1]);
+        const unsigned base = Read_Base(expected);
+        if (expected == now) {
+            tag.Start = fmi->cumulativeFreq[base] + BWTOccValue(fmi, tag.Start, base) + 1;
             if (tag.Skip) {
                 tag.Skip++;
             } else if (tag.Start % SAINTERVAL == 0) {
@@ -348,6 +369,7 @@ void Extend_Right_Singleton(std::string_view Current_Tag,int Offset,struct SARan
 		Now=fmi->bwtCode[(Index) / 16] << (((Index) % 16) * 2)>> (BITS_IN_WORD - 2);
 		if (Now==Tag.Forbidden_Base) return;//already tried by the pass that deferred this range
 		const unsigned char Expected=Current_Tag[Tag.Level-1];
+		const unsigned Base=Read_Base(Expected);
 		if (Now!=Expected && Tag.Mismatches==Count)//at threshold: defer the parent
 		{
 			if (!Tag.Skip) Tag.End=Tag.Start;
@@ -356,7 +378,9 @@ void Extend_Right_Singleton(std::string_view Current_Tag,int Offset,struct SARan
 			return;
 		}
 		Tag.Forbidden_Base=NO_BASE;
-		Tag.Start = fmi->cumulativeFreq[Now] + BWTOccValue(fmi, Tag.Start, Now) + 1;
+		// On a match step with the read's base (see Read_Base).
+		if (Now==Expected) Tag.Start = fmi->cumulativeFreq[Base] + BWTOccValue(fmi, Tag.Start, Base) + 1;
+		else Tag.Start = fmi->cumulativeFreq[Now] + BWTOccValue(fmi, Tag.Start, Now) + 1;
 
 		if (Tag.Skip) Tag.Skip++;
 		else if(Tag.Start % SAINTERVAL == 0) 
@@ -505,9 +529,11 @@ __attribute__((noinline)) void Search_Left_Singleton(std::string_view Current_Ta
 		Index=Tag.Start;
 		if (Index >= fmi->inverseSa0) Index--;//adjust for missing $
 		Now=fmi->bwtCode[(Index) / 16] << (((Index) % 16) * 2)>> (BITS_IN_WORD - 2);//FMIBwtValue(fmi,Index);
-		if (static_cast<unsigned char>(Current_Tag[StringLength-Level]) == Now)
+		const unsigned long Expected=static_cast<unsigned char>(Current_Tag[StringLength-Level]);
+		const unsigned Base=Read_Base(Expected);
+		if (Expected == Now)
 		{
-			Tag.Start = fmi->cumulativeFreq[Now] + BWTOccValue(fmi, Tag.Start, Now) + 1;
+			Tag.Start = fmi->cumulativeFreq[Base] + BWTOccValue(fmi, Tag.Start, Base) + 1;
 
 			if (Tag.Skip) Tag.Skip++;
 			else if(Tag.Start % SAINTERVAL == 0)
@@ -609,6 +635,7 @@ void Extend_Left_Singleton(std::string_view Current_Tag,int Offset,struct SARang
 		Now=fmi->bwtCode[(Index) / 16] << (((Index) % 16) * 2)>> (BITS_IN_WORD - 2);//FMIBwtValue(fmi,Index);
 		if (Now==Tag.Forbidden_Base) return;//already tried by the pass that deferred this range
 		const unsigned char Expected=Current_Tag[StringLength-Tag.Level];
+		const unsigned Base=Read_Base(Expected);
 		if (Now!=Expected && Tag.Mismatches==Count)//at threshold: defer the parent
 		{
 			if (!Tag.Skip) Tag.End=Tag.Start;
@@ -617,7 +644,9 @@ void Extend_Left_Singleton(std::string_view Current_Tag,int Offset,struct SARang
 			return;
 		}
 		Tag.Forbidden_Base=NO_BASE;
-		Tag.Start = fmi->cumulativeFreq[Now] + BWTOccValue(fmi, Tag.Start, Now) + 1;
+		// On a match step with the read's base (see Read_Base).
+		if (Now==Expected) Tag.Start = fmi->cumulativeFreq[Base] + BWTOccValue(fmi, Tag.Start, Base) + 1;
+		else Tag.Start = fmi->cumulativeFreq[Now] + BWTOccValue(fmi, Tag.Start, Now) + 1;
 
 		if (Tag.Skip) Tag.Skip++;
 		else if(Tag.Start % SAINTERVAL == 0)
@@ -929,6 +958,7 @@ int main(int argc, char** argv) {
     bool initialized = false;
     uint64_t records = 0;
     uint64_t reportedHits = 0;
+    ForwardResults exactRight;     // 0|0 range and deferred parents for 0|1, reverse index
     ForwardResults rightMismatch;  // 0|1 ranges, reverse index
     ForwardResults leftMismatch;   // 1|0 ranges, forward index
 
@@ -1003,27 +1033,31 @@ int main(int argc, char** argv) {
         const std::string_view lh = all.substr(0, LH);
         const std::string_view rh = all.substr(LH);
         if (maxMismatches == 1 && LH > LOOKUPSIZE) {
-            // BatMis one-mismatch scan: exact 0|0, then left half exact with a
-            // mismatch in the right half (0|1), then right half exact with a
-            // mismatch in the left half (1|0).
+            // BatMis one-mismatch scan: left half exact, then the right half
+            // extended with no mismatches (0|0). The ranges that extension
+            // defers are resumed with one mismatch (0|1). Finally right half
+            // exact with a mismatch in the left half (1|0).
             std::string lines;
             unsigned long readHits = 0;
 
-            // 0|0, stopping at the left half to keep its exact range for 0|1.
-            SARange leftRange{};
-            bool found = Search_Right(lh, range, revfmi) && range.Start != 0;
-            if (found) {
-                leftRange = range;
+            exactRight.hits.clear();
+            exactRight.mismatches.clear();
+            exactRight.hitCount = 0;
+
+            // 0|0
+            if (Search_Right(lh, range, revfmi) && range.Start != 0) {
                 range.Level = 1;
-                found = Search_Right(rh, range, revfmi) && range.Start != 0;
+                range.Mismatches = 0;
+                range.Mismatch_Char = 0;
+                Extend_Right(rh, LH, range, 0, revfmi, exactRight, 0);
             }
-            if (found) {
-                unsigned long hitCount = range.Skip ? 1UL : (range.End >= range.Start ? (range.End - range.Start + 1UL) : 0UL);
+            for (const SARange& hit : exactRight.hits) {
+                unsigned long hitCount = hit.Skip ? 1UL : (hit.End >= hit.Start ? (hit.End - hit.Start + 1UL) : 0UL);
                 if (maxHits > 0 && hitCount > maxHits) {
                     hitCount = maxHits;
                 }
                 readHits += hitCount;
-                lines += id + "\tF\t" + std::to_string(range.Start) + "\t" + std::to_string(range.End) + "\t" + std::to_string(hitCount) + "\n";
+                lines += id + "\tF\t" + std::to_string(hit.Start) + "\t" + std::to_string(hit.Skip ? hit.Start : hit.End) + "\t" + std::to_string(hitCount) + "\n";
             }
 
             rightMismatch.hits.clear();
@@ -1033,12 +1067,15 @@ int main(int argc, char** argv) {
             leftMismatch.mismatches.clear();
             leftMismatch.hitCount = 0;
 
-            // 0|1
-            if (leftRange.Start && (maxHits == 0 || readHits < maxHits)) {
-                leftRange.Level = 1;
-                leftRange.Mismatches = 0;
-                leftRange.Mismatch_Char = 0;
-                Extend_Right(rh, LH, leftRange, 1, revfmi, rightMismatch,
+            // 0|1, resuming the ranges the exact extension deferred. Their rows
+            // have usually left the cache, so fetch them all before resuming.
+            for (const SARange& parent : exactRight.mismatches) {
+                Prefetch_Row(revfmi, parent.Start);
+                if (!parent.Skip && parent.End != parent.Start) Prefetch_Row(revfmi, parent.End + 1);
+            }
+            for (const SARange& parent : exactRight.mismatches) {
+                if (maxHits && readHits + rightMismatch.hitCount >= maxHits) break;
+                Extend_Right(rh, LH, parent, 1, revfmi, rightMismatch,
                              maxHits ? maxHits - readHits : 0);
             }
 
