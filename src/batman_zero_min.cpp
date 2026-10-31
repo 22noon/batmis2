@@ -81,13 +81,20 @@ using ActiveBWT = BWT;
 ActiveBWT* revfmi = nullptr;
 ActiveBWT* fwfmi = nullptr;  // loaded only for -n 1
 
-int LOOKUPSIZE = 6;
+int LOOKUP_DEPTH = 6;  // --lookup: requested table depth
+int LOOKUPSIZE = 6;    // depth in use, set by Build_Tables
 int STRINGLENGTH = 36;
 
-unsigned* Forward_Start_LookupX = nullptr;
-unsigned* Forward_End_LookupX = nullptr;
-unsigned* Backward_Start_LookupX = nullptr;
-unsigned* Backward_End_LookupX = nullptr;
+// Start-of-search tables, 4^LOOKUPSIZE entries each, filled by Build_Tables: the SA
+// range of every LOOKUPSIZE-base prefix in revfmi (Forward, first base in the low
+// bits) and suffix in fwfmi (Backward, last base in the low bits). Start and End
+// sit together, so a lookup is one cache line. Depth: benchmark/lookup_table.md.
+struct Lookup_Entry {
+    unsigned Start;
+    unsigned End;
+};
+std::vector<Lookup_Entry> Forward_Lookup;
+std::vector<Lookup_Entry> Backward_Lookup;
 unsigned Branch_Characters[4] = {0, 0, 0, 0};
 SARange Branch_Ranges[4];
 
@@ -338,9 +345,8 @@ void Build_Preindex_Forward(Range range, int level, int bit) {
             range.Start = static_cast<unsigned>(start);
             range.End = static_cast<unsigned>(end);
         }
-        Forward_Start_LookupX[range.Label] = range.Start;
-        Forward_End_LookupX[range.Label] = range.End;
-        assert(Forward_Start_LookupX[range.Label] <= Forward_End_LookupX[range.Label]);
+        Forward_Lookup[range.Label] = {range.Start, range.End};
+        assert(range.Start <= range.End);
     } else {
         assert(range.Start <= range.End);
         range.Label = range.Label | (bit << (2 * (level - 1)));
@@ -371,9 +377,8 @@ void Build_Preindex_Backward(Range range, int level, int bit) {
         range.End = static_cast<unsigned>(end);
     }
     if (LOOKUPSIZE == level) {
-        Backward_Start_LookupX[range.Label] = range.Start;
-        Backward_End_LookupX[range.Label] = range.End;
-        assert(Backward_Start_LookupX[range.Label] <= Backward_End_LookupX[range.Label]);
+        Backward_Lookup[range.Label] = {range.Start, range.End};
+        assert(range.Start <= range.End);
     } else {
         level++;
         for (int i = 0; i < 4; i++) {
@@ -383,9 +388,11 @@ void Build_Preindex_Backward(Range range, int level, int bit) {
 }
 
 void Build_Tables(ActiveBWT* fmi) {
-    if (STRINGLENGTH < 28) {
-        LOOKUPSIZE = 3;
-    }
+    // The -n 1 halves search on from Level LOOKUPSIZE+1, so the key must be shorter
+    // than the left half. Reads too short for that (under 8 bp) keep the minimum 3.
+    LOOKUPSIZE = std::max(3, std::min(LOOKUP_DEPTH, STRINGLENGTH / 2 - 1));
+    Forward_Lookup.assign(1ul << (2 * LOOKUPSIZE), Lookup_Entry{});
+    if (fwfmi) Backward_Lookup.assign(1ul << (2 * LOOKUPSIZE), Lookup_Entry{});
 
     Range lRange{};
     for (int i = 0; i < 4; i++) {
@@ -992,8 +999,8 @@ __attribute__((noinline)) unsigned long One_Mismatch_Search(std::string_view lh,
             bc |= rh[RH - 1 - i] << (2 * i);
         }
         SARange rightRange{};
-        rightRange.Start = Backward_Start_LookupX[bc];
-        rightRange.End = Backward_End_LookupX[bc];
+        rightRange.Start = Backward_Lookup[bc].Start;
+        rightRange.End = Backward_Lookup[bc].End;
         rightRange.Level = LOOKUPSIZE + 1;
         Search_Left(rh, LH, rightRange, fwfmi);
         if (rightRange.Start) {
@@ -1023,8 +1030,8 @@ SARange Start_Range(std::string_view read) {
     }
     int c = 0;
     for (int i = 0; i < LOOKUPSIZE; i++) c |= read[i] << (2 * i);
-    range.Start = Forward_Start_LookupX[c];
-    range.End = Forward_End_LookupX[c];
+    range.Start = Forward_Lookup[c].Start;
+    range.End = Forward_Lookup[c].End;
     range.Level = LOOKUPSIZE + 1;
     return range;
 }
@@ -1118,11 +1125,14 @@ bool LoadPac(const std::string& name) {
 
 void Usage(const char* prog) {
     std::fprintf(stderr,
-    "Usage: %s -q <reads.fa/fq> -g <genome_prefix> [-n <0|1>] [-o <hits.txt>] [-m <maxhits>] [--no-ref] [--quiet|-Q] [--timing]\n"
+    "Usage: %s -q <reads.fa/fq> -g <genome_prefix> [-n <0|1>] [-o <hits.txt>] [-m <maxhits>] [--no-ref] [--lookup <k>] [--quiet|-Q] [--timing]\n"
         "  -n  maximum mismatches (default 0); 1 also needs the forward index <genome_prefix>.bwt/.fmv\n"
         "  -m  maximum hits per read (default 1, 0 = all)\n"
         "  --no-ref  do not load the SA samples (.sa) and packed genome (.pac); single-row\n"
         "            paths then walk the index to the end (less memory, slower)\n"
+        "  --lookup  depth k of the start-of-search tables, 3-14 (default 6): 8*4^k bytes\n"
+        "            per index; deeper is faster once there are more than about 4^k/3 reads\n"
+        "            (see benchmark/lookup_table.md)\n"
         "Output, one line per SA range or located hit:\n"
         "  exact:      query_id\tF\tSA_start\tSA_end\thit_count\n"
         "  1 mismatch: query_id\tF|B\tSA_start\tSA_end\thit_count\t1\n"
@@ -1167,6 +1177,12 @@ int main(int argc, char** argv) {
             quiet = true;
         } else if (std::strcmp(argv[i], "--timing") == 0) {
             timing = true;
+        } else if (std::strcmp(argv[i], "--lookup") == 0 && i + 1 < argc) {
+            LOOKUP_DEPTH = std::atoi(argv[++i]);
+            if (LOOKUP_DEPTH < 3 || LOOKUP_DEPTH > 14) {
+                std::fprintf(stderr, "--lookup must be 3-14\n");
+                return 1;
+            }
         } else if (std::strcmp(argv[i], "--no-ref") == 0) {
             useRef = false;
         } else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
@@ -1234,22 +1250,6 @@ int main(int argc, char** argv) {
     Use_Ref = useRef;
     Text_Length = revfmi->textLength;
     indexLoadSeconds = std::chrono::duration<double>(Clock::now() - loadStart).count();
-
-    const unsigned lookupArraySize = (2u << (2 * LOOKUPSIZE));
-    Forward_Start_LookupX = static_cast<unsigned*>(std::malloc(sizeof(unsigned) * lookupArraySize));
-    Forward_End_LookupX = static_cast<unsigned*>(std::malloc(sizeof(unsigned) * lookupArraySize));
-    if (!Forward_Start_LookupX || !Forward_End_LookupX) {
-        std::fprintf(stderr, "Out of memory for lookup tables\n");
-        return 1;
-    }
-    if (fwfmi) {
-        Backward_Start_LookupX = static_cast<unsigned*>(std::malloc(sizeof(unsigned) * lookupArraySize));
-        Backward_End_LookupX = static_cast<unsigned*>(std::malloc(sizeof(unsigned) * lookupArraySize));
-        if (!Backward_Start_LookupX || !Backward_End_LookupX) {
-            std::fprintf(stderr, "Out of memory for lookup tables\n");
-            return 1;
-        }
-    }
 
     std::ifstream in(queryFile.c_str());
     if (!in) {
