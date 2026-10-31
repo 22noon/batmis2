@@ -4,7 +4,7 @@
 # Native build variant via DEFS: DEFS=-DBATMAN_ZERO_MIN_USE_PAIRED_RANK
 
 CXX ?= g++
-CXXFLAGS ?= -O3 -funroll-loops
+CXXFLAGS ?= -O3 -funroll-loops -mpopcnt
 DEFS ?=
 BINDIR ?= ../bin
 

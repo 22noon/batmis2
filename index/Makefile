@@ -1,7 +1,7 @@
 CC ?= gcc
 CXX ?= g++
-CFLAGS ?= -w -O3 -funroll-loops
-CXXFLAGS ?= -O3 -Wall
+CFLAGS ?= -w -O3 -funroll-loops -mpopcnt
+CXXFLAGS ?= -O3 -Wall -mpopcnt
 AR ?= ar
 RANLIB ?= ranlib
 

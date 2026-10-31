@@ -6,6 +6,7 @@
 #include <cassert>
 #include <cctype>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -26,7 +27,14 @@ namespace {
 constexpr int MAXTAG = 4096;
 constexpr int MAX_MISMATCHES_BOUND = 16;
 constexpr int SAINTERVAL = 8;
-constexpr int BRANCHTHRESHOLD = 0;
+// Ranges with End-Start below this count their BWT characters directly (Count_Range)
+// instead of a second stored-count lookup. Counting is faster up to ~256 rows (cold) and
+// ~400 rows (cached), and much slower beyond; see benchmark/branch_threshold.md.
+#ifdef BATMAN_BRANCHTHRESHOLD
+constexpr int BRANCHTHRESHOLD = BATMAN_BRANCHTHRESHOLD;
+#else
+constexpr int BRANCHTHRESHOLD = 128;
+#endif
 constexpr unsigned char NO_BASE = 4;
 
 struct SARange {
@@ -117,6 +125,45 @@ inline void Prefetch_Row(const ActiveBWT* fmi, unsigned long Index) {
     __builtin_prefetch(fmi->occValueMajor + Explicit * OCC_INTERVAL / OCC_INTERVAL_MAJOR * ALPHABET_SIZE);
     __builtin_prefetch(fmi->bwtCode + Index / CHAR_PER_WORD);
     __builtin_prefetch(fmi->bwtCode + Explicit * OCC_INTERVAL / CHAR_PER_WORD);
+}
+
+// Counts each base among the BWT characters of rows Start..End. Row inverseSa0
+// holds $, which is not stored in bwtCode, so it is skipped (as in BWTOccValue).
+inline void Count_Range(const ActiveBWT* fmi, unsigned long Start, unsigned long End, unsigned Count[4]) {
+    const unsigned long First = Start - (Start > fmi->inverseSa0);
+    const unsigned long Last = End + 1 - (End + 1 > fmi->inverseSa0);	// exclusive
+    const unsigned* Code = fmi->bwtCode;
+    if (First >= Last) { Count[0] = Count[1] = Count[2] = Count[3] = 0; return; }
+
+    // Characters are packed high bits first: character k occupies bits 31-2k..30-2k.
+    // Three bit-planes instead of four base comparisons: low bit of the pair set
+    // means C or T, high bit set means G or T, both means T; A is what remains.
+    // Only the first and last words are masked; whole words in between are counted
+    // two at a time.
+    const unsigned long W0 = First / 16, W1 = (Last - 1) / 16;
+    const unsigned Head = ~0u >> (2 * (First % 16));			// characters k >= First%16
+    const unsigned Tail = ~0u << (30 - 2 * ((Last - 1) % 16));	// characters k <= (Last-1)%16
+    unsigned long CT = 0, GT = 0, T = 0;
+    auto Word32 = [&](unsigned W, unsigned M) {
+        M &= 0x55555555u;
+        const unsigned L = W & M, H = (W >> 1) & M;
+        CT += __builtin_popcount(L); GT += __builtin_popcount(H); T += __builtin_popcount(L & H);
+    };
+    if (W0 == W1) Word32(Code[W0], Head & Tail);
+    else {
+        Word32(Code[W0], Head);
+        unsigned long W = W0 + 1;
+        for (; W + 2 <= W1; W += 2) {
+            uint64_t X; std::memcpy(&X, Code + W, 8);
+            // (X >> 1) moves bit 32 into bit 31, an odd bit that the mask drops.
+            const uint64_t L = X & 0x5555555555555555ULL, H = (X >> 1) & 0x5555555555555555ULL;
+            CT += __builtin_popcountll(L); GT += __builtin_popcountll(H); T += __builtin_popcountll(L & H);
+        }
+        if (W < W1) Word32(Code[W], ~0u);
+        Word32(Code[W1], Tail);
+    }
+    const unsigned long N = Last - First;
+    Count[3] = T; Count[1] = CT - T; Count[2] = GT - T; Count[0] = N - CT - GT + T;
 }
 
 // Returns Base unchanged, as a value the compiler cannot relate to anything
@@ -228,10 +275,11 @@ __attribute__((noinline)) bool Search_Right_Singleton(std::string_view currentTa
     }
 
     for (;;) {
-        index = tag.Start;
-        if (index >= fmi->inverseSa0) {
-            index--;
+        // Row inverseSa0 holds $ (not stored in bwtCode): the path ends there.
+        if (tag.Start == fmi->inverseSa0) {
+            return false;
         }
+        index = tag.Start - (tag.Start > fmi->inverseSa0);
         now = fmi->bwtCode[index / 16] << ((index % 16) * 2) >> (BITS_IN_WORD - 2);
         const unsigned int expected = static_cast<unsigned char>(currentTag[tag.Level - 1]);
         const unsigned base = Read_Base(expected);
@@ -260,7 +308,6 @@ __attribute__((noinline)) bool Search_Right_Singleton(std::string_view currentTa
 // Extends tag to the right over currentTag[Level-1] with no mismatches.
 bool Search_Right(std::string_view currentTag, SARange& tag, ActiveBWT* fmi) {
     const int stringLength = static_cast<int>(currentTag.size());
-    unsigned long first, last;
     unsigned int now;
 
     if (!tag.Start) {
@@ -272,28 +319,12 @@ bool Search_Right(std::string_view currentTag, SARange& tag, ActiveBWT* fmi) {
             return Search_Right_Singleton(currentTag, tag, fmi);
         } else {
             if (tag.End - tag.Start < BRANCHTHRESHOLD) {
-                Branch_Characters[0] = 0;
-                Branch_Characters[1] = 0;
-                Branch_Characters[2] = 0;
-                Branch_Characters[3] = 0;
-
-                if (tag.Start + 1 >= fmi->inverseSa0) {
-                    first = tag.Start;
-                    last = tag.End;
-                } else {
-                    first = tag.Start + 1;
-                    last = tag.End + 1;
-                }
-
-                for (unsigned long pos = first; pos <= last; pos++) {
-                    now = fmi->bwtCode[(pos - 1) / 16] << (((pos - 1) % 16) * 2) >> (BITS_IN_WORD - 2);
-                    Branch_Characters[now]++;
-                }
-
+                unsigned count[4];
+                Count_Range(fmi, tag.Start, tag.End, count);
                 now = currentTag[tag.Level - 1];
-                if (Branch_Characters[now]) {
+                if (count[now]) {
                     tag.Start = fmi->cumulativeFreq[now] + BWTOccValue(fmi, tag.Start, now) + 1;
-                    tag.End = tag.Start + Branch_Characters[now] - 1;
+                    tag.End = tag.Start + count[now] - 1;
                 } else {
                     tag.Start = 0;
                 }
@@ -319,32 +350,30 @@ void Branch_Detect (const struct SARange Tag,BWT *fmi,int Start)
 	Branch_Characters[0]=0;Branch_Characters[1]=0;Branch_Characters[2]=0;Branch_Characters[3]=0;
 	if(Tag.End-Tag.Start<BRANCHTHRESHOLD)//only small number of branches
 	{
-		unsigned Last, First;
-		char Now;
-
-		if (Tag.Start+1 >= fmi->inverseSa0) {First=Tag.Start;Last=Tag.End;} else {First=Tag.Start+1;Last=Tag.End+1;} 
-
-		for (unsigned long Pos=First;Pos<=Last;Pos++)
-		{
-			Now=fmi->bwtCode[(Pos-1) / 16] << (((Pos-1) % 16) * 2)>> (BITS_IN_WORD - 2);
-			Branch_Characters[Now]++;	
-		}
-
+		// Occurrences at Start, plus the range's own characters (no second lookup).
+		unsigned int ALIGN_16 Occ_Start[ALPHABET_SIZE];
+		unsigned Count[4];
+		BWTAllOccValue(fmi, Tag.Start, Occ_Start);
+		Count_Range(fmi, Tag.Start, Tag.End, Count);
 		for (int Branch=0;Branch<4;Branch++)
 		{
-			if (Branch_Characters[Branch])
+			Branch_Characters[Branch]=Count[Branch];
+			if (Count[Branch])
 			{
-				Branch_Ranges[Branch].Start = fmi->cumulativeFreq[Branch] + BWTOccValue(fmi, Tag.Start, Branch) + 1;
-				Branch_Ranges[Branch].End = Branch_Ranges[Branch].Start + Branch_Characters[Branch]-1;// Calculate SAranges
+				Branch_Ranges[Branch].Start = fmi->cumulativeFreq[Branch] + Occ_Start[Branch] + 1;
+				Branch_Ranges[Branch].End = Branch_Ranges[Branch].Start + Count[Branch]-1;// Calculate SAranges
 			}
 		}
 	}
 	else
 	{
+		// Occurrences of all four bases at both ends in one call (one decode per end).
+		unsigned int ALIGN_16 Occ_Start[ALPHABET_SIZE], Occ_End[ALPHABET_SIZE];
+		BWTAllOccValueTwoIndex(fmi, Tag.Start, Tag.End+1, Occ_Start, Occ_End);
 		for (int Branch=0;Branch<4;Branch++)
 		{
-				Branch_Ranges[Branch].Start = fmi->cumulativeFreq[Branch] + BWTOccValue(fmi, Tag.Start, Branch) + 1;
-				Branch_Ranges[Branch].End = fmi->cumulativeFreq[Branch] + BWTOccValue(fmi, Tag.End+1, Branch);
+				Branch_Ranges[Branch].Start = fmi->cumulativeFreq[Branch] + Occ_Start[Branch] + 1;
+				Branch_Ranges[Branch].End = fmi->cumulativeFreq[Branch] + Occ_End[Branch];
 				if(!(Branch_Ranges[Branch].End<Branch_Ranges[Branch].Start)) Branch_Characters[Branch]=1;
 		}
 
@@ -364,8 +393,8 @@ void Extend_Right_Singleton(std::string_view Current_Tag,int Offset,struct SARan
 	for(;;)
 	{
 		
-		Index=Tag.Start;
-		if (Index >= fmi->inverseSa0) Index--;//adjust for missing $
+		if (Tag.Start==fmi->inverseSa0) return;//$ row: no base to extend with
+		Index=Tag.Start-(Tag.Start>fmi->inverseSa0);//adjust for missing $
 		Now=fmi->bwtCode[(Index) / 16] << (((Index) % 16) * 2)>> (BITS_IN_WORD - 2);
 		if (Now==Tag.Forbidden_Base) return;//already tried by the pass that deferred this range
 		const unsigned char Expected=Current_Tag[Tag.Level-1];
@@ -444,6 +473,7 @@ void Extend_Right(std::string_view Current_Tag,int Offset,const struct SARange &
 			const unsigned char Expected=Current_Tag[Range.Level-1];
 			Temp_Range=Range;
 			Get_SARange_Fast(Expected,Temp_Range,fmi);
+			// A parent holding the $ row also differs in size; deferring it is harmless (its resume finds nothing).
 			if (!Temp_Range.Start || Temp_Range.End-Temp_Range.Start!=Range.End-Range.Start)
 			{
 				Range.Forbidden_Base=Expected;//other bases remain: defer the parent
@@ -526,8 +556,8 @@ __attribute__((noinline)) void Search_Left_Singleton(std::string_view Current_Ta
 	}
 	for(;;)
 	{
-		Index=Tag.Start;
-		if (Index >= fmi->inverseSa0) Index--;//adjust for missing $
+		if (Tag.Start==fmi->inverseSa0) {Tag.Start=0;return;}//$ row: no base to extend with
+		Index=Tag.Start-(Tag.Start>fmi->inverseSa0);//adjust for missing $
 		Now=fmi->bwtCode[(Index) / 16] << (((Index) % 16) * 2)>> (BITS_IN_WORD - 2);//FMIBwtValue(fmi,Index);
 		const unsigned long Expected=static_cast<unsigned char>(Current_Tag[StringLength-Level]);
 		const unsigned Base=Read_Base(Expected);
@@ -562,7 +592,7 @@ void Search_Left(std::string_view Current_Tag,struct SARange & Tag,BWT *fmi)
 {
 	const int StringLength=static_cast<int>(Current_Tag.size());
 
-	unsigned long Now,First,Last;
+	unsigned long Now;
 	if (!Tag.Start) return;
 
 	for(;;)
@@ -576,21 +606,14 @@ void Search_Left(std::string_view Current_Tag,struct SARange & Tag,BWT *fmi)
 		{
 			if(Tag.End-Tag.Start<BRANCHTHRESHOLD)//only small number of branches
 			{
-				Branch_Characters[0]=0;Branch_Characters[1]=0;Branch_Characters[2]=0;Branch_Characters[3]=0;
-
-				if (Tag.Start+1 >= fmi->inverseSa0) {First=Tag.Start;Last=Tag.End;} else {First=Tag.Start+1;Last=Tag.End+1;}
-				for (unsigned long Pos=First;Pos<=Last;Pos++)
-				{
-					Now=fmi->bwtCode[(Pos-1) / 16] << (((Pos-1) % 16) * 2)>> (BITS_IN_WORD - 2);
-					Branch_Characters[Now]++;
-				}
-
+				unsigned Count[4];
+				Count_Range(fmi, Tag.Start, Tag.End, Count);
 				Now=Current_Tag[StringLength-Tag.Level];
-				if (Branch_Characters[Now])//we have a match...
+				if (Count[Now])//we have a match...
 				{
 
 					Tag.Start = fmi->cumulativeFreq[Now] + BWTOccValue(fmi, Tag.Start, Now) + 1;
-					Tag.End = Tag.Start + Branch_Characters[Now]-1;// Calculate SAranges
+					Tag.End = Tag.Start + Count[Now]-1;// Calculate SAranges
 
 				}
 				else
@@ -630,8 +653,8 @@ void Extend_Left_Singleton(std::string_view Current_Tag,int Offset,struct SARang
 
 	for(;;)
 	{
-		Index=Tag.Start;
-		if (Index >= fmi->inverseSa0) Index--;//adjust for missing $
+		if (Tag.Start==fmi->inverseSa0) return;//$ row: no base to extend with
+		Index=Tag.Start-(Tag.Start>fmi->inverseSa0);//adjust for missing $
 		Now=fmi->bwtCode[(Index) / 16] << (((Index) % 16) * 2)>> (BITS_IN_WORD - 2);//FMIBwtValue(fmi,Index);
 		if (Now==Tag.Forbidden_Base) return;//already tried by the pass that deferred this range
 		const unsigned char Expected=Current_Tag[StringLength-Tag.Level];
@@ -704,6 +727,7 @@ void Extend_Left(std::string_view Current_Tag,int Offset,const struct SARange & 
 			const unsigned char Expected=Current_Tag[StringLength-Range.Level];
 			Temp_Range=Range;
 			Get_SARange_Fast(Expected,Temp_Range,fmi);
+			// A parent holding the $ row also differs in size; deferring it is harmless (its resume finds nothing).
 			if (!Temp_Range.Start || Temp_Range.End-Temp_Range.Start!=Range.End-Range.Start)
 			{
 				Range.Forbidden_Base=Expected;//other bases remain: defer the parent
