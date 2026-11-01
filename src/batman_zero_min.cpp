@@ -121,10 +121,11 @@ ActiveBWT* initFMI(const char* bwtCodeFileName, const char* bwtOccValueFileName,
     return BWTLoad(mmPool, bwtCodeFileName, bwtOccValueFileName, saValueFileName, nullptr, nullptr, nullptr);
 }
 
-void Pack_Read(std::string_view Read) {
-    std::memset(Read_Packed, 0, (Read.size() + 31) / 32 * sizeof(uint64_t));
+// Packed defaults to the current read's Read_Packed; batched searches pass their own.
+void Pack_Read(std::string_view Read, uint64_t* Packed = Read_Packed) {
+    std::memset(Packed, 0, (Read.size() + 31) / 32 * sizeof(uint64_t));
     for (std::size_t i = 0; i < Read.size(); i++) {
-        Read_Packed[i / 32] |= static_cast<uint64_t>(Read[i]) << (62 - 2 * (i % 32));
+        Packed[i / 32] |= static_cast<uint64_t>(Read[i]) << (62 - 2 * (i % 32));
     }
 }
 
@@ -141,18 +142,18 @@ inline uint64_t Genome_Word(unsigned long G0) {
 
 // For read word W against genome word G: the low bit of each base's pair (bit
 // 62-2k for base k) is set where the bases differ, for bases k in [Lo, Hi) only.
-inline uint64_t Mismatch_Bits(uint64_t G, int W, int Lo, int Hi) {
-    uint64_t X = G ^ Read_Packed[W];
+inline uint64_t Mismatch_Bits(uint64_t G, int W, int Lo, int Hi, const uint64_t* Packed = Read_Packed) {
+    uint64_t X = G ^ Packed[W];
     X = (X | (X >> 1)) & 0x5555555555555555ULL;
     return X & (~0ULL >> (2 * Lo)) & (Hi == 32 ? ~0ULL : ~(~0ULL >> (2 * Hi)));
 }
 
 // Mismatches between read[A..B) and genome[S+A..S+B), 32 bases at a time:
 // XOR with the genome, fold each base's two bits into one, popcount.
-unsigned Genome_Mismatches(unsigned long S, int A, int B) {
+unsigned Genome_Mismatches(unsigned long S, int A, int B, const uint64_t* Packed = Read_Packed) {
     unsigned D = 0;
     for (int W = A / 32; W * 32 < B; W++) {
-        D += __builtin_popcountll(Mismatch_Bits(Genome_Word(S + W * 32), W, std::max(A - W * 32, 0), std::min(B - W * 32, 32)));
+        D += __builtin_popcountll(Mismatch_Bits(Genome_Word(S + W * 32), W, std::max(A - W * 32, 0), std::min(B - W * 32, 32), Packed));
     }
     return D;
 }
@@ -205,9 +206,9 @@ bool Locate(const ActiveBWT* fmi, SARange& Tag, bool Right, int Offset, int Len,
 }
 
 // Mismatches in the part of the segment a located Tag has not matched yet.
-unsigned Rest_Mismatches(const SARange& Tag, bool Right, int Offset, int Len, int Done) {
-    return Right ? Genome_Mismatches(Tag.Pos, Offset + Done, Offset + Len)
-                 : Genome_Mismatches(Tag.Pos, Offset, Offset + Len - Done);
+unsigned Rest_Mismatches(const SARange& Tag, bool Right, int Offset, int Len, int Done, const uint64_t* Packed = Read_Packed) {
+    return Right ? Genome_Mismatches(Tag.Pos, Offset + Done, Offset + Len, Packed)
+                 : Genome_Mismatches(Tag.Pos, Offset, Offset + Len - Done, Packed);
 }
 
 // Search_Right/Search_Left at a sampled row: matches if the rest of the segment does.
@@ -1036,6 +1037,160 @@ SARange Start_Range(std::string_view read) {
     return range;
 }
 
+// Batched exact search (-n 0 with --batch B > 1). Each step of a search waits for
+// one cache miss, and one read's steps depend on each other, so B reads ("lanes")
+// are searched at once: each round prefetches what every lane's next step reads,
+// then steps every lane. Each lane follows Search_Right and Search_Right_Singleton
+// exactly (same ranges, Skip and located positions), so the output is unchanged.
+// See benchmark/batched_reads.md.
+constexpr unsigned MAX_BATCH = 64;
+
+enum Lane_State : unsigned char { LANE_WIDE, LANE_SINGLE, LANE_LOCATE, LANE_COMPARE, LANE_DONE };
+
+struct Exact_Lane {
+    SARange R;
+    std::string_view Read;
+    unsigned Index;        // the read's place in the block
+    int Done;              // LOCATE/COMPARE: bases matched when the sampled row was reached
+    Lane_State State;
+    uint64_t Packed[MAXTAG / 32 + 1];
+};
+
+// Search_Right_Singleton's check on entry and after each step: at a sampled row,
+// locate (with the reference) or mark the range as a single row.
+inline void Lane_Sampled(Exact_Lane& L, int Done) {
+    if (L.R.Skip || L.R.Start % SAINTERVAL != 0) return;
+    if (Use_Ref) {
+        L.Done = Done;
+        L.State = LANE_LOCATE;
+        return;
+    }
+    L.R.Skip++;
+    L.R.End = L.R.Start;
+}
+
+inline void Lane_Prefetch(const Exact_Lane& L) {
+    switch (L.State) {
+        case LANE_WIDE:
+            Prefetch_Row(revfmi, L.R.Start);
+            Prefetch_Row(revfmi, L.R.End + 1);
+            break;
+        case LANE_SINGLE:
+            Prefetch_Row(revfmi, L.R.Start);
+            break;
+        case LANE_LOCATE:
+            __builtin_prefetch(revfmi->saValue + L.R.Start / SAINTERVAL);
+            break;
+        case LANE_COMPARE:
+            __builtin_prefetch(Pac.data() + (L.R.Pos + L.Done) / 4);
+            __builtin_prefetch(Pac.data() + (L.R.Pos + L.Read.size()) / 4);
+            break;
+        default:
+            break;
+    }
+}
+
+// One step of a lane. Returns true when the lane has finished (LANE_DONE), with
+// Found as Search_Right would return.
+inline bool Lane_Step(Exact_Lane& L, bool& Found) {
+    const int Len = static_cast<int>(L.Read.size());
+    switch (L.State) {
+        case LANE_WIDE:
+            Get_SARange(L.Read[L.R.Level - 1], L.R, revfmi);
+            if (!L.R.Start) break;
+            if (L.R.Level == Len) {
+                Found = true;
+                return true;
+            }
+            L.R.Level++;
+            if (L.R.End == L.R.Start) {
+                L.State = LANE_SINGLE;
+                Lane_Sampled(L, L.R.Level - 1);
+            }
+            return false;
+        case LANE_SINGLE: {
+            if (L.R.Start == revfmi->inverseSa0) break;  // $ row
+            const unsigned long Index = L.R.Start - (L.R.Start > revfmi->inverseSa0);
+            const unsigned Now = revfmi->bwtCode[Index / 16] << ((Index % 16) * 2) >> (BITS_IN_WORD - 2);
+            const unsigned Expected = static_cast<unsigned char>(L.Read[L.R.Level - 1]);
+            const unsigned Base = Read_Base(Expected);
+            if (Expected != Now) break;
+            L.R.Start = revfmi->cumulativeFreq[Base] + BWTOccValue(revfmi, L.R.Start, Base) + 1;
+            Lane_Sampled(L, L.R.Level);
+            if (L.State == LANE_LOCATE) return false;
+            if (L.R.Level == Len) {
+                L.R.End = L.R.Start;
+                Found = true;
+                return true;
+            }
+            L.R.Level++;
+            return false;
+        }
+        case LANE_LOCATE:
+            if (!Locate(revfmi, L.R, true, 0, Len, L.Done)) break;
+            L.State = LANE_COMPARE;
+            return false;
+        case LANE_COMPARE:
+            if (Rest_Mismatches(L.R, true, 0, Len, L.Done, L.Packed)) break;
+            L.R.Level = Len;
+            Found = true;
+            return true;
+        default:
+            break;
+    }
+    Found = false;
+    return true;
+}
+
+// Searches Count reads of Len bases (codes, back to back) and sets Ranges[i] and
+// Found[i] as Search_Right from Start_Range would, B reads at a time.
+void Batch_Exact(const char* Reads, unsigned Count, int Len, unsigned B, std::vector<SARange>& Ranges,
+                 std::vector<unsigned char>& Found) {
+    static Exact_Lane Lanes[MAX_BATCH];
+    unsigned Active = 0, Next = 0;
+    // Starts the next read in lane L; reads that need no search finish at once.
+    auto Fill = [&](Exact_Lane& L) {
+        while (Next < Count) {
+            const unsigned I = Next++;
+            L.Read = std::string_view(Reads + static_cast<std::size_t>(I) * Len, Len);
+            L.Index = I;
+            L.R = Start_Range(L.Read);
+            if (L.R.Level > Len || !L.R.Start) {  // read no longer than the lookup key, or no match
+                Ranges[I] = L.R;
+                Found[I] = L.R.Start != 0;
+                continue;
+            }
+            if (Use_Ref) Pack_Read(L.Read, L.Packed);
+            L.State = LANE_WIDE;
+            if (L.R.End == L.R.Start || L.R.Skip) {
+                L.State = LANE_SINGLE;
+                Lane_Sampled(L, L.R.Level - 1);
+            }
+            return true;
+        }
+        return false;
+    };
+    for (unsigned i = 0; i < B && Fill(Lanes[Active]); i++) Active++;
+    while (Active) {
+        for (unsigned i = 0; i < Active; i++) Lane_Prefetch(Lanes[i]);
+        for (unsigned i = 0; i < Active;) {
+            Exact_Lane& L = Lanes[i];
+            bool F;
+            if (!Lane_Step(L, F)) {
+                i++;
+                continue;
+            }
+            Ranges[L.Index] = L.R;
+            Found[L.Index] = F;
+            if (!Fill(L)) {
+                L = Lanes[--Active];  // no reads left: close the gap
+                continue;             // step the moved lane in this round too
+            }
+            i++;
+        }
+    }
+}
+
 // "\t<dir>\t<start>\t<end>" for an SA range, or "\tP\t<pos>\t<pos>" for a located hit.
 std::string Hit_Text(const SARange& hit, const char* dir) {
     if (Use_Ref && hit.Skip) {
@@ -1123,9 +1278,86 @@ bool LoadPac(const std::string& name) {
     return static_cast<bool>(in.read(reinterpret_cast<char*>(Pac.data()), size));
 }
 
+// -n 0 with --batch B > 1: reads the records in blocks, searches each block with
+// Batch_Exact and writes its lines in input order, as the per-read loop in main
+// does. Encoding the reads counts as input here. Returns false on an unsupported
+// read length.
+bool Run_Batched_Exact(std::ifstream& in, std::ostream& out, unsigned B, unsigned maxHits, bool quiet,
+                       uint64_t& records, uint64_t& reportedHits, double& tableBuildSeconds,
+                       double& inputParseSeconds, double& searchSeconds, double& outputSeconds) {
+    using Clock = std::chrono::steady_clock;
+    constexpr unsigned BLOCK = 4096;
+    std::vector<std::string> ids(BLOCK);
+    std::vector<unsigned char> searched(BLOCK);  // valid read of the right length
+    std::vector<unsigned> slot(BLOCK);            // its place among the searched reads
+    std::vector<SARange> ranges(BLOCK);
+    std::vector<unsigned char> found(BLOCK);
+    std::string reads;  // codes of the searched reads, back to back
+    std::string seq, lines;
+    bool initialized = false, more = true;
+    while (more) {
+        unsigned n = 0, count = 0;
+        double tableSeconds = 0.0;
+        reads.clear();
+        const auto parseStart = Clock::now();
+        while (n < BLOCK && (more = ReadNextRecord(in, ids[n], seq))) {
+            ++records;
+            if (!initialized) {
+                STRINGLENGTH = static_cast<int>(seq.size());
+                if (STRINGLENGTH <= 0 || STRINGLENGTH >= MAXTAG) {
+                    std::fprintf(stderr, "Unsupported read length: %d\n", STRINGLENGTH);
+                    return false;
+                }
+                const auto tableStart = Clock::now();
+                Build_Tables(revfmi);
+                tableSeconds = std::chrono::duration<double>(Clock::now() - tableStart).count();
+                initialized = true;
+            }
+            bool valid = static_cast<int>(seq.size()) == STRINGLENGTH;
+            const std::size_t at = reads.size();
+            if (valid) {
+                reads.resize(at + STRINGLENGTH);
+                for (int i = 0; i < STRINGLENGTH && valid; i++) {
+                    const int code = EncodeBase(seq[i]);
+                    valid = code >= 0;
+                    reads[at + i] = static_cast<char>(code);
+                }
+                if (!valid) reads.resize(at);
+            }
+            searched[n] = valid;
+            slot[n] = count;
+            count += valid;
+            n++;
+        }
+        tableBuildSeconds += tableSeconds;
+        inputParseSeconds += std::chrono::duration<double>(Clock::now() - parseStart).count() - tableSeconds;
+
+        const auto searchStart = Clock::now();
+        Batch_Exact(reads.data(), count, STRINGLENGTH, B, ranges, found);
+        searchSeconds += std::chrono::duration<double>(Clock::now() - searchStart).count();
+
+        const auto outputStart = Clock::now();
+        lines.clear();
+        for (unsigned j = 0; j < n; j++) {
+            const SARange& range = ranges[slot[j]];
+            if (!searched[j] || !found[slot[j]] || range.Start == 0) {
+                if (!quiet) lines += ids[j] + "\tF\t0\t0\t0\n";
+                continue;
+            }
+            unsigned long hitCount = range.Skip ? 1UL : (range.End >= range.Start ? (range.End - range.Start + 1UL) : 0UL);
+            if (maxHits > 0 && hitCount > maxHits) hitCount = maxHits;
+            reportedHits += hitCount;
+            if (!quiet) lines += ids[j] + Hit_Text(range, "F") + "\t" + std::to_string(hitCount) + "\n";
+        }
+        if (!quiet) out << lines;
+        outputSeconds += std::chrono::duration<double>(Clock::now() - outputStart).count();
+    }
+    return true;
+}
+
 void Usage(const char* prog) {
     std::fprintf(stderr,
-    "Usage: %s -q <reads.fa/fq> -g <genome_prefix> [-n <0|1>] [-o <hits.txt>] [-m <maxhits>] [--no-ref] [--lookup <k>] [--quiet|-Q] [--timing]\n"
+    "Usage: %s -q <reads.fa/fq> -g <genome_prefix> [-n <0|1>] [-o <hits.txt>] [-m <maxhits>] [--no-ref] [--lookup <k>] [--batch <B>] [--quiet|-Q] [--timing]\n"
         "  -n  maximum mismatches (default 0); 1 also needs the forward index <genome_prefix>.bwt/.fmv\n"
         "  -m  maximum hits per read (default 1, 0 = all)\n"
         "  --no-ref  do not load the SA samples (.sa) and packed genome (.pac); single-row\n"
@@ -1133,6 +1365,8 @@ void Usage(const char* prog) {
         "  --lookup  depth k of the start-of-search tables, 3-14 (default 6): 8*4^k bytes\n"
         "            per index; deeper is faster once there are more than about 4^k/3 reads\n"
         "            (see benchmark/lookup_table.md)\n"
+        "  --batch   with -n 0, search B reads at a time, 1-64 (default 1), so that their\n"
+        "            memory accesses overlap (see benchmark/batched_reads.md)\n"
         "Output, one line per SA range or located hit:\n"
         "  exact:      query_id\tF\tSA_start\tSA_end\thit_count\n"
         "  1 mismatch: query_id\tF|B\tSA_start\tSA_end\thit_count\t1\n"
@@ -1153,6 +1387,7 @@ int main(int argc, char** argv) {
     bool quiet = false;
     bool timing = false;
     bool useRef = true;
+    int batchSize = 1;
 
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "-q") == 0 && i + 1 < argc) {
@@ -1177,6 +1412,12 @@ int main(int argc, char** argv) {
             quiet = true;
         } else if (std::strcmp(argv[i], "--timing") == 0) {
             timing = true;
+        } else if (std::strcmp(argv[i], "--batch") == 0 && i + 1 < argc) {
+            batchSize = std::atoi(argv[++i]);
+            if (batchSize < 1 || batchSize > static_cast<int>(MAX_BATCH)) {
+                std::fprintf(stderr, "--batch must be 1-%u\n", MAX_BATCH);
+                return 1;
+            }
         } else if (std::strcmp(argv[i], "--lookup") == 0 && i + 1 < argc) {
             LOOKUP_DEPTH = std::atoi(argv[++i]);
             if (LOOKUP_DEPTH < 3 || LOOKUP_DEPTH > 14) {
@@ -1278,7 +1519,12 @@ int main(int argc, char** argv) {
     ForwardResults rightMismatch;  // 0|1 ranges, reverse index
     ForwardResults leftMismatch;   // 1|0 ranges, forward index
 
-    for (;;) {
+    const bool batched = batchSize > 1 && maxMismatches == 0;
+    if (batched && !Run_Batched_Exact(in, *out, batchSize, maxHits, quiet, records, reportedHits, tableBuildSeconds,
+                                      inputParseSeconds, searchSeconds, outputSeconds)) {
+        return 1;
+    }
+    while (!batched) {
         const auto parseStart = Clock::now();
         const bool haveRecord = ReadNextRecord(in, id, seq);
         inputParseSeconds += std::chrono::duration<double>(Clock::now() - parseStart).count();
