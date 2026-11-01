@@ -57,7 +57,7 @@ struct SARange {
     char Mismatches;
     unsigned char Skip;          // nonzero: single row; with the reference, located (Pos valid)
     unsigned char Forbidden_Base = NO_BASE;  // threshold reject: base already tried at Level
-    int Tag;
+    int Stage;                   // a reported mismatch hit: its stage (Result_List, Hit_Stage)
     unsigned char Mismatch_Pos[MAX_MISMATCHES_BOUND];
     unsigned Mismatch_Char;
     unsigned long Pos;           // located: forward-genome start of the read
@@ -75,6 +75,55 @@ struct ForwardResults {
     std::vector<SARange> mismatches;  // deferred parents at Count mismatches: resume at Level, skipping Forbidden_Base
     unsigned long hitCount = 0;       // locations in hits
 };
+
+// Each read's result lists for -n 1 to 3 (Res[RL_LISTS]). The stages run in output
+// order and add their hits to RL_HITS; End_Stage tags each with its stage, and keeps
+// the stage's rejects (collected in RL_HITS.mismatches) as its chain's latest round,
+// so each chain of resumed rejects holds one round, whatever the mismatch count.
+enum Result_List : unsigned {
+    RL_EXACT,              // 0|0 hits; its rejects are the forward chain's first round
+    RL_HITS,               // every mismatch hit, in stage order; the running stage's rejects
+    RL_FWD,                // the forward chain's (0|k) latest rejects
+    RL_BWD,                // the backward chain's (k|0)
+    RL_CROSS,              // the 1|k chain's (-n 3)
+    RL_SEED_1, RL_SEED_2,  // the running stage's one-mismatch seeds
+    RL_LISTS,
+    RL_NONE = 0xFF         // End_Stage: drop the rejects
+};
+
+// A mismatch stage's output: the index its ranges are in (F revfmi, B fwfmi) and the
+// mismatch count. Its hits carry its position in the search's table as SARange::Stage.
+struct Hit_Stage {
+    const char* Dir;
+    int Mismatches;
+};
+enum : int { ST_RIGHT1, ST_LEFT1, ST_RIGHT2, ST_LEFT2 };  // 0|1, 1|0, 0|2, 2|0
+enum : int { ST2_CROSS_A = 4, ST2_CROSS_B, ST2_CROSS_C };  // -n 2: the thirds' 1|1 (a), (b), (c)
+enum : int { ST3_CROSS_11 = 4, ST3_RIGHT3, ST3_LEFT3, ST3_CROSS_12, ST3_CROSS_21 };  // -n 3: 1|1, 0|3, 3|0, 1|2, 2|1
+constexpr Hit_Stage One_Stages[] = {{"F", 1}, {"B", 1}};
+constexpr Hit_Stage Two_Stages[] = {{"F", 1}, {"B", 1}, {"F", 2}, {"B", 2}, {"F", 2}, {"B", 2}, {"B", 2}};
+constexpr Hit_Stage Three_Stages[] = {{"F", 1}, {"B", 1}, {"F", 2}, {"B", 2}, {"F", 2},
+                                      {"F", 3}, {"B", 3}, {"F", 3}, {"B", 3}};
+
+// Tags the hits added since Tagged with Stage.
+inline void Tag_Hits(ForwardResults* Res, std::size_t& Tagged, int Stage) {
+    std::vector<SARange>& Hits = Res[RL_HITS].hits;
+    for (; Tagged < Hits.size(); Tagged++) Hits[Tagged].Stage = Stage;
+}
+
+// Ends a stage: tags its hits, keeps its rejects as list Keep's (replacing that chain's
+// previous round; RL_NONE drops them) and drops its seeds.
+inline void End_Stage(ForwardResults* Res, std::size_t& Tagged, int Stage, unsigned Keep) {
+    Tag_Hits(Res, Tagged, Stage);
+    std::vector<SARange>& Rejects = Res[RL_HITS].mismatches;
+    if (Keep != RL_NONE) Res[Keep].mismatches.swap(Rejects);
+    Rejects.clear();
+    for (unsigned k : {RL_SEED_1, RL_SEED_2}) {
+        Res[k].hits.clear();
+        Res[k].mismatches.clear();
+        Res[k].hitCount = 0;
+    }
+}
 
 MMPool* mmPool = nullptr;
 using ActiveBWT = BWT;
@@ -1038,23 +1087,26 @@ void Search_Left_Stored(std::string_view Seg, int Offset, SARange& R, int Stop, 
 }
 
 // BatMis one-mismatch scan of one read split into lh|rh, starting from range
-// (lh's lookup-table range): lh exact, then rh extended with no mismatches (0|0,
-// into exactRight). The ranges that extension defers are resumed with one
-// mismatch (0|1, into rightMismatch). Finally rh exact with a mismatch in lh
-// (1|0, into leftMismatch). Returns the locations of the 0|0 hits (each range
-// capped at MaxHits, 0 = no limit), which bound the later passes.
+// (lh's lookup-table range), into Res (Result_List; all cleared first): lh exact, then
+// rh extended with no mismatches (0|0, RL_EXACT). The ranges that extension defers are
+// resumed with one mismatch (0|1, stage ST_RIGHT1; rejects to RL_FWD). Then, unless
+// MaxHits is reached, rh exact with a mismatch in lh (1|0, ST_LEFT1; rejects to RL_BWD).
+// Returns the locations of the 0|0 hits (each range capped at MaxHits, 0 = no limit),
+// which bound the later passes; Tagged is the count of tagged hits (End_Stage).
 // With Scan (-n 2 and up), also records what the two exact half scans found (Half_Scan).
 __attribute__((noinline)) unsigned long One_Mismatch_Search(std::string_view lh, std::string_view rh, SARange range, unsigned MaxHits,
-                                                            ForwardResults& exactRight, ForwardResults& rightMismatch, ForwardResults& leftMismatch,
-                                                            Half_Scan* Scan = nullptr) {
+                                                            ForwardResults* Res, std::size_t& Tagged, Half_Scan* Scan = nullptr) {
     const int LH = static_cast<int>(lh.size());
     const int RH = static_cast<int>(rh.size());
     unsigned long readHits = 0;
-    for (ForwardResults* r : {&exactRight, &rightMismatch, &leftMismatch}) {
-        r->hits.clear();
-        r->mismatches.clear();
-        r->hitCount = 0;
+    for (unsigned k = 0; k < RL_LISTS; k++) {
+        Res[k].hits.clear();
+        Res[k].mismatches.clear();
+        Res[k].hitCount = 0;
     }
+    Tagged = 0;
+    ForwardResults& exact = Res[RL_EXACT];
+    ForwardResults& hits = Res[RL_HITS];
 
     // 0|0
     const bool Table_Hit = range.Start != 0;  // else the table's first Level - 1 bases do not occur
@@ -1063,11 +1115,11 @@ __attribute__((noinline)) unsigned long One_Mismatch_Search(std::string_view lh,
         range.Level = 1;
         range.Mismatches = 0;
         range.Mismatch_Char = 0;
-        Extend_Right(rh, LH, range, 0, revfmi, exactRight, 0);
+        Extend_Right(rh, LH, range, 0, revfmi, exact, 0);
     } else if (Scan) {
         Scan->LH_Fail = Table_Hit ? range.Level : range.Level - 1;
     }
-    for (const SARange& hit : exactRight.hits) {
+    for (const SARange& hit : exact.hits) {
         unsigned long hitCount = hit.Skip ? 1UL : (hit.End >= hit.Start ? (hit.End - hit.Start + 1UL) : 0UL);
         if (MaxHits > 0 && hitCount > MaxHits) {
             hitCount = MaxHits;
@@ -1077,7 +1129,7 @@ __attribute__((noinline)) unsigned long One_Mismatch_Search(std::string_view lh,
 
     // 0|1, resuming the ranges the exact extension deferred. Their rows
     // have usually left the cache, so fetch them all before resuming.
-    for (const SARange& parent : exactRight.mismatches) {
+    for (const SARange& parent : exact.mismatches) {
         if (Use_Ref && parent.Skip) {
             __builtin_prefetch(Pac.data() + (parent.Pos + LH) / 4);  // located: only the genome is read
             continue;
@@ -1085,32 +1137,31 @@ __attribute__((noinline)) unsigned long One_Mismatch_Search(std::string_view lh,
         Prefetch_Row(revfmi, parent.Start);
         if (!parent.Skip && parent.End != parent.Start) Prefetch_Row(revfmi, parent.End + 1);
     }
-    for (const SARange& parent : exactRight.mismatches) {
-        if (MaxHits && readHits + rightMismatch.hitCount >= MaxHits) break;
-        Extend_Right(rh, LH, parent, 1, revfmi, rightMismatch,
-                     MaxHits ? MaxHits - readHits : 0);
+    for (const SARange& parent : exact.mismatches) {
+        if (MaxHits && readHits + hits.hitCount >= MaxHits) break;
+        Extend_Right(rh, LH, parent, 1, revfmi, hits, MaxHits ? MaxHits - readHits : 0);
     }
+    End_Stage(Res, Tagged, ST_RIGHT1, RL_FWD);
 
     // 1|0
-    if (MaxHits == 0 || readHits + rightMismatch.hitCount < MaxHits) {
-        int bc = 0;
-        for (int i = 0; i < LOOKUPSIZE; i++) {
-            bc |= rh[RH - 1 - i] << (2 * i);
-        }
-        SARange rightRange{};
-        rightRange.Start = Backward_Lookup[bc].Start;
-        rightRange.End = Backward_Lookup[bc].End;
-        rightRange.Level = LOOKUPSIZE + 1;
-        const bool Right_Table_Hit = rightRange.Start != 0;
-        if (Scan) Search_Left_Stored(rh, LH, rightRange, Scan->Stop[1], Scan->Stored[1], Scan->Valid[1]);
-        else Search_Left(rh, LH, rightRange, fwfmi);
-        if (!rightRange.Start && Scan) Scan->RH_Fail = LH + RH - (Right_Table_Hit ? rightRange.Level : rightRange.Level - 1);
-        if (rightRange.Start) {
-            rightRange.Level = 1;
-            Extend_Left(lh, 0, rightRange, 1, fwfmi, leftMismatch,
-                        MaxHits ? MaxHits - readHits - rightMismatch.hitCount : 0);
-        }
+    if (MaxHits && readHits + hits.hitCount >= MaxHits) return readHits;
+    int bc = 0;
+    for (int i = 0; i < LOOKUPSIZE; i++) {
+        bc |= rh[RH - 1 - i] << (2 * i);
     }
+    SARange rightRange{};
+    rightRange.Start = Backward_Lookup[bc].Start;
+    rightRange.End = Backward_Lookup[bc].End;
+    rightRange.Level = LOOKUPSIZE + 1;
+    const bool Right_Table_Hit = rightRange.Start != 0;
+    if (Scan) Search_Left_Stored(rh, LH, rightRange, Scan->Stop[1], Scan->Stored[1], Scan->Valid[1]);
+    else Search_Left(rh, LH, rightRange, fwfmi);
+    if (!rightRange.Start && Scan) Scan->RH_Fail = LH + RH - (Right_Table_Hit ? rightRange.Level : rightRange.Level - 1);
+    if (rightRange.Start) {
+        rightRange.Level = 1;
+        Extend_Left(lh, 0, rightRange, 1, fwfmi, hits, MaxHits ? MaxHits - readHits : 0);
+    }
+    End_Stage(Res, Tagged, ST_LEFT1, RL_BWD);
     return readHits;
 }
 
@@ -1172,38 +1223,6 @@ bool Search_Segment(std::string_view Seg, int Offset, bool Right, SARange& R) {
     Search_Left(Seg, Offset, R, fwfmi);
     return R.Start != 0;
 }
-
-// Result lists of the two- and three-mismatch searches, after the first three
-// (One_Mismatch_Search's exactRight, rightMismatch, leftMismatch). -n 2 splits 1|1 by the
-// read's thirds T1 = [0, a), T2 = [a, b), T3 = [b, L) (Thirds); -n 3 by its quarters
-// Q1 = [0, c1), Q2 = [c1, LH), Q3 = [LH, c3), Q4 = [c3, L) (Quarters). p and q are
-// mismatches in LH and RH.
-enum Two_Mismatch_List : unsigned {
-    TM_EXACT, TM_RIGHT1, TM_LEFT1,  // 0|0, 0|1, 1|0
-    TM_RIGHT2, TM_LEFT2,            // 0|2 (resumed 0|1 rejects), 2|0 (resumed 1|0 rejects)
-    TM_CROSS_A,                     // -n 2, 1|1, p in [a, LH): T1 exact, extended right over [a, L) (revfmi)
-    TM_CROSS_B,                     // -n 2, 1|1, p in T1, q in [LH, b): T3 exact, extended left over [0, b) (fwfmi)
-    TM_SEED_C,                      // -n 2, 1|1, p in T1, q in T3: T2 exact, extended right over T3 (seeds)
-    TM_CROSS_C,                     // ... each seed in fwfmi, extended left over T1
-    TM_RIGHT3, TM_LEFT3,            // -n 3: 0|3 (resumed 0|2 rejects), 3|0 (resumed 2|0 rejects)
-    TM_SEED_LR,                     // -n 3: LH with one mismatch, p in Q2: Q1 exact, extended right over Q2 (revfmi)
-    TM_SEED_LF,                     //       ... p in Q1: Q2 exact, extended left over Q1 (fwfmi)
-    TM_CROSS_11,                    // -n 3, 1|1: those seeds (in revfmi) extended right over RH, Count 2
-    TM_CROSS_12,                    // -n 3, 1|2: TM_CROSS_11's rejects resumed with Count 3
-    TM_SEED_RF,                     // -n 3: RH with one mismatch, q in Q3: Q4 exact, extended left over Q3 (fwfmi)
-    TM_SEED_RR,                     //       ... q in Q4: Q3 exact, extended right over Q4 (revfmi)
-    TM_CROSS_21,                    // -n 3, 2|1: those seeds (in fwfmi) extended left over LH, Count 3
-    TM_LISTS
-};
-constexpr unsigned TM_TWO_LISTS = TM_CROSS_C + 1;  // the lists -n 2 uses
-
-// The hit lists (reported, and counted towards MaxHits) of -n 2 and -n 3; the others
-// are seeds.
-constexpr unsigned TM_HITS_TWO = 1u << TM_RIGHT1 | 1u << TM_LEFT1 | 1u << TM_RIGHT2 | 1u << TM_LEFT2 |
-                                 1u << TM_CROSS_A | 1u << TM_CROSS_B | 1u << TM_CROSS_C;
-constexpr unsigned TM_HITS_THREE = 1u << TM_RIGHT1 | 1u << TM_LEFT1 | 1u << TM_RIGHT2 | 1u << TM_LEFT2 |
-                                   1u << TM_RIGHT3 | 1u << TM_LEFT3 | 1u << TM_CROSS_11 | 1u << TM_CROSS_12 |
-                                   1u << TM_CROSS_21;
 
 // The quarters' boundaries c1 < LH < c3 of a read of L bases (each half split in two).
 inline void Quarters(int L, int& c1, int& c3) {
@@ -1331,13 +1350,6 @@ inline bool Windows_Hold(const SARange& T, const Mm_Windows& W, int A, int B) {
     return true;
 }
 
-// Hits the read has so far: its exact count plus the hit lists in Hits, leaving out Skip.
-inline unsigned long Mismatch_Hits_Used(const ForwardResults* Res, unsigned long ReadHits, unsigned Hits, int Skip = -1) {
-    unsigned long Used = ReadHits;
-    for (unsigned k = 1; k < TM_LISTS; k++)
-        if ((Hits >> k & 1) && static_cast<int>(k) != Skip) Used += Res[k].hitCount;
-    return Used;
-}
 
 // Batched search (--batch B > 1). Each step of a search waits for one cache miss,
 // and one read's steps depend on each other, so B reads ("lanes") are searched at
@@ -1370,6 +1382,7 @@ enum Mm_Op : unsigned char {
     OP_CROSS,           // extend each hit of list From (a seed) over Seg, keeping its mismatches; with
                         // Switch, a seed not located first gets the other index's range of Seg2
                         // (with its mismatch applied) by a Start-only walk (Mm_Start_Switch)
+    OP_END_STAGE,       // End_Stage: tag the stage's hits with stage Count, keep its rejects in list Out
     OP_STOP_IF_MAXHITS, // stop once the hits so far reach MaxHits
     OP_END
 };
@@ -1383,50 +1396,53 @@ struct Mm_Step {
                               // segment, or OP_SEARCH_KEEP's kept segment
     unsigned char Stored;     // OP_SEARCH / OP_SEARCH_KEEP: 1 + the slot of the kept range (0: none)
 };
-constexpr unsigned MM_PROGRAM_MAX = 32;  // longest program (-n 3: 29 steps), for the stats
-constexpr unsigned MM_LISTS = TM_LISTS;  // each read's lists (-n 1 uses the first three, -n 2 TM_TWO_LISTS)
-// The lists whose hits are reported, and count towards MaxHits (not the seeds). A
-// program leaves the lists it does not use empty.
-constexpr unsigned MM_HIT_LISTS = TM_HITS_TWO | TM_HITS_THREE;
+constexpr unsigned MM_PROGRAM_MAX = 40;  // longest program (-n 3: 38 steps), for the stats
+constexpr unsigned MM_LISTS = RL_LISTS;  // each read's lists (Result_List)
 
 // -n 0: Search_Right over the read.
 constexpr Mm_Step Program_Exact[] = {{OP_SEARCH, true, 0, 0, 0, 0, false, false},
                                      {OP_END, false, 0, 0, 0, 0, false, false}};
 // -n 1, as One_Mismatch_Search: 0|0, 0|1 from the deferred 0|0 ranges, then 1|0.
-// Lists: 0 exactRight, 1 rightMismatch, 2 leftMismatch.
 // LH_SEARCH / RH_SEARCH: the exact scans of LH and RH (OP_SEARCH, or OP_SEARCH_KEEP).
-#define MM_ONE_MISMATCH_PASSES_WITH(LH_SEARCH, RH_SEARCH)        \
-    LH_SEARCH,                                                   \
-    {OP_EXTEND, true, 2, 0, TM_EXACT, 0, false, false},          \
-    {OP_COUNT_EXACT, false, 0, 0, 0, TM_EXACT, false, false},    \
-    {OP_RESUME, true, 2, 1, TM_RIGHT1, TM_EXACT, true, false},   \
-    {OP_STOP_IF_MAXHITS, false, 0, 0, 0, 0, false, false},       \
-    RH_SEARCH,                                                   \
-    {OP_EXTEND, false, 1, 1, TM_LEFT1, 0, true, false}
-#define MM_ONE_MISMATCH_PASSES                                                 \
-    MM_ONE_MISMATCH_PASSES_WITH((Mm_Step{OP_SEARCH, true, 1, 0, 0, 0, false, false}), \
-                                (Mm_Step{OP_SEARCH, false, 2, 0, 0, 0, false, false}))
+#define MM_ONE_MISMATCH_PASSES_WITH(LH_SEARCH, RH_SEARCH)                     \
+    LH_SEARCH,                                                                \
+    {OP_EXTEND, true, SEG_RH, 0, RL_EXACT, 0, false, false},                  \
+    {OP_COUNT_EXACT, false, 0, 0, 0, RL_EXACT, false, false},                 \
+    {OP_RESUME, true, SEG_RH, 1, RL_HITS, RL_EXACT, true, false},             \
+    {OP_END_STAGE, false, 0, ST_RIGHT1, RL_FWD, 0, false, false},             \
+    {OP_STOP_IF_MAXHITS, false, 0, 0, 0, 0, false, false},                    \
+    RH_SEARCH,                                                                \
+    {OP_EXTEND, false, SEG_LH, 1, RL_HITS, 0, true, false},                   \
+    {OP_END_STAGE, false, 0, ST_LEFT1, RL_BWD, 0, false, false}
+#define MM_ONE_MISMATCH_PASSES                                                         \
+    MM_ONE_MISMATCH_PASSES_WITH((Mm_Step{OP_SEARCH, true, SEG_LH, 0, 0, 0, false, false}), \
+                                (Mm_Step{OP_SEARCH, false, SEG_RH, 0, 0, 0, false, false}))
 constexpr Mm_Step Program_One_Mismatch[] = {MM_ONE_MISMATCH_PASSES, {OP_END, false, 0, 0, 0, 0, false, false}};
 // -n 2, as Two_Mismatch_Search: the -n 1 passes, 0|2 and 2|0 from their rejects, then
 // 1|1 by the thirds: (a) T1 exact, (b) T3 exact, (c) T2 exact, each with its windows,
 // narrowed by where the exact LH / RH searches failed; (a) and (b) are skipped when
-// their windows cannot hold.
-// The LH / RH scans keep T1's / T3's ranges (slots 0 and 1) for (a) and (b).
+// their windows cannot hold. The LH / RH scans keep T1's / T3's ranges (slots 0 and 1).
 constexpr Mm_Step Program_Two_Mismatch[] = {
     MM_ONE_MISMATCH_PASSES_WITH((Mm_Step{OP_SEARCH_KEEP, true, SEG_LH, 0, 0, 0, false, false, 0, SEG_T1, 1}),
                                 (Mm_Step{OP_SEARCH_KEEP, false, SEG_RH, 0, 0, 0, false, false, 0, SEG_T3, 2})),
-    {OP_RESUME, true, SEG_RH, 2, TM_RIGHT2, TM_RIGHT1, true, false},
-    {OP_RESUME, false, SEG_LH, 2, TM_LEFT2, TM_LEFT1, true, false},
+    {OP_STOP_IF_MAXHITS, false, 0, 0, 0, 0, false, false},
+    {OP_RESUME, true, SEG_RH, 2, RL_HITS, RL_FWD, true, false},
+    {OP_END_STAGE, false, 0, ST_RIGHT2, RL_NONE, 0, false, false},
+    {OP_RESUME, false, SEG_LH, 2, RL_HITS, RL_BWD, true, false},
+    {OP_END_STAGE, false, 0, ST_LEFT2, RL_NONE, 0, false, false},
     {OP_STOP_IF_MAXHITS, false, 0, 0, 0, 0, false, false},
     {OP_SEARCH, true, SEG_T1, 0, 0, 0, false, false, WIN_A, 0, 1},
-    {OP_EXTEND, true, SEG_A_END, 0, TM_CROSS_A, 0, true, false, WIN_A},
+    {OP_EXTEND, true, SEG_A_END, 0, RL_HITS, 0, true, false, WIN_A},
+    {OP_END_STAGE, false, 0, ST2_CROSS_A, RL_NONE, 0, false, false},
     {OP_STOP_IF_MAXHITS, false, 0, 0, 0, 0, false, false},
     {OP_SEARCH, false, SEG_T3, 0, 0, 0, false, false, WIN_B, 0, 2},
-    {OP_EXTEND, false, SEG_START_B, 0, TM_CROSS_B, 0, true, false, WIN_B},
+    {OP_EXTEND, false, SEG_START_B, 0, RL_HITS, 0, true, false, WIN_B},
+    {OP_END_STAGE, false, 0, ST2_CROSS_B, RL_NONE, 0, false, false},
     {OP_STOP_IF_MAXHITS, false, 0, 0, 0, 0, false, false},
     {OP_SEARCH, true, SEG_T2, 0, 0, 0, false, false},
-    {OP_EXTEND, true, SEG_T3, 0, TM_SEED_C, 0, false, false, WIN_C3},
-    {OP_CROSS, false, SEG_T1, 0, TM_CROSS_C, TM_SEED_C, true, true, WIN_C1, SEG_A_END},
+    {OP_EXTEND, true, SEG_T3, 0, RL_SEED_1, 0, false, false, WIN_C3},
+    {OP_CROSS, false, SEG_T1, 0, RL_HITS, RL_SEED_1, true, true, WIN_C1, SEG_A_END},
+    {OP_END_STAGE, false, 0, ST2_CROSS_C, RL_NONE, 0, false, false},
     {OP_END, false, 0, 0, 0, 0, false, false},
 };
 
@@ -1437,26 +1453,34 @@ constexpr Mm_Step Program_Two_Mismatch[] = {
 constexpr Mm_Step Program_Three_Mismatch[] = {
     MM_ONE_MISMATCH_PASSES_WITH((Mm_Step{OP_SEARCH_KEEP, true, SEG_LH, 0, 0, 0, false, false, 0, SEG_Q1, 1}),
                                 (Mm_Step{OP_SEARCH_KEEP, false, SEG_RH, 0, 0, 0, false, false, 0, SEG_Q4, 2})),
-    {OP_RESUME, true, SEG_RH, 2, TM_RIGHT2, TM_RIGHT1, true, false},
-    {OP_RESUME, false, SEG_LH, 2, TM_LEFT2, TM_LEFT1, true, false},
+    {OP_STOP_IF_MAXHITS, false, 0, 0, 0, 0, false, false},
+    {OP_RESUME, true, SEG_RH, 2, RL_HITS, RL_FWD, true, false},
+    {OP_END_STAGE, false, 0, ST_RIGHT2, RL_FWD, 0, false, false},
+    {OP_RESUME, false, SEG_LH, 2, RL_HITS, RL_BWD, true, false},
+    {OP_END_STAGE, false, 0, ST_LEFT2, RL_BWD, 0, false, false},
     {OP_STOP_IF_MAXHITS, false, 0, 0, 0, 0, false, false},
     {OP_SEARCH, true, SEG_Q1, 0, 0, 0, false, false, WIN_Q2, 0, 1},
-    {OP_EXTEND, true, SEG_Q2, 0, TM_SEED_LR, 0, false, false, WIN_Q2},
+    {OP_EXTEND, true, SEG_Q2, 0, RL_SEED_1, 0, false, false, WIN_Q2},
     {OP_SEARCH, false, SEG_Q2, 0, 0, 0, false, false},
-    {OP_EXTEND, false, SEG_Q1, 0, TM_SEED_LF, 0, false, false, WIN_Q1},
-    {OP_CROSS, true, SEG_RH, 2, TM_CROSS_11, TM_SEED_LR, true, false},
-    {OP_CROSS, true, SEG_RH, 2, TM_CROSS_11, TM_SEED_LF, true, true, 0, SEG_LH},
+    {OP_EXTEND, false, SEG_Q1, 0, RL_SEED_2, 0, false, false, WIN_Q1},
+    {OP_CROSS, true, SEG_RH, 2, RL_HITS, RL_SEED_1, true, false},
+    {OP_CROSS, true, SEG_RH, 2, RL_HITS, RL_SEED_2, true, true, 0, SEG_LH},
+    {OP_END_STAGE, false, 0, ST3_CROSS_11, RL_CROSS, 0, false, false},
     {OP_STOP_IF_MAXHITS, false, 0, 0, 0, 0, false, false},
-    {OP_RESUME, true, SEG_RH, 3, TM_RIGHT3, TM_RIGHT2, true, false},
-    {OP_RESUME, false, SEG_LH, 3, TM_LEFT3, TM_LEFT2, true, false},
-    {OP_RESUME, true, SEG_RH, 3, TM_CROSS_12, TM_CROSS_11, true, false},
+    {OP_RESUME, true, SEG_RH, 3, RL_HITS, RL_FWD, true, false},
+    {OP_END_STAGE, false, 0, ST3_RIGHT3, RL_NONE, 0, false, false},
+    {OP_RESUME, false, SEG_LH, 3, RL_HITS, RL_BWD, true, false},
+    {OP_END_STAGE, false, 0, ST3_LEFT3, RL_NONE, 0, false, false},
+    {OP_RESUME, true, SEG_RH, 3, RL_HITS, RL_CROSS, true, false},
+    {OP_END_STAGE, false, 0, ST3_CROSS_12, RL_NONE, 0, false, false},
     {OP_STOP_IF_MAXHITS, false, 0, 0, 0, 0, false, false},
     {OP_SEARCH, false, SEG_Q4, 0, 0, 0, false, false, WIN_Q3, 0, 2},
-    {OP_EXTEND, false, SEG_Q3, 0, TM_SEED_RF, 0, false, false, WIN_Q3},
+    {OP_EXTEND, false, SEG_Q3, 0, RL_SEED_1, 0, false, false, WIN_Q3},
     {OP_SEARCH, true, SEG_Q3, 0, 0, 0, false, false},
-    {OP_EXTEND, true, SEG_Q4, 0, TM_SEED_RR, 0, false, false, WIN_Q4},
-    {OP_CROSS, false, SEG_LH, 3, TM_CROSS_21, TM_SEED_RF, true, false},
-    {OP_CROSS, false, SEG_LH, 3, TM_CROSS_21, TM_SEED_RR, true, true, 0, SEG_RH},
+    {OP_EXTEND, true, SEG_Q4, 0, RL_SEED_2, 0, false, false, WIN_Q4},
+    {OP_CROSS, false, SEG_LH, 3, RL_HITS, RL_SEED_1, true, false},
+    {OP_CROSS, false, SEG_LH, 3, RL_HITS, RL_SEED_2, true, true, 0, SEG_RH},
+    {OP_END_STAGE, false, 0, ST3_CROSS_21, RL_NONE, 0, false, false},
     {OP_END, false, 0, 0, 0, 0, false, false},
 };
 
@@ -1483,6 +1507,7 @@ struct Mm_Lane {
     SARange Stored[2];    // OP_SEARCH_KEEP's kept ranges, if Stored_Valid
     bool Stored_Valid[2];
     bool Keeping;         // OP_SEARCH_KEEP is searching its kept segment (else the rest)
+    std::size_t Tagged;   // hits of Res[RL_HITS] tagged with their stage (End_Stage)
     // The current task.
     Mm_Task Task;
     bool Right, Found;
@@ -1922,13 +1947,10 @@ inline std::string_view Mm_Segment(const Mm_Lane& L, unsigned Seg, int& Offset) 
     return Read_Segment_Of(L.All, Seg, Offset);
 }
 
-// Hits the read has so far: its exact count plus the mismatch lists, leaving out Skip.
+// Hits the read has so far: its exact count plus its mismatch hits (RL_HITS), unless
+// Skip is RL_HITS (an extension into RL_HITS counts that list itself).
 inline unsigned long Mm_Used(const Mm_Lane& L, int Skip = -1) {
-    unsigned long Used = L.ReadHits;
-    if (L.Res)
-        for (unsigned k = 1; k < MM_LISTS; k++)
-            if ((MM_HIT_LISTS >> k & 1) && static_cast<int>(k) != Skip) Used += L.Res[k].hitCount;
-    return Used;
+    return L.ReadHits + (L.Res && Skip != static_cast<int>(RL_HITS) ? L.Res[RL_HITS].hitCount : 0);
 }
 
 // OP_CROSS: extends seed R (its mismatches kept) over the step's segment. Returns false
@@ -2134,6 +2156,10 @@ void Mm_Run(Mm_Lane& L, unsigned MaxHits) {
                 L.PC++;
                 continue;
             }
+            case OP_END_STAGE:
+                End_Stage(L.Res, L.Tagged, P.Count, P.Out);
+                L.PC++;
+                continue;
             case OP_STOP_IF_MAXHITS:
                 if (MaxHits && Mm_Used(L) >= MaxHits) {
                     L.Done_Read = true;
@@ -2191,17 +2217,21 @@ inline bool Mm_Step_Task(Mm_Lane& L) {
 
 // Runs Program on Count reads of Len bases (codes, back to back), B at a time.
 // -n 0 (Program_Exact): Ranges[i] / Found[i] as Search_Right from Start_Range.
-// -n 1 (Program_One_Mismatch): Res[3 * i ...] get read i's exactRight, rightMismatch
-// and leftMismatch, ReadHits[i] its exact hit count (One_Mismatch_Search's value).
+// -n 1 to 3 (Program_One_Mismatch, ...): Res[MM_LISTS * i ...] get read i's result lists
+// (Result_List), ReadHits[i] its exact hit count (One_Mismatch_Search's value).
 void Batch_Search(const char* Reads, unsigned Count, int Len, unsigned B, unsigned MaxHits, const Mm_Step* Program,
                   std::vector<ForwardResults>* Res, std::vector<unsigned long>* ReadHits, std::vector<SARange>* Ranges,
                   std::vector<unsigned char>* Found) {
     static Mm_Lane Lanes[MAX_BATCH];
     unsigned Active = 0, Next = 0;
-    unsigned Lists = 3;  // the lists the program writes
-    for (const Mm_Step* P = Program; P->Op != OP_END; P++)
-        if (P->Op == OP_EXTEND || P->Op == OP_RESUME || P->Op == OP_CROSS) Lists = std::max(Lists, P->Out + 1u);
-    auto Finish = [&](const Mm_Lane& L) {
+    auto Finish = [&](Mm_Lane& L) {
+        if (L.Res) {  // a read stopped inside a stage (OP_CROSS at MaxHits): tag its last hits
+            for (const Mm_Step* P = Program + L.PC; P->Op != OP_END; P++)
+                if (P->Op == OP_END_STAGE) {
+                    Tag_Hits(L.Res, L.Tagged, P->Count);
+                    break;
+                }
+        }
         if (ReadHits) (*ReadHits)[L.Index] = L.ReadHits;
         if (Ranges) {
             (*Ranges)[L.Index] = L.Cur;
@@ -2214,8 +2244,9 @@ void Batch_Search(const char* Reads, unsigned Count, int Len, unsigned B, unsign
             L.All = std::string_view(Reads + static_cast<std::size_t>(I) * Len, Len);
             L.Index = I;
             L.Res = Res ? &(*Res)[MM_LISTS * static_cast<std::size_t>(I)] : nullptr;
+            L.Tagged = 0;
             if (L.Res)
-                for (unsigned k = 0; k < Lists; k++) {
+                for (unsigned k = 0; k < MM_LISTS; k++) {
                     L.Res[k].hits.clear();
                     L.Res[k].mismatches.clear();
                     L.Res[k].hitCount = 0;
@@ -2332,37 +2363,36 @@ bool Switch_Index(std::string_view All, const SARange& Seed, unsigned Seg, bool 
 //     (b) p in T1, q in [LH, b): T3 exact, extended left over [0, b) (fwfmi);
 //     (c) p in T1, q in T3:      T2 exact, extended right over T3 (revfmi), each such seed
 //                                switched to fwfmi (unless located) and extended left over T1.
-// Stops between stages at MaxHits. Res has TM_LISTS lists; returns the exact hit count.
+// Stops at MaxHits where Program_Two_Mismatch does, so both leave the same lists. Res
+// has RL_LISTS lists (Result_List; stages Two_Stages); returns the exact hit count.
 // With the reference, the read must be packed in Read_Packed (Pack_Read).
 __attribute__((noinline)) unsigned long Two_Mismatch_Search(std::string_view All, const SARange& Range, unsigned MaxHits,
                                                             ForwardResults* Res) {
-    const int LH = static_cast<int>(All.size()) / 2;
+    const int L = static_cast<int>(All.size()), LH = L / 2;
     const std::string_view lh = All.substr(0, LH), rh = All.substr(LH);
-    for (unsigned k = TM_RIGHT2; k < TM_TWO_LISTS; k++) {
-        Res[k].hits.clear();
-        Res[k].mismatches.clear();
-        Res[k].hitCount = 0;
-    }
-    const int L = static_cast<int>(All.size());
     int a, b;
     Thirds(L, a, b);
     Half_Scan Scan{L, 0, {a, L - b}, {}, {false, false}};  // keeps T1's and T3's ranges
-    const unsigned long ReadHits =
-        One_Mismatch_Search(lh, rh, Range, MaxHits, Res[TM_EXACT], Res[TM_RIGHT1], Res[TM_LEFT1], &Scan);
+    std::size_t Tagged;
+    const unsigned long ReadHits = One_Mismatch_Search(lh, rh, Range, MaxHits, Res, Tagged, &Scan);
+    if (MaxHits && ReadHits + Res[RL_HITS].hitCount >= MaxHits) return ReadHits;
     const int LH_Fail = Scan.LH_Fail, RH_Fail = Scan.RH_Fail;
-    auto Done = [&] { return MaxHits && Mismatch_Hits_Used(Res, ReadHits, TM_HITS_TWO) >= MaxHits; };
-    auto Budget = [&](unsigned Out) { return MaxHits ? MaxHits - Mismatch_Hits_Used(Res, ReadHits, TM_HITS_TWO, Out) : 0; };
+    ForwardResults& Hits = Res[RL_HITS];
+    auto Done = [&] { return MaxHits && ReadHits + Hits.hitCount >= MaxHits; };
+    const unsigned Budget = MaxHits ? MaxHits - ReadHits : 0;  // Hits counts the rest
 
     // 0|2
-    for (const SARange& Parent : Res[TM_RIGHT1].mismatches) {
-        if (Done()) return ReadHits;
-        Extend_Right(rh, LH, Parent, 2, revfmi, Res[TM_RIGHT2], Budget(TM_RIGHT2));
+    for (const SARange& Parent : Res[RL_FWD].mismatches) {
+        if (Done()) break;
+        Extend_Right(rh, LH, Parent, 2, revfmi, Hits, Budget);
     }
+    End_Stage(Res, Tagged, ST_RIGHT2, RL_NONE);
     // 2|0
-    for (const SARange& Parent : Res[TM_LEFT1].mismatches) {
-        if (Done()) return ReadHits;
-        Extend_Left(lh, 0, Parent, 2, fwfmi, Res[TM_LEFT2], Budget(TM_LEFT2));
+    for (const SARange& Parent : Res[RL_BWD].mismatches) {
+        if (Done()) break;
+        Extend_Left(lh, 0, Parent, 2, fwfmi, Hits, Budget);
     }
+    End_Stage(Res, Tagged, ST_LEFT2, RL_NONE);
     // 1|1
     SARange Seed;
     int Offset;
@@ -2381,18 +2411,24 @@ __attribute__((noinline)) unsigned long Two_Mismatch_Search(std::string_view All
     };
     const Mm_Windows A = Window_Set(WIN_A, L, LH_Fail, RH_Fail), B = Window_Set(WIN_B, L, LH_Fail, RH_Fail);
     if (Done()) return ReadHits;
-    if (Windows_Possible(A) && Exact(SEG_T1, true)) Extend_Windows(All, SEG_A_END, Seed, true, A, Res[TM_CROSS_A], Budget(TM_CROSS_A));
+    if (Windows_Possible(A) && Exact(SEG_T1, true)) Extend_Windows(All, SEG_A_END, Seed, true, A, Hits, Budget);
+    End_Stage(Res, Tagged, ST2_CROSS_A, RL_NONE);
     if (Done()) return ReadHits;
-    if (Windows_Possible(B) && Exact(SEG_T3, false)) Extend_Windows(All, SEG_START_B, Seed, false, B, Res[TM_CROSS_B], Budget(TM_CROSS_B));
+    if (Windows_Possible(B) && Exact(SEG_T3, false)) Extend_Windows(All, SEG_START_B, Seed, false, B, Hits, Budget);
+    End_Stage(Res, Tagged, ST2_CROSS_B, RL_NONE);
     if (Done()) return ReadHits;
-    if (Exact(SEG_T2, true)) Extend_Windows(All, SEG_T3, Seed, true, Window_Set(WIN_C3, L, LH_Fail, RH_Fail), Res[TM_SEED_C], 0);
+    if (Exact(SEG_T2, true)) Extend_Windows(All, SEG_T3, Seed, true, Window_Set(WIN_C3, L, LH_Fail, RH_Fail), Res[RL_SEED_1], 0);
     const Mm_Windows C1 = Window_Set(WIN_C1, L, LH_Fail, RH_Fail);
-    for (const SARange& S : Res[TM_SEED_C].hits) {
-        if (Done()) return ReadHits;
+    for (const SARange& S : Res[RL_SEED_1].hits) {
+        if (Done()) {
+            Tag_Hits(Res, Tagged, ST2_CROSS_C);
+            return ReadHits;
+        }
         SARange R = S;
         if (!(Use_Ref && S.Skip) && !Switch_Index(All, S, SEG_A_END, false, R)) continue;
-        Extend_Windows(All, SEG_T1, R, false, C1, Res[TM_CROSS_C], Budget(TM_CROSS_C));
+        Extend_Windows(All, SEG_T1, R, false, C1, Hits, Budget);
     }
+    End_Stage(Res, Tagged, ST2_CROSS_C, RL_NONE);
     return ReadHits;
 }
 
@@ -2409,44 +2445,44 @@ __attribute__((noinline)) unsigned long Two_Mismatch_Search(std::string_view All
 //                  q in Q4: Q3 exact, extended right over Q4, then switched to fwfmi),
 //                  extended left over LH with Count 3 (so exactly two in LH).
 // The one-mismatch seeds use windows narrowed by the scans' failure bounds; a seed case
-// whose window cannot hold is skipped. Stops between stages at MaxHits. Res has TM_LISTS
-// lists; returns the exact hit count. With the reference, the read must be packed.
+// whose window cannot hold is skipped. Stops at MaxHits where Program_Three_Mismatch
+// does. Res has RL_LISTS lists (Result_List; stages Three_Stages); returns the exact hit
+// count. With the reference, the read must be packed.
 __attribute__((noinline)) unsigned long Three_Mismatch_Search(std::string_view All, const SARange& Range, unsigned MaxHits,
                                                               ForwardResults* Res) {
     const int L = static_cast<int>(All.size()), LH = L / 2;
     const std::string_view lh = All.substr(0, LH), rh = All.substr(LH);
-    for (unsigned k = TM_RIGHT2; k < TM_LISTS; k++) {
-        Res[k].hits.clear();
-        Res[k].mismatches.clear();
-        Res[k].hitCount = 0;
-    }
     int c1, c3;
     Quarters(L, c1, c3);
     Half_Scan Scan{L, 0, {c1, L - c3}, {}, {false, false}};  // keeps Q1's and Q4's ranges
-    const unsigned long ReadHits =
-        One_Mismatch_Search(lh, rh, Range, MaxHits, Res[TM_EXACT], Res[TM_RIGHT1], Res[TM_LEFT1], &Scan);
-    auto Done = [&] { return MaxHits && Mismatch_Hits_Used(Res, ReadHits, TM_HITS_THREE) >= MaxHits; };
-    auto Budget = [&](unsigned Out) { return MaxHits ? MaxHits - Mismatch_Hits_Used(Res, ReadHits, TM_HITS_THREE, Out) : 0; };
-    // Resumes each range of list From over the other half with Count mismatches into Out.
-    auto Resume = [&](unsigned From, bool Right, int Count, unsigned Out) {
+    std::size_t Tagged;
+    const unsigned long ReadHits = One_Mismatch_Search(lh, rh, Range, MaxHits, Res, Tagged, &Scan);
+    ForwardResults& Hits = Res[RL_HITS];
+    auto Done = [&] { return MaxHits && ReadHits + Hits.hitCount >= MaxHits; };
+    if (Done()) return ReadHits;
+    const unsigned Budget = MaxHits ? MaxHits - ReadHits : 0;  // Hits counts the rest
+    // Resumes each range of chain list From over the other half with Count mismatches,
+    // then ends the stage.
+    auto Resume = [&](unsigned From, bool Right, int Count, int Stage, unsigned Keep) {
         for (const SARange& Parent : Res[From].mismatches) {
-            if (Done()) return false;
-            if (Right) Extend_Right(rh, LH, Parent, Count, revfmi, Res[Out], Budget(Out));
-            else Extend_Left(lh, 0, Parent, Count, fwfmi, Res[Out], Budget(Out));
+            if (Done()) break;
+            if (Right) Extend_Right(rh, LH, Parent, Count, revfmi, Hits, Budget);
+            else Extend_Left(lh, 0, Parent, Count, fwfmi, Hits, Budget);
         }
-        return true;
+        End_Stage(Res, Tagged, Stage, Keep);
     };
     // Extends each one-mismatch seed of list From over the other half with Count; with
     // Seg2, a seed not located is first switched to the other index (Switch_Index).
-    auto Cross = [&](unsigned From, bool Right, int Count, unsigned Out, int Seg2) {
+    // Returns false if MaxHits stopped it.
+    auto Cross = [&](unsigned From, bool Right, int Count, int Seg2) {
         for (const SARange& S : Res[From].hits) {
             if (Done()) return false;
             SARange R = S;
             if (Seg2 >= 0 && !(Use_Ref && S.Skip) && !Switch_Index(All, S, Seg2, Right, R)) continue;
             R.Level = 1;
             R.Forbidden_Base = NO_BASE;
-            if (Right) Extend_Right(rh, LH, R, Count, revfmi, Res[Out], Budget(Out));
-            else Extend_Left(lh, 0, R, Count, fwfmi, Res[Out], Budget(Out));
+            if (Right) Extend_Right(rh, LH, R, Count, revfmi, Hits, Budget);
+            else Extend_Left(lh, 0, R, Count, fwfmi, Hits, Budget);
         }
         return true;
     };
@@ -2467,22 +2503,33 @@ __attribute__((noinline)) unsigned long Three_Mismatch_Search(std::string_view A
     auto Win = [&](unsigned Set) { return Window_Set(Set, L, Scan.LH_Fail, Scan.RH_Fail); };
 
     // 0|2, 2|0
-    if (!Resume(TM_RIGHT1, true, 2, TM_RIGHT2) || !Resume(TM_LEFT1, false, 2, TM_LEFT2) || Done()) return ReadHits;
+    Resume(RL_FWD, true, 2, ST_RIGHT2, RL_FWD);
+    Resume(RL_BWD, false, 2, ST_LEFT2, RL_BWD);
+    if (Done()) return ReadHits;
     // 1|1
     const Mm_Windows Q2 = Win(WIN_Q2);
-    if (Windows_Possible(Q2) && Exact(SEG_Q1, true, 0)) Extend_Windows(All, SEG_Q2, Seed, true, Q2, Res[TM_SEED_LR], 0);
-    if (Exact(SEG_Q2, false, -1)) Extend_Windows(All, SEG_Q1, Seed, false, Win(WIN_Q1), Res[TM_SEED_LF], 0);
-    if (!Cross(TM_SEED_LR, true, 2, TM_CROSS_11, -1) || !Cross(TM_SEED_LF, true, 2, TM_CROSS_11, SEG_LH) || Done())
+    if (Windows_Possible(Q2) && Exact(SEG_Q1, true, 0)) Extend_Windows(All, SEG_Q2, Seed, true, Q2, Res[RL_SEED_1], 0);
+    if (Exact(SEG_Q2, false, -1)) Extend_Windows(All, SEG_Q1, Seed, false, Win(WIN_Q1), Res[RL_SEED_2], 0);
+    if (!Cross(RL_SEED_1, true, 2, -1) || !Cross(RL_SEED_2, true, 2, SEG_LH)) {
+        Tag_Hits(Res, Tagged, ST3_CROSS_11);
         return ReadHits;
+    }
+    End_Stage(Res, Tagged, ST3_CROSS_11, RL_CROSS);
+    if (Done()) return ReadHits;
     // 0|3, 3|0, 1|2
-    if (!Resume(TM_RIGHT2, true, 3, TM_RIGHT3) || !Resume(TM_LEFT2, false, 3, TM_LEFT3) ||
-        !Resume(TM_CROSS_11, true, 3, TM_CROSS_12) || Done())
-        return ReadHits;
+    Resume(RL_FWD, true, 3, ST3_RIGHT3, RL_NONE);
+    Resume(RL_BWD, false, 3, ST3_LEFT3, RL_NONE);
+    Resume(RL_CROSS, true, 3, ST3_CROSS_12, RL_NONE);
+    if (Done()) return ReadHits;
     // 2|1
     const Mm_Windows Q3 = Win(WIN_Q3);
-    if (Windows_Possible(Q3) && Exact(SEG_Q4, false, 1)) Extend_Windows(All, SEG_Q3, Seed, false, Q3, Res[TM_SEED_RF], 0);
-    if (Exact(SEG_Q3, true, -1)) Extend_Windows(All, SEG_Q4, Seed, true, Win(WIN_Q4), Res[TM_SEED_RR], 0);
-    Cross(TM_SEED_RF, false, 3, TM_CROSS_21, -1) && Cross(TM_SEED_RR, false, 3, TM_CROSS_21, SEG_RH);
+    if (Windows_Possible(Q3) && Exact(SEG_Q4, false, 1)) Extend_Windows(All, SEG_Q3, Seed, false, Q3, Res[RL_SEED_1], 0);
+    if (Exact(SEG_Q3, true, -1)) Extend_Windows(All, SEG_Q4, Seed, true, Win(WIN_Q4), Res[RL_SEED_2], 0);
+    if (!Cross(RL_SEED_1, false, 3, -1) || !Cross(RL_SEED_2, false, 3, SEG_RH)) {
+        Tag_Hits(Res, Tagged, ST3_CROSS_21);
+        return ReadHits;
+    }
+    End_Stage(Res, Tagged, ST3_CROSS_21, RL_NONE);
     return ReadHits;
 }
 
@@ -2573,63 +2620,35 @@ bool LoadPac(const std::string& name) {
     return static_cast<bool>(in.read(reinterpret_cast<char*>(Pac.data()), size));
 }
 
-// One stage's hits in the output: the list, its index (F revfmi, B fwfmi) and mismatches.
-struct Hit_Stage {
-    const ForwardResults* List;
-    const char* Dir;
-    int Mismatches;
-};
-
-// The output lines of one -n 1 / -n 2 read (main and the batched runner): the exact
-// hits (each capped at maxHits), then the mismatch stages' hits in order until maxHits.
+// The output lines of one -n 1 to 3 read (main and the batched runner), from its lists
+// (Result_List): the exact hits (each capped at maxHits), then the mismatch hits in
+// stage order until maxHits, each with its stage's index and mismatch count (Stages).
 // Returns the read's reported hit count; with none, the caller writes "F 0 0 0".
-unsigned long Format_Hits(const std::string& id, const ForwardResults& exact, const Hit_Stage* stages, int count,
+unsigned long Format_Hits(const std::string& id, const ForwardResults* Res, const Hit_Stage* Stages,
                           unsigned long readHits, unsigned maxHits, std::string& lines) {
-    for (const SARange& hit : exact.hits) {
+    for (const SARange& hit : Res[RL_EXACT].hits) {
         unsigned long hitCount = hit.Skip ? 1UL : (hit.End >= hit.Start ? (hit.End - hit.Start + 1UL) : 0UL);
         if (maxHits > 0 && hitCount > maxHits) {
             hitCount = maxHits;
         }
         lines += id + Hit_Text(hit, "F") + "\t" + std::to_string(hitCount) + "\n";
     }
-    for (int s = 0; s < count; s++) {
-        for (const SARange& hit : stages[s].List->hits) {
-            if (maxHits > 0 && readHits >= maxHits) break;
-            unsigned long hitCount = hit.Skip ? 1UL : hit.End - hit.Start + 1UL;
-            if (maxHits > 0 && readHits + hitCount > maxHits) {
-                hitCount = maxHits - readHits;
-            }
-            readHits += hitCount;
-            lines += id + Hit_Text(hit, stages[s].Dir) + "\t" + std::to_string(hitCount) + "\t" +
-                     std::to_string(stages[s].Mismatches) + "\n";
+    for (const SARange& hit : Res[RL_HITS].hits) {
+        if (maxHits > 0 && readHits >= maxHits) break;
+        unsigned long hitCount = hit.Skip ? 1UL : hit.End - hit.Start + 1UL;
+        if (maxHits > 0 && readHits + hitCount > maxHits) {
+            hitCount = maxHits - readHits;
         }
+        readHits += hitCount;
+        const Hit_Stage& Stage = Stages[hit.Stage];
+        lines += id + Hit_Text(hit, Stage.Dir) + "\t" + std::to_string(hitCount) + "\t" + std::to_string(Stage.Mismatches) + "\n";
     }
     return readHits;
 }
 
-unsigned long Format_One_Mismatch(const std::string& id, const ForwardResults& exactRight,
-                                  const ForwardResults& rightMismatch, const ForwardResults& leftMismatch,
-                                  unsigned long readHits, unsigned maxHits, std::string& lines) {
-    const Hit_Stage stages[] = {{&rightMismatch, "F", 1}, {&leftMismatch, "B", 1}};
-    return Format_Hits(id, exactRight, stages, 2, readHits, maxHits, lines);
-}
-
-// Two_Mismatch_Search's lists in output order: 0|1, 1|0, 0|2, 2|0, then 1|1 (a), (b), (c).
-unsigned long Format_Two_Mismatch(const std::string& id, const ForwardResults* Res, unsigned long readHits,
-                                  unsigned maxHits, std::string& lines) {
-    const Hit_Stage stages[] = {{&Res[TM_RIGHT1], "F", 1},  {&Res[TM_LEFT1], "B", 1},   {&Res[TM_RIGHT2], "F", 2},
-                                {&Res[TM_LEFT2], "B", 2},   {&Res[TM_CROSS_A], "F", 2}, {&Res[TM_CROSS_B], "B", 2},
-                                {&Res[TM_CROSS_C], "B", 2}};
-    return Format_Hits(id, Res[TM_EXACT], stages, 7, readHits, maxHits, lines);
-}
-
-// Three_Mismatch_Search's lists in output order: 0|1, 1|0, 0|2, 2|0, 1|1, 0|3, 3|0, 1|2, 2|1.
-unsigned long Format_Three_Mismatch(const std::string& id, const ForwardResults* Res, unsigned long readHits,
-                                    unsigned maxHits, std::string& lines) {
-    const Hit_Stage stages[] = {{&Res[TM_RIGHT1], "F", 1},   {&Res[TM_LEFT1], "B", 1},    {&Res[TM_RIGHT2], "F", 2},
-                                {&Res[TM_LEFT2], "B", 2},    {&Res[TM_CROSS_11], "F", 2}, {&Res[TM_RIGHT3], "F", 3},
-                                {&Res[TM_LEFT3], "B", 3},    {&Res[TM_CROSS_12], "F", 3}, {&Res[TM_CROSS_21], "B", 3}};
-    return Format_Hits(id, Res[TM_EXACT], stages, 9, readHits, maxHits, lines);
+// The stage table of -n 1, 2 or 3.
+inline const Hit_Stage* Stages_Of(int maxMismatches) {
+    return maxMismatches == 3 ? Three_Stages : maxMismatches == 2 ? Two_Stages : One_Stages;
 }
 
 // --batch B > 1: reads the records in blocks, searches each block with Batch_Exact
@@ -2707,9 +2726,7 @@ bool Run_Batched(std::ifstream& in, std::ostream& out, unsigned B, int maxMismat
             if (searched[j]) {
                 const ForwardResults* r = &results[MM_LISTS * static_cast<std::size_t>(slot[j])];
                 const std::size_t at = lines.size();
-                hits = maxMismatches == 3   ? Format_Three_Mismatch(ids[j], r, readHits[slot[j]], maxHits, lines)
-                       : maxMismatches == 2 ? Format_Two_Mismatch(ids[j], r, readHits[slot[j]], maxHits, lines)
-                                            : Format_One_Mismatch(ids[j], r[0], r[1], r[2], readHits[slot[j]], maxHits, lines);
+                hits = Format_Hits(ids[j], r, Stages_Of(maxMismatches), readHits[slot[j]], maxHits, lines);
                 if (quiet) lines.resize(at);
             }
             reportedHits += hits;
@@ -2897,10 +2914,7 @@ int main(int argc, char** argv) {
     bool initialized = false;
     uint64_t records = 0;
     uint64_t reportedHits = 0;
-    ForwardResults exactRight;     // 0|0 range and deferred parents for 0|1, reverse index
-    ForwardResults rightMismatch;  // 0|1 ranges, reverse index
-    ForwardResults leftMismatch;   // 1|0 ranges, forward index
-    ForwardResults twoMismatch[TM_LISTS];  // -n 2 / -n 3: Two_Mismatch_Search's or Three_Mismatch_Search's lists
+    ForwardResults lists[RL_LISTS];  // -n 1 to 3: the read's result lists (Result_List)
 
     const bool batched = batchSize > 1;
     if (batched && !Run_Batched(in, *out, batchSize, maxMismatches, maxHits, quiet, records, reportedHits,
@@ -2966,16 +2980,11 @@ int main(int argc, char** argv) {
         const std::string_view rh = all.substr(LH);
         if (maxMismatches >= 1 && LH > LOOKUPSIZE) {
             std::string lines;
-            const unsigned long readHits =
-                maxMismatches == 3
-                    ? Format_Three_Mismatch(id, twoMismatch, Three_Mismatch_Search(all, range, maxHits, twoMismatch), maxHits,
-                                            lines)
-                : maxMismatches == 2
-                    ? Format_Two_Mismatch(id, twoMismatch, Two_Mismatch_Search(all, range, maxHits, twoMismatch), maxHits,
-                                          lines)
-                    : Format_One_Mismatch(id, exactRight, rightMismatch, leftMismatch,
-                                          One_Mismatch_Search(lh, rh, range, maxHits, exactRight, rightMismatch, leftMismatch),
-                                          maxHits, lines);
+            std::size_t tagged;
+            const unsigned long exactHits = maxMismatches == 3   ? Three_Mismatch_Search(all, range, maxHits, lists)
+                                            : maxMismatches == 2 ? Two_Mismatch_Search(all, range, maxHits, lists)
+                                                                 : One_Mismatch_Search(lh, rh, range, maxHits, lists, tagged);
+            const unsigned long readHits = Format_Hits(id, lists, Stages_Of(maxMismatches), exactHits, maxHits, lines);
             reportedHits += readHits;
             searchSeconds += std::chrono::duration<double>(Clock::now() - searchStart).count();
 
