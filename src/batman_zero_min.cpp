@@ -26,6 +26,9 @@ extern "C" {
 #include "BWT.h"
 }
 
+#include "genome_map.hpp"
+#include "sam_writer.hpp"
+
 namespace {
 
 constexpr int MAXTAG = 4096;
@@ -149,6 +152,10 @@ SARange Branch_Ranges[4];
 
 // Reference for located singletons (see Locate). Off with --no-ref.
 bool Use_Ref = false;
+// Without the reference, but with the SA samples loaded (SAM/BAM output): a single-row
+// path records its genome position in Pos at the first sampled row (Mark_Sampled).
+bool Track_Pos = false;
+constexpr unsigned long NO_POS = ~0UL;  // Pos unknown (Track_Pos: the read runs off the genome)
 std::vector<uint8_t> Pac;             // forward genome (.pac): 2 bits a base, first base in bits 7-6, 16 bytes of padding
 unsigned long Text_Length = 0;
 uint64_t Read_Packed[MAXTAG / 32 + 1];  // current read: 32 bases a word, first base in bits 63-62
@@ -252,6 +259,17 @@ bool Locate(const ActiveBWT* fmi, SARange& Tag, bool Right, int Offset, int Len,
     if (S < 0 || S + STRINGLENGTH > static_cast<long>(Text_Length)) return false;
     Tag.Pos = S;
     return true;
+}
+
+// A single-row path without the reference reaching a sampled row: from now on Skip (a
+// single row; the walk goes on). With Track_Pos, also the read's forward-genome start in
+// Pos, read from the SA sample as Locate does (NO_POS if the read would run off the
+// genome): later steps follow the same occurrence, so it stays valid, and the hit needs
+// no SA walk at output. Done bases of the segment are matched at this row.
+inline void Mark_Sampled(const ActiveBWT* fmi, SARange& Tag, bool Right, int Offset, int Len, int Done) {
+    Tag.Skip++;
+    Tag.End = Tag.Start;
+    if (Track_Pos && !Locate(fmi, Tag, Right, Offset, Len, Done)) Tag.Pos = NO_POS;
 }
 
 // Mismatches in the part of the segment a located Tag has not matched yet.
@@ -512,8 +530,7 @@ __attribute__((noinline)) bool Search_Right_Singleton(std::string_view currentTa
             tag.Level = stringLength;
             return true;
         }
-        tag.Skip++;
-        tag.End = tag.Start;
+        Mark_Sampled(fmi, tag, true, offset, stringLength, tag.Level - 1);
     }
 
     for (;;) {
@@ -533,8 +550,7 @@ __attribute__((noinline)) bool Search_Right_Singleton(std::string_view currentTa
                     tag.Level = stringLength;
                     return true;
                 }
-                tag.Skip++;
-                tag.End = tag.Start;
+                Mark_Sampled(fmi, tag, true, offset, stringLength, tag.Level);
             }
 
             if (tag.Level == stringLength) {
@@ -620,8 +636,7 @@ void Extend_Right_Singleton(std::string_view Current_Tag,int Offset,struct SARan
 	if(Tag.Start % SAINTERVAL == 0 && !Tag.Skip)
 	{
 		if (Use_Ref) {if (Locate(fmi,Tag,true,Offset,StringLength,Tag.Level-1)) Extend_Located(Tag,true,Offset,StringLength,Count,Out);return;}
-		Tag.Skip++;
-		Tag.End=Tag.Start;
+		Mark_Sampled(fmi, Tag, true, Offset, StringLength, Tag.Level - 1);
 	}
 
 	for(;;)
@@ -647,8 +662,7 @@ void Extend_Right_Singleton(std::string_view Current_Tag,int Offset,struct SARan
 
 		if(!Tag.Skip && Tag.Start % SAINTERVAL == 0)
 		{
-			Tag.Skip++;
-			Tag.End=Tag.Start;
+			Mark_Sampled(fmi, Tag, true, Offset, StringLength, Tag.Level);
 		}
 
 		if (Expected!=Now)
@@ -795,8 +809,7 @@ __attribute__((noinline)) void Search_Left_Singleton(std::string_view Current_Ta
 			if (!Search_Located(fmi,Tag,false,Offset,StringLength,Level-1)) Tag.Start=0;//Level: the failure depth
 			return;
 		}
-		Tag.Skip++;
-		Tag.End=Tag.Start;
+		Mark_Sampled(fmi, Tag, false, Offset, StringLength, Level - 1);
 	}
 	for(;;)
 	{
@@ -816,7 +829,7 @@ __attribute__((noinline)) void Search_Left_Singleton(std::string_view Current_Ta
 					if (!Search_Located(fmi,Tag,false,Offset,StringLength,Level)) Tag.Start=0;
 					return;
 				}
-				Tag.Skip++;Tag.End=Tag.Start;
+				Mark_Sampled(fmi, Tag, false, Offset, StringLength, Level);
 			}
 
 			if(Level== StringLength)//no need to print as we are still halfway..
@@ -879,8 +892,7 @@ void Extend_Left_Singleton(std::string_view Current_Tag,int Offset,struct SARang
 	if(Tag.Start % SAINTERVAL == 0 && !Tag.Skip)
 	{
 		if (Use_Ref) {if (Locate(fmi,Tag,false,Offset,StringLength,Tag.Level-1)) Extend_Located(Tag,false,Offset,StringLength,Count,Out);return;}
-		Tag.Skip++;
-		Tag.End=Tag.Start;
+		Mark_Sampled(fmi, Tag, false, Offset, StringLength, Tag.Level - 1);
 	}
 
 	for(;;)
@@ -905,8 +917,7 @@ void Extend_Left_Singleton(std::string_view Current_Tag,int Offset,struct SARang
 
 		if(!Tag.Skip && Tag.Start % SAINTERVAL == 0)
 		{
-			Tag.Skip++;
-			Tag.End=Tag.Start;
+			Mark_Sampled(fmi, Tag, false, Offset, StringLength, Tag.Level);
 		}
 
 		if (Expected!=Now)
@@ -1395,8 +1406,9 @@ struct Mm_Step {
     unsigned char Win, Seg2;  // Win: windowed extension, or a search's case (Mm_Window_Set); Seg2: OP_CROSS's switch
                               // segment, or OP_SEARCH_KEEP's kept segment
     unsigned char Stored;     // OP_SEARCH / OP_SEARCH_KEEP: 1 + the slot of the kept range (0: none)
+    unsigned char Strand;     // two-strand programs (Zig_Zag): 0 the read, 1 its reverse complement
 };
-constexpr unsigned MM_PROGRAM_MAX = 40;  // longest program (-n 3: 38 steps), for the stats
+constexpr unsigned MM_PROGRAM_MAX = 96;  // longest program (-n 3 zig-zag: 85 steps), for the stats
 constexpr unsigned MM_LISTS = RL_LISTS;  // each read's lists (Result_List)
 
 // -n 0: Search_Right over the read.
@@ -1493,6 +1505,20 @@ struct {
 } Batch_Stats;
 #endif
 
+// A read strand's state in a lane (two-strand programs): the lane's fields of the same
+// names hold the active strand's, Mm_Set_Strand swaps them with these.
+struct Mm_Strand {
+    std::string_view All;
+    unsigned Index;
+    ForwardResults* Res;
+    unsigned long ReadHits;
+    int LH_Fail, RH_Fail;
+    SARange Stored[2];
+    bool Stored_Valid[2];
+    std::size_t Tagged;
+    uint64_t Packed[MAXTAG / 32 + 1];
+};
+
 struct Mm_Lane {
     std::string_view All;
     unsigned Index;
@@ -1523,7 +1549,29 @@ struct Mm_Lane {
     unsigned long Width;     // TASK_SWITCH: the range's width, the same in both indexes
     uint64_t Packed[MAXTAG / 32 + 1];
     char Patched[MAXTAG];    // TASK_SWITCH: the read with the seed's mismatch applied
+    // Two-strand programs: the active strand (the fields above) and the other one.
+    bool Two_Strands;
+    unsigned char Strand;
+    Mm_Strand Other;
 };
+
+// Makes strand S the lane's active one (between steps only): swaps the per-strand fields.
+inline void Mm_Set_Strand(Mm_Lane& L, unsigned S) {
+    if (S == L.Strand || !L.Two_Strands) return;
+    Mm_Strand& O = L.Other;
+    const std::size_t Words = (L.All.size() + 31) / 32;  // both strands have the read's length
+    std::swap(L.All, O.All);
+    std::swap(L.Index, O.Index);
+    std::swap(L.Res, O.Res);
+    std::swap(L.ReadHits, O.ReadHits);
+    std::swap(L.LH_Fail, O.LH_Fail);
+    std::swap(L.RH_Fail, O.RH_Fail);
+    std::swap(L.Stored, O.Stored);
+    std::swap(L.Stored_Valid, O.Stored_Valid);
+    std::swap(L.Tagged, O.Tagged);
+    if (Use_Ref) std::swap_ranges(L.Packed, L.Packed + Words, O.Packed);
+    L.Strand = static_cast<unsigned char>(S);
+}
 
 // The read base at Level and its read position, for the task's direction.
 inline unsigned Mm_Base(const Mm_Lane& L, int Level) {
@@ -1547,8 +1595,7 @@ inline void Mm_Search_Enter(Mm_Lane& L) {
             L.Sub = MM_LOCATE;
             return;
         }
-        T.Skip++;
-        T.End = T.Start;
+        Mark_Sampled(L.Fmi, T, L.Right, L.Offset, static_cast<int>(L.Tag.size()), T.Level - 1);
     }
 }
 
@@ -1585,8 +1632,7 @@ inline bool Mm_Search_Step(Mm_Lane& L) {
                     L.Sub = MM_LOCATE;
                     return false;
                 }
-                T.Skip++;
-                T.End = T.Start;
+                Mark_Sampled(L.Fmi, T, L.Right, L.Offset, Len, T.Level);
             }
             if (T.Level == Len) {
                 if (L.Right || !T.Skip) T.End = T.Start;  // as Search_Right / Search_Left_Singleton
@@ -1632,8 +1678,7 @@ inline bool Mm_Single_Enter(Mm_Lane& L) {
             L.Sub = MM_LOCATE;
             return false;
         }
-        T.Skip++;
-        T.End = T.Start;
+        Mark_Sampled(L.Fmi, T, L.Right, L.Offset, static_cast<int>(L.Tag.size()), T.Level - 1);
     }
     return false;
 }
@@ -1716,8 +1761,7 @@ inline bool Mm_Extend_Step(Mm_Lane& L) {
             if (Now == Expected) T.Start = L.Fmi->cumulativeFreq[Base] + BWTOccValue(L.Fmi, T.Start, Base) + 1;
             else T.Start = L.Fmi->cumulativeFreq[Now] + BWTOccValue(L.Fmi, T.Start, Now) + 1;
             if (!T.Skip && T.Start % SAINTERVAL == 0) {
-                T.Skip++;
-                T.End = T.Start;
+                Mark_Sampled(L.Fmi, T, L.Right, L.Offset, Len, T.Level);
             }
             if (Expected != Now) {
                 T.Mismatch_Char = T.Mismatch_Char | (Now << T.Mismatches * 2);
@@ -1859,8 +1903,7 @@ inline bool Mm_Window_Step(Mm_Lane& L) {
             if (Now == Expected) T.Start = L.Fmi->cumulativeFreq[Base] + BWTOccValue(L.Fmi, T.Start, Base) + 1;
             else T.Start = L.Fmi->cumulativeFreq[Now] + BWTOccValue(L.Fmi, T.Start, Now) + 1;
             if (!T.Skip && T.Start % SAINTERVAL == 0) {
-                T.Skip++;
-                T.End = T.Start;
+                Mark_Sampled(L.Fmi, T, L.Right, L.Offset, Len, T.Level);
             }
             if (Now != Expected) Mm_Record(T, Now, x);
             if (!Window_Keep(T, L.W, x, L.Right)) return Mm_Single_Done(L);
@@ -1948,9 +1991,12 @@ inline std::string_view Mm_Segment(const Mm_Lane& L, unsigned Seg, int& Offset) 
 }
 
 // Hits the read has so far: its exact count plus its mismatch hits (RL_HITS), unless
-// Skip is RL_HITS (an extension into RL_HITS counts that list itself).
+// Skip is RL_HITS (an extension into RL_HITS counts that list itself); with two strands,
+// the other strand's too.
 inline unsigned long Mm_Used(const Mm_Lane& L, int Skip = -1) {
-    return L.ReadHits + (L.Res && Skip != static_cast<int>(RL_HITS) ? L.Res[RL_HITS].hitCount : 0);
+    unsigned long Used = L.ReadHits + (L.Res && Skip != static_cast<int>(RL_HITS) ? L.Res[RL_HITS].hitCount : 0);
+    if (L.Two_Strands) Used += L.Other.ReadHits + (L.Other.Res ? L.Other.Res[RL_HITS].hitCount : 0);
+    return Used;
 }
 
 // OP_CROSS: extends seed R (its mismatches kept) over the step's segment. Returns false
@@ -1995,6 +2041,7 @@ inline void Mm_Keep_Rest(Mm_Lane& L, const Mm_Step& P, std::string_view Seg, int
 void Mm_Run(Mm_Lane& L, unsigned MaxHits) {
     for (;;) {
         const Mm_Step& P = L.Program[L.PC];
+        Mm_Set_Strand(L, P.Strand);
         int Offset;
         switch (P.Op) {
             case OP_SEARCH: {
@@ -2076,8 +2123,8 @@ void Mm_Run(Mm_Lane& L, unsigned MaxHits) {
                     L.PC++;
                     continue;
                 }
-                if (!L.Found || !L.Cur.Start) {
-                    L.PC++;
+                if (!L.Found || !L.Cur.Start || (P.Limited && MaxHits && Mm_Used(L) >= MaxHits)) {
+                    L.PC++;  // nothing to extend, or no hits left to find (a budget of 0 is no limit)
                     continue;
                 }
                 SARange R = L.Cur;
@@ -2219,15 +2266,18 @@ inline bool Mm_Step_Task(Mm_Lane& L) {
 // -n 0 (Program_Exact): Ranges[i] / Found[i] as Search_Right from Start_Range.
 // -n 1 to 3 (Program_One_Mismatch, ...): Res[MM_LISTS * i ...] get read i's result lists
 // (Result_List), ReadHits[i] its exact hit count (One_Mismatch_Search's value).
+// With Two_Strands (a Zig_Zag program), Reads holds 2 * Count reads, read Count + i the
+// reverse complement of read i, and one lane searches both (Mm_Strand); Res and ReadHits
+// are indexed by read as before.
 void Batch_Search(const char* Reads, unsigned Count, int Len, unsigned B, unsigned MaxHits, const Mm_Step* Program,
                   std::vector<ForwardResults>* Res, std::vector<unsigned long>* ReadHits, std::vector<SARange>* Ranges,
-                  std::vector<unsigned char>* Found) {
+                  std::vector<unsigned char>* Found, bool Two_Strands = false) {
     static Mm_Lane Lanes[MAX_BATCH];
     unsigned Active = 0, Next = 0;
-    auto Finish = [&](Mm_Lane& L) {
+    auto Finish_Strand = [&](Mm_Lane& L) {
         if (L.Res) {  // a read stopped inside a stage (OP_CROSS at MaxHits): tag its last hits
             for (const Mm_Step* P = Program + L.PC; P->Op != OP_END; P++)
-                if (P->Op == OP_END_STAGE) {
+                if (P->Op == OP_END_STAGE && P->Strand == L.Strand) {
                     Tag_Hits(L.Res, L.Tagged, P->Count);
                     break;
                 }
@@ -2238,30 +2288,48 @@ void Batch_Search(const char* Reads, unsigned Count, int Len, unsigned B, unsign
             (*Found)[L.Index] = L.Found;
         }
     };
+    auto Finish = [&](Mm_Lane& L) {
+        Finish_Strand(L);
+        if (!L.Two_Strands) return;
+        Mm_Set_Strand(L, 1 - L.Strand);
+        Finish_Strand(L);
+    };
+    // Starts a strand: read I's lists, packed read and search state (the active fields).
+    auto Start_Strand = [&](Mm_Lane& L, unsigned I) {
+        L.All = std::string_view(Reads + static_cast<std::size_t>(I) * Len, Len);
+        L.Index = I;
+        L.Res = Res ? &(*Res)[MM_LISTS * static_cast<std::size_t>(I)] : nullptr;
+        L.Tagged = 0;
+        if (L.Res)
+            for (unsigned k = 0; k < MM_LISTS; k++) {
+                L.Res[k].hits.clear();
+                L.Res[k].mismatches.clear();
+                L.Res[k].hitCount = 0;
+            }
+        L.ReadHits = 0;
+        L.LH_Fail = Len;
+        L.RH_Fail = 0;
+        L.Stored_Valid[0] = L.Stored_Valid[1] = false;
+        if (Use_Ref) Pack_Read(L.All, L.Packed);
+    };
     auto Fill = [&](Mm_Lane& L) {
         while (Next < Count) {
             const unsigned I = Next++;
-            L.All = std::string_view(Reads + static_cast<std::size_t>(I) * Len, Len);
-            L.Index = I;
-            L.Res = Res ? &(*Res)[MM_LISTS * static_cast<std::size_t>(I)] : nullptr;
-            L.Tagged = 0;
-            if (L.Res)
-                for (unsigned k = 0; k < MM_LISTS; k++) {
-                    L.Res[k].hits.clear();
-                    L.Res[k].mismatches.clear();
-                    L.Res[k].hitCount = 0;
-                }
-            L.ReadHits = 0;
+            L.Two_Strands = false;
+            L.Strand = 0;
+            if (Two_Strands) {  // the reverse complement first, then swapped out
+                Start_Strand(L, Count + I);
+                L.Two_Strands = true;
+                L.Strand = 1;
+                Mm_Set_Strand(L, 0);
+            }
+            Start_Strand(L, I);
             L.Program = Program;
             L.PC = 0;
             L.InTask = L.Done_Read = false;
             L.Resume = 0;
             L.Switching = false;
             L.Found = false;
-            L.LH_Fail = Len;
-            L.RH_Fail = 0;
-            L.Stored_Valid[0] = L.Stored_Valid[1] = false;
-            if (Use_Ref) Pack_Read(L.All, L.Packed);
             Mm_Run(L, MaxHits);
             if (!L.Done_Read) return true;
             Finish(L);
@@ -2316,6 +2384,54 @@ void Batch_Two_Mismatch(const char* Reads, unsigned Count, int Len, unsigned B, 
 void Batch_Three_Mismatch(const char* Reads, unsigned Count, int Len, unsigned B, unsigned MaxHits,
                           std::vector<ForwardResults>& Res, std::vector<unsigned long>& ReadHits) {
     Batch_Search(Reads, Count, Len, B, MaxHits, Program_Three_Mismatch, &Res, &ReadHits, nullptr, nullptr);
+}
+
+// The two-strand (zig-zag) form of a one-strand program, for Batch_Search with
+// Two_Strands. P is cut into groups at each OP_STOP_IF_MAXHITS, and after OP_COUNT_EXACT
+// so that the exact hits are a group of their own. Each group runs on the read, then on
+// its reverse complement, with a MaxHits stop after each. Each strand's stages keep their
+// order, and a group holds one mismatch count (the first: exact hits, never budget-
+// limited), so the hits found are still the best: a strand stops only once the hits
+// reach MaxHits with nothing better left in either strand, and the reverse complement's
+// half of a group could only tie (ties: the read's strand first).
+std::vector<Mm_Step> Zig_Zag(const Mm_Step* P) {
+    std::vector<Mm_Step> Out, Group;
+    auto Flush = [&] {
+        if (Group.empty()) return;
+        for (unsigned char Strand : {0, 1}) {
+            for (Mm_Step Step : Group) {
+                Step.Strand = Strand;
+                Out.push_back(Step);
+            }
+            Out.push_back({OP_STOP_IF_MAXHITS, false, 0, 0, 0, 0, false, false});
+        }
+        Group.clear();
+    };
+    for (; P->Op != OP_END; P++) {
+        if (P->Op == OP_STOP_IF_MAXHITS) {
+            Flush();
+            continue;
+        }
+        Group.push_back(*P);
+        if (P->Op == OP_COUNT_EXACT) Flush();
+    }
+    Flush();
+    Out.push_back({OP_END, false, 0, 0, 0, 0, false, false});
+    if (Out.size() > MM_PROGRAM_MAX) {
+        std::fprintf(stderr, "zig-zag program too long (%zu steps)\n", Out.size());
+        std::exit(1);
+    }
+    return Out;
+}
+
+// -n 1 to 3 on both strands of each read (Zig_Zag): Reads holds 2 * Count reads, read
+// Count + i the reverse complement of read i; Res and ReadHits are indexed the same way.
+void Batch_Both_Strands(const char* Reads, unsigned Count, int Len, unsigned B, unsigned MaxHits, int MaxMismatches,
+                        std::vector<ForwardResults>& Res, std::vector<unsigned long>& ReadHits) {
+    static const std::vector<Mm_Step> Programs[3] = {Zig_Zag(Program_One_Mismatch), Zig_Zag(Program_Two_Mismatch),
+                                                     Zig_Zag(Program_Three_Mismatch)};
+    Batch_Search(Reads, Count, Len, B, MaxHits, Programs[MaxMismatches - 1].data(), &Res, &ReadHits, nullptr, nullptr,
+                 true);
 }
 
 // The per-read path's windowed extensions and index switches: the lane steps above, run
@@ -2542,7 +2658,8 @@ std::string Hit_Text(const SARange& hit, const char* dir) {
     return std::string("\t") + dir + "\t" + std::to_string(hit.Start) + "\t" + std::to_string(hit.Skip ? hit.Start : hit.End);
 }
 
-bool ReadNextRecord(std::ifstream& in, std::string& id, std::string& seq) {
+// The next FASTA or FASTQ record; with qual, also its quality line (empty for FASTA).
+bool ReadNextRecord(std::ifstream& in, std::string& id, std::string& seq, std::string* qual = nullptr) {
     std::string line;
     while (std::getline(in, line)) {
         if (line.empty()) {
@@ -2557,7 +2674,7 @@ bool ReadNextRecord(std::ifstream& in, std::string& id, std::string& seq) {
             if (!std::getline(in, line)) {
                 return false;
             }
-            if (!std::getline(in, line)) {
+            if (!std::getline(in, qual ? *qual : line)) {
                 return false;
             }
             return true;
@@ -2566,6 +2683,7 @@ bool ReadNextRecord(std::ifstream& in, std::string& id, std::string& seq) {
         if (line[0] == '>') {
             id = line.substr(1);
             seq.clear();
+            if (qual) qual->clear();
             std::streampos pos;
             while (true) {
                 pos = in.tellg();
@@ -2651,26 +2769,128 @@ inline const Hit_Stage* Stages_Of(int maxMismatches) {
     return maxMismatches == 3 ? Three_Stages : maxMismatches == 2 ? Two_Stages : One_Stages;
 }
 
+// SAM/BAM output (--sam / --bam): the genome's sequences and N runs, the writer, and
+// whether the reverse complement of each read is searched too.
+struct Sam_Output {
+    Genome_Map Map;
+    Sam_Writer Writer;
+    bool Reverse = true;
+    bool Write = true;  // false with --quiet
+    std::vector<uint64_t> Positions;
+};
+
+// The forward-text start of each location of a hit of L bases whose rows are in fwfmi
+// (Forward_Index) or revfmi: Pos when the walk recorded it (located, or Track_Pos), else
+// each row's SA value.
+void Hit_Positions(const SARange& hit, bool Forward_Index, int L, std::vector<uint64_t>& Out) {
+    if (hit.Skip && (Use_Ref || Track_Pos) && hit.Pos != NO_POS) {
+        Out.push_back(hit.Pos);
+        return;
+    }
+    const unsigned long Last = hit.Skip ? hit.Start : hit.End;
+    for (unsigned long Row = hit.Start; Row <= Last; Row++)
+        Out.push_back(Forward_Index ? BWTSaValue(fwfmi, Row) : Text_Length - L - BWTSaValue(revfmi, Row));
+}
+
+// Writes one read's SAM/BAM records from its strands' lists (Res[1]: the reverse
+// complement's, or null): the hits in order of mismatches (forward strand first on a
+// tie), each location placed on its sequence (Genome_Map::Place; locations leaving a
+// sequence or covering an N are dropped), at most MaxHits records (0: all). The first is
+// primary. No record: one unmapped record. Returns the mapped records.
+unsigned long Write_Sam_Read(Sam_Output& S, const std::string& Id, const std::string& Seq_Text, const std::string& Qual,
+                             std::string_view Codes, const ForwardResults* const Res[2], const Hit_Stage* const Stages[2],
+                             unsigned MaxHits) {
+    struct Candidate {
+        int Mismatches, Strand;
+        const SARange* Hit;
+        bool Forward_Index;
+    };
+    struct Record {
+        int Tid, Strand;
+        int64_t Pos;
+        const SARange* Hit;
+    };
+    static std::vector<Candidate> Candidates;
+    static std::vector<Record> Records;
+    Candidates.clear();
+    Records.clear();
+    for (int Strand = 0; Strand < 2; Strand++) {
+        if (!Res[Strand]) continue;
+        for (const SARange& h : Res[Strand][RL_EXACT].hits) Candidates.push_back({0, Strand, &h, false});
+        for (const SARange& h : Res[Strand][RL_HITS].hits) {
+            const Hit_Stage& Stage = Stages[Strand][h.Stage];
+            Candidates.push_back({Stage.Mismatches, Strand, &h, Stage.Dir[0] == 'B'});
+        }
+    }
+    std::stable_sort(Candidates.begin(), Candidates.end(),
+                     [](const Candidate& a, const Candidate& b) { return a.Mismatches < b.Mismatches; });
+    const int L = static_cast<int>(Codes.size());
+    for (const Candidate& C : Candidates) {
+        S.Positions.clear();
+        Hit_Positions(*C.Hit, C.Forward_Index, L, S.Positions);
+        for (uint64_t G : S.Positions) {
+            int Tid;
+            int64_t Pos;
+            if (!S.Map.Place(G, L, Tid, Pos)) continue;
+            Records.push_back({Tid, C.Strand, Pos, C.Hit});
+            if (MaxHits && Records.size() >= MaxHits) break;
+        }
+        if (MaxHits && Records.size() >= MaxHits) break;
+    }
+    if (!S.Write) return Records.size();
+    const std::string Name = Id.substr(0, Id.find_first_of(" \t"));
+    if (Records.empty()) {
+        S.Writer.Write_Unmapped(Name, Seq_Text, Qual);
+        return 0;
+    }
+    std::string Seq[2], Qual_Of[2];
+    Seq[0].resize(L);
+    Seq[1].resize(L);
+    for (int i = 0; i < L; i++) {
+        Seq[0][i] = "ACGT"[static_cast<unsigned char>(Codes[i])];
+        Seq[1][L - 1 - i] = "TGCA"[static_cast<unsigned char>(Codes[i])];
+    }
+    Qual_Of[0] = Qual.size() == static_cast<std::size_t>(L) ? Qual : std::string();
+    Qual_Of[1] = std::string(Qual_Of[0].rbegin(), Qual_Of[0].rend());
+    std::vector<std::pair<int, int>> Mismatches;
+    for (std::size_t k = 0; k < Records.size(); k++) {
+        const Record& R = Records[k];
+        Mismatches.clear();
+        for (int i = 0; i < R.Hit->Mismatches && i < MAX_MISMATCHES_BOUND; i++)
+            Mismatches.push_back({R.Hit->Mismatch_Pos[i], static_cast<int>(R.Hit->Mismatch_Char >> (2 * i) & 3)});
+        const uint16_t Flag = (R.Strand ? BAM_FREVERSE : 0) | (k ? BAM_FSECONDARY : 0);
+        S.Writer.Write_Mapped(Name, Flag, R.Tid, R.Pos, Seq[R.Strand], Qual_Of[R.Strand], Mismatches,
+                              static_cast<int>(Records.size()));
+    }
+    return Records.size();
+}
+
 // --batch B > 1: reads the records in blocks, searches each block with Batch_Exact
 // (-n 0, or reads too short to split into halves) or Batch_One_Mismatch (-n 1) and
 // writes its lines in input order, as the per-read loop in main does. Encoding the
 // reads counts as input here. Returns false on an unsupported read length.
+// With sam, writes SAM/BAM records instead (Write_Sam_Read). The reverse complements of
+// the block's reads, if searched, follow the reads: one lane searches both strands of a
+// read in zig-zag order (Batch_Both_Strands); the exact search takes them as more reads.
 bool Run_Batched(std::ifstream& in, std::ostream& out, unsigned B, int maxMismatches, unsigned maxHits, bool quiet,
                  uint64_t& records, uint64_t& reportedHits, double& tableBuildSeconds,
-                 double& inputParseSeconds, double& searchSeconds, double& outputSeconds) {
+                 double& inputParseSeconds, double& searchSeconds, double& outputSeconds, Sam_Output* sam = nullptr) {
     using Clock = std::chrono::steady_clock;
 #ifdef BATMAN_BATCH_BLOCK
     constexpr unsigned BLOCK = BATMAN_BATCH_BLOCK;
 #else
     constexpr unsigned BLOCK = 4096;
 #endif
+    const unsigned strands = sam && sam->Reverse ? 2 : 1;  // searched copies of each read
     std::vector<std::string> ids(BLOCK);
+    std::vector<std::string> seqs(sam ? BLOCK : 0), quals(sam ? BLOCK : 0);  // SAM/BAM: the reads as given
     std::vector<unsigned char> searched(BLOCK);  // valid read of the right length
     std::vector<unsigned> slot(BLOCK);            // its place among the searched reads
-    std::vector<SARange> ranges(BLOCK);
-    std::vector<unsigned char> found(BLOCK);
-    std::vector<ForwardResults> results(MM_LISTS * BLOCK);  // -n 1 to 3: each read's result lists
-    std::vector<unsigned long> readHits(BLOCK);
+    std::vector<SARange> ranges(strands * BLOCK);
+    std::vector<unsigned char> found(strands * BLOCK);
+    std::vector<ForwardResults> results(MM_LISTS * strands * BLOCK);  // -n 1 to 3: each read's result lists
+    std::vector<unsigned long> readHits(strands * BLOCK);
+    ForwardResults exactLists[2][RL_LISTS];  // SAM/BAM, exact search: a read's range as lists
     std::string reads;  // codes of the searched reads, back to back
     std::string seq, lines;
     bool initialized = false, more = true;
@@ -2679,8 +2899,9 @@ bool Run_Batched(std::ifstream& in, std::ostream& out, unsigned B, int maxMismat
         double tableSeconds = 0.0;
         reads.clear();
         const auto parseStart = Clock::now();
-        while (n < BLOCK && (more = ReadNextRecord(in, ids[n], seq))) {
+        while (n < BLOCK && (more = ReadNextRecord(in, ids[n], seq, sam ? &quals[n] : nullptr))) {
             ++records;
+            if (sam) seqs[n] = seq;
             if (!initialized) {
                 STRINGLENGTH = static_cast<int>(seq.size());
                 if (STRINGLENGTH <= 0 || STRINGLENGTH >= MAXTAG) {
@@ -2713,11 +2934,48 @@ bool Run_Batched(std::ifstream& in, std::ostream& out, unsigned B, int maxMismat
 
         const bool oneMismatch = maxMismatches >= 1 && STRINGLENGTH / 2 > LOOKUPSIZE;
         const auto searchStart = Clock::now();
-        if (oneMismatch && maxMismatches == 3) Batch_Three_Mismatch(reads.data(), count, STRINGLENGTH, B, maxHits, results, readHits);
-        else if (oneMismatch && maxMismatches == 2) Batch_Two_Mismatch(reads.data(), count, STRINGLENGTH, B, maxHits, results, readHits);
-        else if (oneMismatch) Batch_One_Mismatch(reads.data(), count, STRINGLENGTH, B, maxHits, results, readHits);
-        else Batch_Exact(reads.data(), count, STRINGLENGTH, B, ranges, found);
+        if (strands == 2) {  // the reverse complements, read count + i for read i
+            reads.resize(2 * reads.size());
+            const std::size_t half = reads.size() / 2;
+            for (std::size_t r = 0; r < count; r++)
+                for (int i = 0; i < STRINGLENGTH; i++)
+                    reads[half + r * STRINGLENGTH + i] = static_cast<char>(3 - reads[r * STRINGLENGTH + STRINGLENGTH - 1 - i]);
+        }
+        const unsigned total = strands * count;
+        if (oneMismatch && strands == 2) Batch_Both_Strands(reads.data(), count, STRINGLENGTH, B, maxHits, maxMismatches, results, readHits);
+        else if (oneMismatch && maxMismatches == 3) Batch_Three_Mismatch(reads.data(), total, STRINGLENGTH, B, maxHits, results, readHits);
+        else if (oneMismatch && maxMismatches == 2) Batch_Two_Mismatch(reads.data(), total, STRINGLENGTH, B, maxHits, results, readHits);
+        else if (oneMismatch) Batch_One_Mismatch(reads.data(), total, STRINGLENGTH, B, maxHits, results, readHits);
+        else Batch_Exact(reads.data(), total, STRINGLENGTH, B, ranges, found);
         searchSeconds += std::chrono::duration<double>(Clock::now() - searchStart).count();
+
+        if (sam) {
+            const auto outputStart = Clock::now();
+            for (unsigned j = 0; j < n; j++) {
+                if (!searched[j]) {
+                    if (sam->Write) sam->Writer.Write_Unmapped(ids[j].substr(0, ids[j].find_first_of(" \t")), seqs[j], quals[j]);
+                    continue;
+                }
+                const ForwardResults* res[2] = {nullptr, nullptr};
+                const Hit_Stage* stages[2] = {One_Stages, One_Stages};
+                for (unsigned s = 0; s < strands; s++) {
+                    const std::size_t at = s * count + slot[j];
+                    if (oneMismatch) {
+                        res[s] = &results[MM_LISTS * at];
+                        stages[s] = Stages_Of(maxMismatches);
+                        continue;
+                    }
+                    exactLists[s][RL_EXACT].hits.clear();
+                    if (found[at] && ranges[at].Start) exactLists[s][RL_EXACT].hits.push_back(ranges[at]);
+                    res[s] = exactLists[s];
+                }
+                reportedHits += Write_Sam_Read(*sam, ids[j], seqs[j], quals[j],
+                                               std::string_view(reads.data() + static_cast<std::size_t>(slot[j]) * STRINGLENGTH, STRINGLENGTH),
+                                               res, stages, maxHits);
+            }
+            outputSeconds += std::chrono::duration<double>(Clock::now() - outputStart).count();
+            continue;
+        }
 
         const auto outputStart = Clock::now();
         lines.clear();
@@ -2751,12 +3009,17 @@ bool Run_Batched(std::ifstream& in, std::ostream& out, unsigned B, int maxMismat
 
 void Usage(const char* prog) {
     std::fprintf(stderr,
-    "Usage: %s -q <reads.fa/fq> -g <genome_prefix> [-n <0|1|2|3>] [-o <hits.txt>] [-m <maxhits>] [--no-ref] [--lookup <k>] [--batch <B>] [--quiet|-Q] [--timing]\n"
+    "Usage: %s -q <reads.fa/fq> -g <genome_prefix> [-n <0|1|2|3>] [-o <hits.txt>] [-m <maxhits>] [--no-ref] [--lookup <k>] [--batch <B>] [--sam|--bam] [--forward-only] [--quiet|-Q] [--timing]\n"
         "  -n  maximum mismatches, 0-3 (default 0); 1 to 3 also need the forward index\n"
         "      <genome_prefix>.bwt/.fmv\n"
         "  -m  maximum hits per read (default 1, 0 = all)\n"
         "  --no-ref  do not load the SA samples (.sa) and packed genome (.pac); single-row\n"
         "            paths then walk the index to the end (less memory, slower)\n"
+        "  --sam, --bam  write SAM / BAM (htslib; also chosen by an -o ending .sam / .bam;\n"
+        "            stdout without -o): both strands, NM/MD/NH tags, hits on N runs or across\n"
+        "            sequences dropped. Needs the SA samples (.sa) even with --no-ref, which\n"
+        "            then records positions at sampled rows of single-row paths\n"
+        "  --forward-only  SAM/BAM: search the reads as given, not their reverse complements\n"
         "  --lookup  depth k of the start-of-search tables, 3-14 (default 6): 8*4^k bytes\n"
         "            per index; deeper is faster once there are more than about 4^k/3 reads\n"
         "            (see benchmark/lookup_table.md)\n"
@@ -2783,6 +3046,8 @@ int main(int argc, char** argv) {
     bool timing = false;
     bool useRef = true;
     int batchSize = 1;
+    int samFormat = 0;  // 1 SAM, 2 BAM (--sam / --bam, or the -o extension)
+    bool forwardOnly = false;
 
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "-q") == 0 && i + 1 < argc) {
@@ -2825,6 +3090,12 @@ int main(int argc, char** argv) {
             }
         } else if (std::strcmp(argv[i], "--no-ref") == 0) {
             useRef = false;
+        } else if (std::strcmp(argv[i], "--sam") == 0) {
+            samFormat = 1;
+        } else if (std::strcmp(argv[i], "--bam") == 0) {
+            samFormat = 2;
+        } else if (std::strcmp(argv[i], "--forward-only") == 0) {
+            forwardOnly = true;
         } else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
             Usage(argv[0]);
             return 0;
@@ -2838,6 +3109,12 @@ int main(int argc, char** argv) {
         Usage(argv[0]);
         return 1;
     }
+    auto endsWith = [&](const char* suffix) {
+        const std::size_t n = std::strlen(suffix);
+        return outputFile.size() >= n && outputFile.compare(outputFile.size() - n, n, suffix) == 0;
+    };
+    if (!samFormat && endsWith(".bam")) samFormat = 2;
+    if (!samFormat && endsWith(".sam")) samFormat = 1;
 
     using Clock = std::chrono::steady_clock;
     const auto totalStart = Clock::now();
@@ -2865,14 +3142,24 @@ int main(int argc, char** argv) {
         }
     }
 
+    const bool loadSa = useRef || samFormat;  // SAM/BAM: positions need the SA samples
+    if (samFormat) {
+        for (const std::string* name : {&revSa, &fwSa}) {
+            if ((name != &fwSa || maxMismatches > 0) && !FileExists(*name)) {
+                std::fprintf(stderr, "SAM/BAM output needs %s\n", name->c_str());
+                return 1;
+            }
+        }
+    }
+
     const auto loadStart = Clock::now();
-    revfmi = initFMI(revBwt.c_str(), revOcc.c_str(), useRef ? revSa.c_str() : nullptr);
+    revfmi = initFMI(revBwt.c_str(), revOcc.c_str(), loadSa ? revSa.c_str() : nullptr);
     if (!revfmi) {
         std::fprintf(stderr, "Failed to load reverse index: %s / %s\n", revBwt.c_str(), revOcc.c_str());
         return 1;
     }
     if (maxMismatches > 0) {
-        fwfmi = BWTLoad(mmPool, fwBwt.c_str(), fwOcc.c_str(), useRef ? fwSa.c_str() : nullptr, nullptr, nullptr, nullptr);
+        fwfmi = BWTLoad(mmPool, fwBwt.c_str(), fwOcc.c_str(), loadSa ? fwSa.c_str() : nullptr, nullptr, nullptr, nullptr);
         if (!fwfmi) {
             std::fprintf(stderr, "Failed to load forward index: %s / %s\n", fwBwt.c_str(), fwOcc.c_str());
             return 1;
@@ -2888,7 +3175,26 @@ int main(int argc, char** argv) {
         }
     }
     Use_Ref = useRef;
+    Track_Pos = samFormat && !useRef && revfmi->saInterval == SAINTERVAL && (!fwfmi || fwfmi->saInterval == SAINTERVAL);
     Text_Length = revfmi->textLength;
+
+    Sam_Output sam;
+    if (samFormat) {
+        std::string error, commandLine = argv[0];
+        for (int i = 1; i < argc; i++) commandLine += std::string(" ") + argv[i];
+        if (!sam.Map.Load(genomePrefix, error) ||
+            (!quiet && !sam.Writer.Open(outputFile.empty() ? "-" : outputFile, samFormat == 2, sam.Map, commandLine, error))) {
+            std::fprintf(stderr, "%s\n", error.c_str());
+            return 1;
+        }
+        if (sam.Map.Text_Length() != Text_Length) {
+            std::fprintf(stderr, "%s.ann.location does not match the index (%llu bases, index %lu)\n", genomePrefix.c_str(),
+                         static_cast<unsigned long long>(sam.Map.Text_Length()), Text_Length);
+            return 1;
+        }
+        sam.Reverse = !forwardOnly;
+        sam.Write = !quiet;
+    }
     indexLoadSeconds = std::chrono::duration<double>(Clock::now() - loadStart).count();
 
     std::ifstream in(queryFile.c_str());
@@ -2899,7 +3205,7 @@ int main(int argc, char** argv) {
 
     std::ostream* out = &std::cout;
     std::ofstream outFile;
-    if (!outputFile.empty()) {
+    if (!outputFile.empty() && !samFormat) {
         outFile.open(outputFile.c_str());
         if (!outFile) {
             std::fprintf(stderr, "Cannot open output file: %s\n", outputFile.c_str());
@@ -2916,9 +3222,10 @@ int main(int argc, char** argv) {
     uint64_t reportedHits = 0;
     ForwardResults lists[RL_LISTS];  // -n 1 to 3: the read's result lists (Result_List)
 
-    const bool batched = batchSize > 1;
+    const bool batched = batchSize > 1 || samFormat;  // SAM/BAM: the batched engine, --batch 1 by default
     if (batched && !Run_Batched(in, *out, batchSize, maxMismatches, maxHits, quiet, records, reportedHits,
-                                tableBuildSeconds, inputParseSeconds, searchSeconds, outputSeconds)) {
+                                tableBuildSeconds, inputParseSeconds, searchSeconds, outputSeconds,
+                                samFormat ? &sam : nullptr)) {
         return 1;
     }
     while (!batched) {
