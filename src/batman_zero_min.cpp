@@ -7,6 +7,7 @@
 // The BWA-index variant lives in batman_zero_min_bwa.cpp.
 // Optional build variant: -DBATMAN_ZERO_MIN_USE_PAIRED_RANK.
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cctype>
 #include <cstdio>
@@ -168,6 +169,13 @@ int EncodeBase(char c) {
         default: return -1;
     }
 }
+
+// EncodeBase as a table (Run_Batched encodes every base of the input).
+const std::array<signed char, 256> Base_Codes = [] {
+    std::array<signed char, 256> T;
+    for (int c = 0; c < 256; c++) T[c] = static_cast<signed char>(EncodeBase(static_cast<char>(c)));
+    return T;
+}();
 
 ActiveBWT* initFMI(const char* bwtCodeFileName, const char* bwtOccValueFileName, const char* saValueFileName = nullptr) {
     const int poolSize = 524288;
@@ -2916,6 +2924,88 @@ private:
     bool Stop = false;
 };
 
+// A block of records as read, not yet checked or encoded (Run_Batched).
+struct Input_Block {
+    std::vector<std::string> Ids, Seqs, Quals;
+    unsigned N = 0;
+    bool More = true;     // false: the input ended in this block
+    double Seconds = 0;   // reading it
+};
+
+// Reads the blocks in turn. With Ahead, a thread of its own reads the next block into
+// a second buffer while the caller works on the one Next returned (double buffering);
+// otherwise Next reads it. Next returns null once the input has ended; the block it
+// returned before stays valid until it is called again.
+class Block_Reader {
+public:
+    Block_Reader(std::ifstream& In, unsigned Size, bool Qual, bool Ahead) : In(In), Qual(Qual) {
+        for (Input_Block& B : Blocks) {
+            B.Ids.resize(Size);
+            B.Seqs.resize(Size);
+            B.Quals.resize(Qual ? Size : 0);
+        }
+        if (Ahead) Thread = std::thread([this] { Read_Ahead(); });
+    }
+    ~Block_Reader() {
+        {
+            std::lock_guard<std::mutex> Lock(Mutex);
+            Stop = true;
+        }
+        Changed.notify_all();
+        if (Thread.joinable()) Thread.join();
+    }
+
+    const Input_Block* Next() {
+        if (!Thread.joinable()) {
+            if (Ended) return nullptr;
+            Read(Blocks[0]);
+            Ended = !Blocks[0].More;
+            return &Blocks[0];
+        }
+        std::unique_lock<std::mutex> Lock(Mutex);
+        Changed.wait(Lock, [&] { return Filled > Taken || Ended; });
+        if (Filled == Taken) return nullptr;
+        const Input_Block* B = &Blocks[Taken % 2];
+        Taken++;  // the block before it is free
+        Changed.notify_all();
+        return B;
+    }
+
+private:
+    void Read(Input_Block& B) {
+        const auto Start = std::chrono::steady_clock::now();
+        B.N = 0;
+        while (B.N < B.Ids.size() && (B.More = ReadNextRecord(In, B.Ids[B.N], B.Seqs[B.N], Qual ? &B.Quals[B.N] : nullptr)))
+            B.N++;
+        B.Seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - Start).count();
+    }
+
+    void Read_Ahead() {
+        for (unsigned long I = 0;; I++) {
+            {  // block I's buffer is free once block I - 1 has been taken
+                std::unique_lock<std::mutex> Lock(Mutex);
+                Changed.wait(Lock, [&] { return Stop || I < 2 || Taken >= I; });
+                if (Stop) return;
+            }
+            Read(Blocks[I % 2]);
+            std::lock_guard<std::mutex> Lock(Mutex);
+            Filled++;
+            Ended = !Blocks[I % 2].More;
+            Changed.notify_all();
+            if (Ended) return;
+        }
+    }
+
+    std::ifstream& In;
+    const bool Qual;
+    Input_Block Blocks[2];
+    std::thread Thread;
+    std::mutex Mutex;
+    std::condition_variable Changed;
+    unsigned long Filled = 0, Taken = 0;  // blocks read, and returned by Next
+    bool Ended = false, Stop = false;
+};
+
 // Reads the records in blocks, searches each
 // block with Batch_Exact (-n 0, or reads too short to split into halves) or the -n k
 // program (Batch_One_Mismatch ... Batch_Five_Mismatch, Batch_Both_Strands) and writes
@@ -2927,12 +3017,17 @@ private:
 // With Threads > 1, a block holds 2 * Threads chunks of reads, which the threads take in
 // turn to search (each with its own lanes and Batch_Chooser); then each thread formats
 // (or, for SAM/BAM, decodes) a contiguous part of the block, and the main thread writes
-// the parts in order. The output does not depend on Threads.
+// the parts in order. Before the search, each thread checks and encodes its part of the
+// block's reads, and a reader thread (Block_Reader) reads the next block meanwhile. The
+// output does not depend on Threads. inputSeconds: waiting for the reader, and encoding;
+// readSeconds: the reading itself (overlapped with the rest when Threads > 1, and part of
+// inputSeconds otherwise).
 std::string Batch_Report;  // the lanes used, for --timing (Run_Batched)
 
 bool Run_Batched(std::ifstream& in, std::ostream& out, unsigned B, unsigned Threads, int maxMismatches,
                  unsigned maxHits, bool quiet, uint64_t& records, uint64_t& reportedHits, double& tableBuildSeconds,
-                 double& inputParseSeconds, double& searchSeconds, double& outputSeconds, Sam_Output* sam = nullptr) {
+                 double& inputSeconds, double& readSeconds, double& searchSeconds, double& outputSeconds,
+                 Sam_Output* sam = nullptr) {
     using Clock = std::chrono::steady_clock;
 #ifdef BATMAN_BATCH_BLOCK
     constexpr unsigned CHUNK = BATMAN_BATCH_BLOCK;
@@ -2957,8 +3052,7 @@ bool Run_Batched(std::ifstream& in, std::ostream& out, unsigned B, unsigned Thre
 #endif
     Thread_Pool pool(Threads, atExit);
     std::vector<Batch_Chooser> choosers(Threads);  // B = 0: --batch auto
-    std::vector<std::string> ids(BLOCK);
-    std::vector<std::string> seqs(sam ? BLOCK : 0), quals(sam ? BLOCK : 0);  // SAM/BAM: the reads as given
+    Block_Reader reader(in, BLOCK, sam != nullptr, Threads > 1);
     std::vector<unsigned char> searched(BLOCK);  // valid read of the right length
     std::vector<unsigned> slot(BLOCK);            // its place among the searched reads
     std::vector<SARange> ranges(strands * BLOCK);
@@ -2978,61 +3072,81 @@ bool Run_Batched(std::ifstream& in, std::ostream& out, unsigned B, unsigned Thre
         uint64_t hits = 0;
     };
     std::vector<Part> parts(Threads);
+    std::vector<unsigned> partReads(Threads);  // searched reads in each part
 #ifdef SA_CHAIN
     constexpr bool useChain = true;
 #else
     constexpr bool useChain = false;
 #endif
     std::string reads;  // codes of the searched reads, back to back
-    std::string seq;
-    bool initialized = false, more = true;
-    while (more) {
-        unsigned n = 0, count = 0;
-        double tableSeconds = 0.0;
-        reads.clear();
-        const auto parseStart = Clock::now();
-        while (n < BLOCK && (more = ReadNextRecord(in, ids[n], seq, sam ? &quals[n] : nullptr))) {
-            ++records;
-            if (sam) seqs[n] = seq;
-            if (!initialized) {
-                STRINGLENGTH = static_cast<int>(seq.size());
-                if (STRINGLENGTH <= 0 || STRINGLENGTH >= MAXTAG) {
-                    std::fprintf(stderr, "Unsupported read length: %d\n", STRINGLENGTH);
-                    return false;
-                }
-                const auto tableStart = Clock::now();
-                Build_Tables(revfmi);
-                tableSeconds = std::chrono::duration<double>(Clock::now() - tableStart).count();
-                initialized = true;
+    bool initialized = false;
+    for (;;) {
+        const auto waitStart = Clock::now();
+        const Input_Block* block = reader.Next();
+        if (!block) break;
+        const unsigned n = block->N;
+        const std::vector<std::string>& ids = block->Ids;
+        const std::vector<std::string>& seqs = block->Seqs;  // the reads as given
+        const std::vector<std::string>& quals = block->Quals;
+        records += n;
+        readSeconds += block->Seconds;
+        double tableSeconds = 0;
+        if (!initialized && n) {
+            STRINGLENGTH = static_cast<int>(seqs[0].size());
+            if (STRINGLENGTH <= 0 || STRINGLENGTH >= MAXTAG) {
+                std::fprintf(stderr, "Unsupported read length: %d\n", STRINGLENGTH);
+                return false;
             }
-            bool valid = static_cast<int>(seq.size()) == STRINGLENGTH;
-            const std::size_t at = reads.size();
-            if (valid) {
-                reads.resize(at + STRINGLENGTH);
-                for (int i = 0; i < STRINGLENGTH && valid; i++) {
-                    const int code = EncodeBase(seq[i]);
-                    valid = code >= 0;
-                    reads[at + i] = static_cast<char>(code);
-                }
-                if (!valid) reads.resize(at);
-            }
-            searched[n] = valid;
-            slot[n] = count;
-            count += valid;
-            n++;
+            const auto tableStart = Clock::now();
+            Build_Tables(revfmi);
+            tableSeconds = std::chrono::duration<double>(Clock::now() - tableStart).count();
+            tableBuildSeconds += tableSeconds;
+            initialized = true;
         }
-        tableBuildSeconds += tableSeconds;
-        inputParseSeconds += std::chrono::duration<double>(Clock::now() - parseStart).count() - tableSeconds;
+        // Thread t's part of the block: records [Part_Begin(t), Part_Begin(t + 1)).
+        auto Part_Begin = [&](unsigned t) { return static_cast<unsigned>(uint64_t(n) * t / Threads); };
+        // A read is searched if it has the first read's length and only ACGT (any case);
+        // its codes go to reads at its place among the searched reads (slot), and with
+        // strands == 2 its reverse complement's at count + slot.
+        const std::size_t L = static_cast<std::size_t>(STRINGLENGTH);
+        pool.Run([&](unsigned t) {
+            unsigned c = 0;
+            for (unsigned j = Part_Begin(t); j < Part_Begin(t + 1); j++) {
+                const std::string& seq = seqs[j];
+                bool valid = seq.size() == L;
+                for (std::size_t i = 0; i < L && valid; i++) valid = Base_Codes[static_cast<unsigned char>(seq[i])] >= 0;
+                searched[j] = valid;
+                c += valid;
+            }
+            partReads[t] = c;
+        });
+        unsigned count = 0;
+        for (unsigned t = 0; t < Threads; t++) {
+            const unsigned c = partReads[t];
+            partReads[t] = count;  // the part's first slot
+            count += c;
+        }
+        reads.resize(strands * count * L);
+        pool.Run([&](unsigned t) {
+            unsigned r = partReads[t];
+            for (unsigned j = Part_Begin(t); j < Part_Begin(t + 1); j++) {
+                slot[j] = r;
+                if (!searched[j]) continue;
+                char* code = &reads[r * L];
+                const char* seq = seqs[j].data();
+                for (std::size_t i = 0; i < L; i++) code[i] = Base_Codes[static_cast<unsigned char>(seq[i])];
+                if (strands == 2) {
+                    char* rc = &reads[(count + r) * L];
+                    for (std::size_t i = 0; i < L; i++) rc[i] = static_cast<char>(3 - code[L - 1 - i]);
+                }
+                r++;
+            }
+        });
+        inputSeconds += std::chrono::duration<double>(Clock::now() - waitStart).count() - tableSeconds;
+        if (!initialized) continue;  // no reads yet
 
         const bool oneMismatch = maxMismatches >= 1 && STRINGLENGTH / 2 > LOOKUPSIZE;
         const auto searchStart = Clock::now();
-        if (strands == 2) {  // the reverse complements, read count + i for read i
-            reads.resize(2 * reads.size());
-            const std::size_t half = reads.size() / 2;
-            for (std::size_t r = 0; r < count; r++)
-                for (int i = 0; i < STRINGLENGTH; i++)
-                    reads[half + r * STRINGLENGTH + i] = static_cast<char>(3 - reads[r * STRINGLENGTH + STRINGLENGTH - 1 - i]);
-        }
         // The block's search: the -n k program (both strands of a read in one lane, zig-zag)
         // or the exact search (each strand a read), in chunks (one with a single thread).
         const bool zigZag = oneMismatch && strands == 2;
@@ -3057,8 +3171,6 @@ bool Run_Batched(std::ifstream& in, std::ostream& out, unsigned B, unsigned Thre
         });
         searchSeconds += std::chrono::duration<double>(Clock::now() - searchStart).count();
 
-        // Thread t's part of the block: records [Part_Begin(t), Part_Begin(t + 1)).
-        auto Part_Begin = [&](unsigned t) { return static_cast<unsigned>(uint64_t(n) * t / Threads); };
         const auto outputStart = Clock::now();
         if (sam) {
             // Each read's hits in output order, the rows to decode for them (Sam_Requests),
@@ -3291,6 +3403,7 @@ int main(int argc, char** argv) {
     double indexLoadSeconds = 0.0;
     double tableBuildSeconds = 0.0;
     double inputParseSeconds = 0.0;
+    double inputReadSeconds = 0.0;
     double searchSeconds = 0.0;
     double outputSeconds = 0.0;
 
@@ -3388,7 +3501,7 @@ int main(int argc, char** argv) {
     uint64_t reportedHits = 0;
 
     if (!Run_Batched(in, *out, batchSize, threads, maxMismatches, maxHits, quiet, records, reportedHits, tableBuildSeconds,
-                     inputParseSeconds, searchSeconds, outputSeconds, samFormat ? &sam : nullptr)) {
+                     inputParseSeconds, inputReadSeconds, searchSeconds, outputSeconds, samFormat ? &sam : nullptr)) {
         return 1;
     }
 
@@ -3398,6 +3511,7 @@ int main(int argc, char** argv) {
                   << "batman_zero_min timing: index_load=" << indexLoadSeconds
                   << "s table_build=" << tableBuildSeconds
                   << "s input_parse=" << inputParseSeconds
+                  << "s input_read=" << inputReadSeconds
                   << "s search=" << searchSeconds
                   << "s output_format=" << outputSeconds
                   << "s total=" << totalSeconds
