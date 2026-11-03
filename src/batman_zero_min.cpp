@@ -89,7 +89,9 @@ enum Result_List : unsigned {
     RL_FWD,                // the forward chain's (0|k) latest rejects
     RL_BWD,                // the backward chain's (k|0)
     RL_CROSS,              // the 1|k chain's (-n 3)
-    RL_SEED_1, RL_SEED_2,  // the running stage's one-mismatch seeds
+    RL_CROSS2,             // the k|1 chain's (-n 4)
+    RL_SEED_1, RL_SEED_2,  // the running stage's seeds (one mismatch; -n 4 2|2: two in LH)
+    RL_SEED_3,             // -n 4 2|2 case c: H2 exact extended over H3, before the switch
     RL_LISTS,
     RL_NONE = 0xFF         // End_Stage: drop the rejects
 };
@@ -103,10 +105,13 @@ struct Hit_Stage {
 enum : int { ST_RIGHT1, ST_LEFT1, ST_RIGHT2, ST_LEFT2 };  // 0|1, 1|0, 0|2, 2|0
 enum : int { ST2_CROSS_A = 4, ST2_CROSS_B, ST2_CROSS_C };  // -n 2: the thirds' 1|1 (a), (b), (c)
 enum : int { ST3_CROSS_11 = 4, ST3_RIGHT3, ST3_LEFT3, ST3_CROSS_12, ST3_CROSS_21 };  // -n 3: 1|1, 0|3, 3|0, 1|2, 2|1
+enum : int { ST4_RIGHT4 = 9, ST4_LEFT4, ST4_CROSS_13, ST4_CROSS_31, ST4_CROSS_22 };  // -n 4: 0|4, 4|0, 1|3, 3|1, 2|2
 constexpr Hit_Stage One_Stages[] = {{"F", 1}, {"B", 1}};
 constexpr Hit_Stage Two_Stages[] = {{"F", 1}, {"B", 1}, {"F", 2}, {"B", 2}, {"F", 2}, {"B", 2}, {"B", 2}};
 constexpr Hit_Stage Three_Stages[] = {{"F", 1}, {"B", 1}, {"F", 2}, {"B", 2}, {"F", 2},
                                       {"F", 3}, {"B", 3}, {"F", 3}, {"B", 3}};
+constexpr Hit_Stage Four_Stages[] = {{"F", 1}, {"B", 1}, {"F", 2}, {"B", 2}, {"F", 2}, {"F", 3}, {"B", 3},
+                                     {"F", 3}, {"B", 3}, {"F", 4}, {"B", 4}, {"F", 4}, {"B", 4}, {"F", 4}};
 
 // Tags the hits added since Tagged with Stage.
 inline void Tag_Hits(ForwardResults* Res, std::size_t& Tagged, int Stage) {
@@ -121,7 +126,7 @@ inline void End_Stage(ForwardResults* Res, std::size_t& Tagged, int Stage, unsig
     std::vector<SARange>& Rejects = Res[RL_HITS].mismatches;
     if (Keep != RL_NONE) Res[Keep].mismatches.swap(Rejects);
     Rejects.clear();
-    for (unsigned k : {RL_SEED_1, RL_SEED_2}) {
+    for (unsigned k : {RL_SEED_1, RL_SEED_2, RL_SEED_3}) {
         Res[k].hits.clear();
         Res[k].mismatches.clear();
         Res[k].hitCount = 0;
@@ -1248,17 +1253,26 @@ inline void Thirds(int L, int& a, int& b) {
     b = 2 * L / 3;
 }
 
-// Read segments used by the searches: the read, its halves, its thirds, [a, L), [0, b)
-// and its quarters.
+// The sixths' boundaries h1 < h2 < LH (LH's thirds H1 = [0, h1), H2 = [h1, h2), H3 = [h2, LH)).
+inline void Sixths(int L, int& h1, int& h2) {
+    const int LH = L / 2;
+    h1 = LH / 3;
+    h2 = 2 * LH / 3;
+}
+
+// Read segments used by the searches: the read, its halves, its thirds, [a, L), [0, b),
+// its quarters, and LH's thirds with [h1, LH) and [0, h2) (-n 4).
 enum Read_Segment : unsigned char {
-    SEG_ALL, SEG_LH, SEG_RH, SEG_T1, SEG_T2, SEG_T3, SEG_A_END, SEG_START_B, SEG_Q1, SEG_Q2, SEG_Q3, SEG_Q4
+    SEG_ALL, SEG_LH, SEG_RH, SEG_T1, SEG_T2, SEG_T3, SEG_A_END, SEG_START_B, SEG_Q1, SEG_Q2, SEG_Q3, SEG_Q4,
+    SEG_H1, SEG_H2, SEG_H3, SEG_H23, SEG_H12
 };
 
 inline std::string_view Read_Segment_Of(std::string_view All, unsigned Seg, int& Offset) {
     const int L = static_cast<int>(All.size()), LH = L / 2;
-    int a, b, c1, c3;
+    int a, b, c1, c3, h1, h2;
     Thirds(L, a, b);
     Quarters(L, c1, c3);
+    Sixths(L, h1, h2);
     int Start = 0, End = L;
     switch (Seg) {
         case SEG_LH: End = LH; break;
@@ -1272,35 +1286,46 @@ inline std::string_view Read_Segment_Of(std::string_view All, unsigned Seg, int&
         case SEG_Q2: Start = c1; End = LH; break;
         case SEG_Q3: Start = LH; End = c3; break;
         case SEG_Q4: Start = c3; break;
+        case SEG_H1: End = h1; break;
+        case SEG_H2: Start = h1; End = h2; break;
+        case SEG_H3: Start = h2; End = LH; break;
+        case SEG_H23: Start = h1; End = LH; break;
+        case SEG_H12: End = h2; break;
         default: break;
     }
     Offset = Start;
     return All.substr(Start, End - Start);
 }
 
-// Mismatch windows for the 1|1 extensions: read positions [Lo, Hi) that must hold
-// exactly Need mismatches. Positions outside every window must match.
+// Mismatch windows for the 1|1 (and -n 4 2|2 seed) extensions: read positions [Lo, Hi)
+// that must hold exactly Need mismatches. Positions outside every window must match.
 struct Mm_Windows {
     int N = 0;
     int Lo[3], Hi[3], Need[3];
 };
-enum Mm_Window_Set : unsigned char { WIN_NONE, WIN_A, WIN_B, WIN_C3, WIN_C1, WIN_Q1, WIN_Q2, WIN_Q3, WIN_Q4 };
+enum Mm_Window_Set : unsigned char {
+    WIN_NONE, WIN_A, WIN_B, WIN_C3, WIN_C1, WIN_Q1, WIN_Q2, WIN_Q3, WIN_Q4,
+    WIN_H23_2, WIN_H12, WIN_H1_2, WIN_H3, WIN_H1  // -n 4: LH's two-mismatch seeds (2|2)
+};
 
 // The windows of Set for a read of L bases, narrowed by the exact half searches' failure
 // depths (One_Mismatch_Search): read[0, LH_Fail) and read[RH_Fail, L) do not occur, so
-// a 1|1 hit has p < LH_Fail and q >= RH_Fail (L and 0: no bound).
+// a 1|1 hit has p < LH_Fail and q >= RH_Fail (L and 0: no bound). The 2|2 seeds hold two
+// mismatches in LH, of which only the first is bounded (< LH_Fail): their windows are not
+// narrowed, but case a (H1 exact) cannot hold when LH_Fail <= h1.
 inline Mm_Windows Window_Set(unsigned Set, int L, int LH_Fail, int RH_Fail) {
-    int a, b, c1, c3;
+    int a, b, c1, c3, h1, h2;
     Thirds(L, a, b);
     Quarters(L, c1, c3);
+    Sixths(L, h1, h2);
     const int LH = L / 2;
     Mm_Windows W;
-    auto Add = [&](int Lo, int Hi) {
-        if (Hi <= LH) Hi = std::min(Hi, LH_Fail);
-        else Lo = std::max(Lo, RH_Fail);
+    auto Add = [&](int Lo, int Hi, int Need = 1, bool Narrow = true) {
+        if (Narrow && Hi <= LH) Hi = std::min(Hi, LH_Fail);
+        else if (Narrow) Lo = std::max(Lo, RH_Fail);
         W.Lo[W.N] = Lo;
         W.Hi[W.N] = Hi;
-        W.Need[W.N] = 1;
+        W.Need[W.N] = Need;
         W.N++;
     };
     switch (Set) {
@@ -1312,6 +1337,11 @@ inline Mm_Windows Window_Set(unsigned Set, int L, int LH_Fail, int RH_Fail) {
         case WIN_Q2: Add(c1, LH); break;
         case WIN_Q3: Add(LH, c3); break;
         case WIN_Q4: Add(c3, L); break;
+        case WIN_H23_2: Add(h1, LH_Fail <= h1 ? h1 : LH, 2, false); break;  // a: both in [h1, LH)
+        case WIN_H12: Add(0, h1, 1, false); Add(h1, h2, 1, false); break;    // b1: one in H1, one in H2
+        case WIN_H1_2: Add(0, h1, 2, false); break;                          // b2: both in H1
+        case WIN_H3: Add(h2, LH, 1, false); break;                           // c: one in H3 ...
+        case WIN_H1: Add(0, h1, 1, false); break;                            // ... and one in H1
         default: break;
     }
     return W;
@@ -1408,7 +1438,7 @@ struct Mm_Step {
     unsigned char Stored;     // OP_SEARCH / OP_SEARCH_KEEP: 1 + the slot of the kept range (0: none)
     unsigned char Strand;     // two-strand programs (Zig_Zag): 0 the read, 1 its reverse complement
 };
-constexpr unsigned MM_PROGRAM_MAX = 96;  // longest program (-n 3 zig-zag: 85 steps), for the stats
+constexpr unsigned MM_PROGRAM_MAX = 160;  // longest program (-n 4 zig-zag), for the stats
 constexpr unsigned MM_LISTS = RL_LISTS;  // each read's lists (Result_List)
 
 // -n 0: Search_Right over the read.
@@ -1493,6 +1523,67 @@ constexpr Mm_Step Program_Three_Mismatch[] = {
     {OP_CROSS, false, SEG_LH, 3, RL_HITS, RL_SEED_1, true, false},
     {OP_CROSS, false, SEG_LH, 3, RL_HITS, RL_SEED_2, true, true, 0, SEG_RH},
     {OP_END_STAGE, false, 0, ST3_CROSS_21, RL_NONE, 0, false, false},
+    {OP_END, false, 0, 0, 0, 0, false, false},
+};
+
+// -n 4, as Three_Mismatch_Search with Max 4: the -n 3 stages, with the rejects of 0|3, 3|0,
+// 1|2 and 2|1 kept; 0|4, 4|0, 1|3 and 3|1 from them with Count 4; then 2|2 from LH's
+// two-mismatch seeds (LH's thirds H1, H2, H3: a, H1 exact; b1, H3 exact; b2, [h1, LH)
+// exact; c, H2 exact, extended over H3 then switched and extended over H1), extended right
+// over RH with Count 4.
+constexpr Mm_Step Program_Four_Mismatch[] = {
+    MM_ONE_MISMATCH_PASSES_WITH((Mm_Step{OP_SEARCH_KEEP, true, SEG_LH, 0, 0, 0, false, false, 0, SEG_Q1, 1}),
+                                (Mm_Step{OP_SEARCH_KEEP, false, SEG_RH, 0, 0, 0, false, false, 0, SEG_Q4, 2})),
+    {OP_STOP_IF_MAXHITS, false, 0, 0, 0, 0, false, false},
+    {OP_RESUME, true, SEG_RH, 2, RL_HITS, RL_FWD, true, false},
+    {OP_END_STAGE, false, 0, ST_RIGHT2, RL_FWD, 0, false, false},
+    {OP_RESUME, false, SEG_LH, 2, RL_HITS, RL_BWD, true, false},
+    {OP_END_STAGE, false, 0, ST_LEFT2, RL_BWD, 0, false, false},
+    {OP_STOP_IF_MAXHITS, false, 0, 0, 0, 0, false, false},
+    {OP_SEARCH, true, SEG_Q1, 0, 0, 0, false, false, WIN_Q2, 0, 1},
+    {OP_EXTEND, true, SEG_Q2, 0, RL_SEED_1, 0, false, false, WIN_Q2},
+    {OP_SEARCH, false, SEG_Q2, 0, 0, 0, false, false},
+    {OP_EXTEND, false, SEG_Q1, 0, RL_SEED_2, 0, false, false, WIN_Q1},
+    {OP_CROSS, true, SEG_RH, 2, RL_HITS, RL_SEED_1, true, false},
+    {OP_CROSS, true, SEG_RH, 2, RL_HITS, RL_SEED_2, true, true, 0, SEG_LH},
+    {OP_END_STAGE, false, 0, ST3_CROSS_11, RL_CROSS, 0, false, false},
+    {OP_STOP_IF_MAXHITS, false, 0, 0, 0, 0, false, false},
+    {OP_RESUME, true, SEG_RH, 3, RL_HITS, RL_FWD, true, false},
+    {OP_END_STAGE, false, 0, ST3_RIGHT3, RL_FWD, 0, false, false},
+    {OP_RESUME, false, SEG_LH, 3, RL_HITS, RL_BWD, true, false},
+    {OP_END_STAGE, false, 0, ST3_LEFT3, RL_BWD, 0, false, false},
+    {OP_RESUME, true, SEG_RH, 3, RL_HITS, RL_CROSS, true, false},
+    {OP_END_STAGE, false, 0, ST3_CROSS_12, RL_CROSS, 0, false, false},
+    {OP_STOP_IF_MAXHITS, false, 0, 0, 0, 0, false, false},
+    {OP_SEARCH, false, SEG_Q4, 0, 0, 0, false, false, WIN_Q3, 0, 2},
+    {OP_EXTEND, false, SEG_Q3, 0, RL_SEED_1, 0, false, false, WIN_Q3},
+    {OP_SEARCH, true, SEG_Q3, 0, 0, 0, false, false},
+    {OP_EXTEND, true, SEG_Q4, 0, RL_SEED_2, 0, false, false, WIN_Q4},
+    {OP_CROSS, false, SEG_LH, 3, RL_HITS, RL_SEED_1, true, false},
+    {OP_CROSS, false, SEG_LH, 3, RL_HITS, RL_SEED_2, true, true, 0, SEG_RH},
+    {OP_END_STAGE, false, 0, ST3_CROSS_21, RL_CROSS2, 0, false, false},
+    {OP_STOP_IF_MAXHITS, false, 0, 0, 0, 0, false, false},
+    {OP_RESUME, true, SEG_RH, 4, RL_HITS, RL_FWD, true, false},
+    {OP_END_STAGE, false, 0, ST4_RIGHT4, RL_NONE, 0, false, false},
+    {OP_RESUME, false, SEG_LH, 4, RL_HITS, RL_BWD, true, false},
+    {OP_END_STAGE, false, 0, ST4_LEFT4, RL_NONE, 0, false, false},
+    {OP_RESUME, true, SEG_RH, 4, RL_HITS, RL_CROSS, true, false},
+    {OP_END_STAGE, false, 0, ST4_CROSS_13, RL_NONE, 0, false, false},
+    {OP_RESUME, false, SEG_LH, 4, RL_HITS, RL_CROSS2, true, false},
+    {OP_END_STAGE, false, 0, ST4_CROSS_31, RL_NONE, 0, false, false},
+    {OP_STOP_IF_MAXHITS, false, 0, 0, 0, 0, false, false},
+    {OP_SEARCH, true, SEG_H1, 0, 0, 0, false, false, WIN_H23_2},
+    {OP_EXTEND, true, SEG_H23, 0, RL_SEED_1, 0, false, false, WIN_H23_2},
+    {OP_SEARCH, false, SEG_H3, 0, 0, 0, false, false},
+    {OP_EXTEND, false, SEG_H12, 0, RL_SEED_2, 0, false, false, WIN_H12},
+    {OP_SEARCH, false, SEG_H23, 0, 0, 0, false, false},
+    {OP_EXTEND, false, SEG_H1, 0, RL_SEED_2, 0, false, false, WIN_H1_2},
+    {OP_SEARCH, true, SEG_H2, 0, 0, 0, false, false},
+    {OP_EXTEND, true, SEG_H3, 0, RL_SEED_3, 0, false, false, WIN_H3},
+    {OP_CROSS, false, SEG_H1, 0, RL_SEED_2, RL_SEED_3, false, true, WIN_H1, SEG_H23},
+    {OP_CROSS, true, SEG_RH, 4, RL_HITS, RL_SEED_1, true, false},
+    {OP_CROSS, true, SEG_RH, 4, RL_HITS, RL_SEED_2, true, true, 0, SEG_LH},
+    {OP_END_STAGE, false, 0, ST4_CROSS_22, RL_NONE, 0, false, false},
     {OP_END, false, 0, 0, 0, 0, false, false},
 };
 
@@ -1941,7 +2032,7 @@ inline bool Mm_Window_Step(Mm_Lane& L) {
     }
 }
 
-// An index switch: the range of Seg of the read, with Seed's (first) mismatch applied, in
+// An index switch: the range of Seg of the read, with Seed's mismatches applied, in
 // the other index (Right: revfmi, else fwfmi), for a seed found in one index and to be
 // extended in the other. The string occurs (it is the seed's), so every range on the way
 // is non-empty: Start alone is stepped from the lookup table (S' = C[c] + Occ(c, S) + 1,
@@ -1951,7 +2042,8 @@ inline bool Mm_Window_Step(Mm_Lane& L) {
 // seed's row, and without End it is not known when it becomes so.
 inline void Mm_Start_Switch(Mm_Lane& L, const SARange& Seed, unsigned Seg, bool Right) {
     std::memcpy(L.Patched, L.All.data(), L.All.size());
-    L.Patched[Seed.Mismatch_Pos[0]] = static_cast<char>(Seed.Mismatch_Char & 3);
+    for (int i = 0; i < Seed.Mismatches; i++)  // one, or two for -n 4's 2|2 seeds
+        L.Patched[Seed.Mismatch_Pos[i]] = static_cast<char>(Seed.Mismatch_Char >> 2 * i & 3);
     int Offset;
     const std::string_view S = Read_Segment_Of(L.All, Seg, Offset);
     L.Task = TASK_SWITCH;
@@ -2386,6 +2478,11 @@ void Batch_Three_Mismatch(const char* Reads, unsigned Count, int Len, unsigned B
     Batch_Search(Reads, Count, Len, B, MaxHits, Program_Three_Mismatch, &Res, &ReadHits, nullptr, nullptr);
 }
 
+void Batch_Four_Mismatch(const char* Reads, unsigned Count, int Len, unsigned B, unsigned MaxHits,
+                         std::vector<ForwardResults>& Res, std::vector<unsigned long>& ReadHits) {
+    Batch_Search(Reads, Count, Len, B, MaxHits, Program_Four_Mismatch, &Res, &ReadHits, nullptr, nullptr);
+}
+
 // The two-strand (zig-zag) form of a one-strand program, for Batch_Search with
 // Two_Strands. P is cut into groups at each OP_STOP_IF_MAXHITS, and after OP_COUNT_EXACT
 // so that the exact hits are a group of their own. Each group runs on the read, then on
@@ -2424,12 +2521,12 @@ std::vector<Mm_Step> Zig_Zag(const Mm_Step* P) {
     return Out;
 }
 
-// -n 1 to 3 on both strands of each read (Zig_Zag): Reads holds 2 * Count reads, read
+// -n 1 to 4 on both strands of each read (Zig_Zag): Reads holds 2 * Count reads, read
 // Count + i the reverse complement of read i; Res and ReadHits are indexed the same way.
 void Batch_Both_Strands(const char* Reads, unsigned Count, int Len, unsigned B, unsigned MaxHits, int MaxMismatches,
                         std::vector<ForwardResults>& Res, std::vector<unsigned long>& ReadHits) {
-    static const std::vector<Mm_Step> Programs[3] = {Zig_Zag(Program_One_Mismatch), Zig_Zag(Program_Two_Mismatch),
-                                                     Zig_Zag(Program_Three_Mismatch)};
+    static const std::vector<Mm_Step> Programs[4] = {Zig_Zag(Program_One_Mismatch), Zig_Zag(Program_Two_Mismatch),
+                                                     Zig_Zag(Program_Three_Mismatch), Zig_Zag(Program_Four_Mismatch)};
     Batch_Search(Reads, Count, Len, B, MaxHits, Programs[MaxMismatches - 1].data(), &Res, &ReadHits, nullptr, nullptr,
                  true);
 }
@@ -2564,8 +2661,18 @@ __attribute__((noinline)) unsigned long Two_Mismatch_Search(std::string_view All
 // whose window cannot hold is skipped. Stops at MaxHits where Program_Three_Mismatch
 // does. Res has RL_LISTS lists (Result_List; stages Three_Stages); returns the exact hit
 // count. With the reference, the read must be packed.
-__attribute__((noinline)) unsigned long Three_Mismatch_Search(std::string_view All, const SARange& Range, unsigned MaxHits,
-                                                              ForwardResults* Res) {
+// With Max 4 (Four_Mismatch_Search, as Program_Four_Mismatch), 0|3, 3|0, 1|2 and 2|1 keep
+// their rejects, and then:
+//   0|4, 4|0, 1|3, 3|1  the 0|3, 3|0, 1|2 and 2|1 rejects resumed with Count 4;
+//   2|2            LH with exactly two mismatches, by LH's thirds H1, H2, H3 (one is exact):
+//                  a, none in H1: H1 exact, extended right over [h1, LH);
+//                  b1, one in H1 and one in H2: H3 exact, extended left over [0, h2);
+//                  b2, both in H1: [h1, LH) exact, extended left over H1;
+//                  c, one in H1 and one in H3: H2 exact, extended right over H3, switched
+//                  to fwfmi and extended left over H1;
+//                  then (b1, b2 and c switched to revfmi) extended right over RH, Count 4.
+unsigned long Three_Four_Mismatch_Search(std::string_view All, const SARange& Range, unsigned MaxHits, ForwardResults* Res,
+                                         int Max) {
     const int L = static_cast<int>(All.size()), LH = L / 2;
     const std::string_view lh = All.substr(0, LH), rh = All.substr(LH);
     int c1, c3;
@@ -2633,9 +2740,10 @@ __attribute__((noinline)) unsigned long Three_Mismatch_Search(std::string_view A
     End_Stage(Res, Tagged, ST3_CROSS_11, RL_CROSS);
     if (Done()) return ReadHits;
     // 0|3, 3|0, 1|2
-    Resume(RL_FWD, true, 3, ST3_RIGHT3, RL_NONE);
-    Resume(RL_BWD, false, 3, ST3_LEFT3, RL_NONE);
-    Resume(RL_CROSS, true, 3, ST3_CROSS_12, RL_NONE);
+    const bool Four = Max == 4;
+    Resume(RL_FWD, true, 3, ST3_RIGHT3, Four ? RL_FWD : RL_NONE);
+    Resume(RL_BWD, false, 3, ST3_LEFT3, Four ? RL_BWD : RL_NONE);
+    Resume(RL_CROSS, true, 3, ST3_CROSS_12, Four ? RL_CROSS : RL_NONE);
     if (Done()) return ReadHits;
     // 2|1
     const Mm_Windows Q3 = Win(WIN_Q3);
@@ -2645,8 +2753,42 @@ __attribute__((noinline)) unsigned long Three_Mismatch_Search(std::string_view A
         Tag_Hits(Res, Tagged, ST3_CROSS_21);
         return ReadHits;
     }
-    End_Stage(Res, Tagged, ST3_CROSS_21, RL_NONE);
+    End_Stage(Res, Tagged, ST3_CROSS_21, Four ? RL_CROSS2 : RL_NONE);
+    if (!Four || Done()) return ReadHits;
+    // 0|4, 4|0, 1|3, 3|1
+    Resume(RL_FWD, true, 4, ST4_RIGHT4, RL_NONE);
+    Resume(RL_BWD, false, 4, ST4_LEFT4, RL_NONE);
+    Resume(RL_CROSS, true, 4, ST4_CROSS_13, RL_NONE);
+    Resume(RL_CROSS2, false, 4, ST4_CROSS_31, RL_NONE);
+    if (Done()) return ReadHits;
+    // 2|2: LH's two-mismatch seeds
+    const Mm_Windows H23 = Win(WIN_H23_2);
+    if (Windows_Possible(H23) && Exact(SEG_H1, true, -1)) Extend_Windows(All, SEG_H23, Seed, true, H23, Res[RL_SEED_1], 0);
+    if (Exact(SEG_H3, false, -1)) Extend_Windows(All, SEG_H12, Seed, false, Win(WIN_H12), Res[RL_SEED_2], 0);
+    if (Exact(SEG_H23, false, -1)) Extend_Windows(All, SEG_H1, Seed, false, Win(WIN_H1_2), Res[RL_SEED_2], 0);
+    if (Exact(SEG_H2, true, -1)) Extend_Windows(All, SEG_H3, Seed, true, Win(WIN_H3), Res[RL_SEED_3], 0);
+    const Mm_Windows H1 = Win(WIN_H1);
+    for (const SARange& S : Res[RL_SEED_3].hits) {
+        SARange R = S;
+        if (!(Use_Ref && S.Skip) && !Switch_Index(All, S, SEG_H23, false, R)) continue;
+        Extend_Windows(All, SEG_H1, R, false, H1, Res[RL_SEED_2], 0);
+    }
+    if (!Cross(RL_SEED_1, true, 4, -1) || !Cross(RL_SEED_2, true, 4, SEG_LH)) {
+        Tag_Hits(Res, Tagged, ST4_CROSS_22);
+        return ReadHits;
+    }
+    End_Stage(Res, Tagged, ST4_CROSS_22, RL_NONE);
     return ReadHits;
+}
+
+__attribute__((noinline)) unsigned long Three_Mismatch_Search(std::string_view All, const SARange& Range, unsigned MaxHits,
+                                                              ForwardResults* Res) {
+    return Three_Four_Mismatch_Search(All, Range, MaxHits, Res, 3);
+}
+
+__attribute__((noinline)) unsigned long Four_Mismatch_Search(std::string_view All, const SARange& Range, unsigned MaxHits,
+                                                             ForwardResults* Res) {
+    return Three_Four_Mismatch_Search(All, Range, MaxHits, Res, 4);
 }
 
 // "\t<dir>\t<start>\t<end>" for an SA range, or "\tP\t<pos>\t<pos>" for a located hit.
@@ -2764,9 +2906,12 @@ unsigned long Format_Hits(const std::string& id, const ForwardResults* Res, cons
     return readHits;
 }
 
-// The stage table of -n 1, 2 or 3.
+// The stage table of -n 1 to 4.
 inline const Hit_Stage* Stages_Of(int maxMismatches) {
-    return maxMismatches == 3 ? Three_Stages : maxMismatches == 2 ? Two_Stages : One_Stages;
+    return maxMismatches == 4   ? Four_Stages
+           : maxMismatches == 3 ? Three_Stages
+           : maxMismatches == 2 ? Two_Stages
+                                : One_Stages;
 }
 
 // SAM/BAM output (--sam / --bam): the genome's sequences and N runs, the writer, and
@@ -2779,63 +2924,571 @@ struct Sam_Output {
     std::vector<uint64_t> Positions;
 };
 
-// The forward-text start of each location of a hit of L bases whose rows are in fwfmi
-// (Forward_Index) or revfmi: Pos when the walk recorded it (located, or Track_Pos), else
-// each row's SA value.
-void Hit_Positions(const SARange& hit, bool Forward_Index, int L, std::vector<uint64_t>& Out) {
-    if (hit.Skip && (Use_Ref || Track_Pos) && hit.Pos != NO_POS) {
-        Out.push_back(hit.Pos);
-        return;
+// ---- SA rows to SA values for SAM/BAM output (Sa_Decode) ----
+//
+// BWTSaValue walks a row back with LF (BWTPsiMinusValue) until it reaches a sampled row
+// (every saInterval-th row), about 7 dependent cache misses, far more where LF strides
+// regularly (a homopolymer run, e.g. an N run stored as C: a block of rows shifts by a
+// multiple of saInterval and the same rows miss the samples step after step).
+// Sa_Decode does many rows at once, each round stepping every unit of work, all of
+// whose rows are Skipped steps from their requests:
+//   - a span: rows Lo..Hi, of which the ones whose (row - Lo) % saInterval is a class
+//     in Mask are resolved. Its sampled rows form one class, read off from saValue
+//     together. If all its rows have one BWT character (BWTAllOccValue at both ends),
+//     LF shifts it whole: the same rows, classes and outputs, at O(1) a step however
+//     long it stalls. Otherwise it splits into its runs of one character: runs of at
+//     least SA_SPAN_MIN rows stay spans, the others' unresolved rows become groups.
+//   - a group: unresolved rows in row order. Its sampled rows (and the $ row) are read
+//     off; the rest map by LF to at most 4 child groups (the rows with each BWT
+//     character; LF keeps their order). Occ comes from one BWTAllOccValue at the first
+//     row, then by counting the BWT characters between neighbouring rows, or a fresh
+//     BWTAllOccValue across a gap over SA_GAP_LOOKUP rows.
+//   - a walk: a single row (SA_SINGLE_WALK), stepped like BWTSaValue; the walks of a
+//     round go side by side with prefetching, so their cache misses overlap.
+// SA_DECODE 0 walks every row; SA_SPAN_MIN 0 makes no spans.
+#ifndef SA_DECODE
+#define SA_DECODE 1
+#endif
+#ifndef SA_GAP_LOOKUP
+#define SA_GAP_LOOKUP 64
+#endif
+#ifndef SA_SINGLE_WALK
+#define SA_SINGLE_WALK 1
+#endif
+#ifndef SA_SPAN_MIN
+#define SA_SPAN_MIN 16
+#endif
+
+// Rows Start..End of Fmi, whose SA values go to Values[Out ...].
+struct Sa_Request {
+    const ActiveBWT* Fmi;
+    unsigned long Start, End;
+    std::size_t Out;
+};
+
+#ifdef BATMAN_BATCH_STATS
+struct {
+    unsigned long Rows = 0, Direct = 0, Walk_Steps = 0, Range_Steps = 0, Span_Steps = 0;
+    double Seconds = 0;  // SAM output up to the records: candidates, chains, Sa_Decode
+} Decode_Stats;
+#endif
+
+void Sa_Decode(const std::vector<Sa_Request>& Requests, std::vector<unsigned>& Values) {
+    struct Walk {
+        const ActiveBWT* Fmi;
+        unsigned long Row;
+        unsigned Skipped;
+        std::size_t Out;
+    };
+    struct Item {
+        unsigned long Row;
+        std::size_t Out;
+    };
+    struct Group {  // Items[Begin .. Begin + Count)
+        const ActiveBWT* Fmi;
+        unsigned Skipped;
+        std::size_t Begin, Count;
+    };
+    struct Span {  // rows Lo..Hi, row r's output Out + (r - Lo)
+        const ActiveBWT* Fmi;
+        unsigned Skipped;
+        unsigned long Lo, Hi;
+        std::size_t Out;
+        uint64_t Mask;  // resolved classes of (r - Lo) % saInterval
+    };
+    static std::vector<Walk> Walks, Next_Walks;
+    static std::vector<Item> Items, Next_Items, Kids[4];
+    static std::vector<Group> Groups, Next_Groups;
+    static std::vector<Span> Spans, Next_Spans;
+    Walks.clear();
+    Items.clear();
+    Groups.clear();
+    Spans.clear();
+#ifdef BATMAN_BATCH_STATS
+    static FILE* Dump = std::getenv("BATMAN_DECODE_DUMP") ? std::fopen(std::getenv("BATMAN_DECODE_DUMP"), "w") : nullptr;
+#endif
+    for (const Sa_Request& R : Requests) {
+        const unsigned long Count = R.End - R.Start + 1;
+#ifdef BATMAN_BATCH_STATS
+        Decode_Stats.Rows += Count;
+        if (Dump) std::fprintf(Dump, "%d %lu %lu\n", R.Fmi == fwfmi, R.Start, R.End);
+#endif
+        if (SA_DECODE == 0 || (SA_SINGLE_WALK && Count == 1)) {
+            for (unsigned long Row = R.Start; Row <= R.End; Row++) Walks.push_back({R.Fmi, Row, 0, R.Out + (Row - R.Start)});
+        } else if (SA_SPAN_MIN && Count >= SA_SPAN_MIN && R.Fmi->saInterval <= 64) {
+            Spans.push_back({R.Fmi, 0, R.Start, R.End, R.Out, 0});
+        } else {
+            Groups.push_back({R.Fmi, 0, Items.size(), Count});
+            for (unsigned long Row = R.Start; Row <= R.End; Row++) Items.push_back({Row, R.Out + (Row - R.Start)});
+        }
     }
-    const unsigned long Last = hit.Skip ? hit.Start : hit.End;
-    for (unsigned long Row = hit.Start; Row <= Last; Row++)
-        Out.push_back(Forward_Index ? BWTSaValue(fwfmi, Row) : Text_Length - L - BWTSaValue(revfmi, Row));
+    auto Char_At = [](const ActiveBWT* F, unsigned long Row) -> unsigned {
+        const unsigned long Index = Row - (Row > F->inverseSa0);
+        return F->bwtCode[Index / 16] << ((Index % 16) * 2) >> (BITS_IN_WORD - 2);
+    };
+    // Kids[c] as the next round's groups.
+    auto Emit_Kids = [&](const ActiveBWT* F, unsigned Skipped) {
+        for (const std::vector<Item>& K : Kids) {
+            if (K.empty()) continue;
+            Next_Groups.push_back({F, Skipped, Next_Items.size(), K.size()});
+            Next_Items.insert(Next_Items.end(), K.begin(), K.end());
+        }
+    };
+    // One step of a group: read off its sampled rows, then its children by BWT character.
+    auto Group_Step = [&](const Group& G) {
+        const ActiveBWT* F = G.Fmi;
+        const unsigned Interval = F->saInterval;
+        Item* It = Items.data() + G.Begin;
+        std::size_t Left = 0;
+        for (std::size_t i = 0; i < G.Count; i++) {
+            const Item X = It[i];
+            if (X.Row % Interval == 0) {
+                Values[X.Out] = F->saValue[X.Row / Interval] + G.Skipped;
+#ifdef BATMAN_BATCH_STATS
+                Decode_Stats.Direct++;
+#endif
+            } else if (X.Row == F->inverseSa0) {  // the $ row: LF goes to row 0 (saValue[0] is -1)
+                Values[X.Out] = F->saValue[0] + G.Skipped + 1;
+            } else {
+                It[Left++] = X;
+            }
+        }
+        if (!Left) return;
+        if (SA_SINGLE_WALK && Left == 1) {
+#ifdef BATMAN_BATCH_STATS
+            Decode_Stats.Walk_Steps++;
+#endif
+            Next_Walks.push_back({F, BWTPsiMinusValue(F, static_cast<unsigned>(It[0].Row)), G.Skipped + 1, It[0].Out});
+            return;
+        }
+        for (std::vector<Item>& K : Kids) K.clear();
+        unsigned ALIGN_16 Occ[ALPHABET_SIZE];
+        unsigned long Prev = 0;
+        for (std::size_t i = 0; i < Left; i++) {
+            const unsigned long Row = It[i].Row;
+            if (i == 0 || Row - Prev > SA_GAP_LOOKUP) {
+                BWTAllOccValue(F, static_cast<unsigned>(Row), Occ);
+#ifdef BATMAN_BATCH_STATS
+                Decode_Stats.Range_Steps++;
+#endif
+            } else {
+                for (unsigned long r = Prev + 1; r < Row; r++)
+                    if (r != F->inverseSa0) Occ[Char_At(F, r)]++;
+            }
+            const unsigned c = Char_At(F, Row);
+            Kids[c].push_back({F->cumulativeFreq[c] + Occ[c] + 1, It[i].Out});
+            Occ[c]++;
+            Prev = Row;
+        }
+        Emit_Kids(F, G.Skipped + 1);
+    };
+    // One step of a span: read off its sampled class, then shift it whole or split it.
+    auto Span_Step = [&](const Span& P) {
+        const ActiveBWT* F = P.Fmi;
+        const unsigned Interval = F->saInterval;
+        const uint64_t Full = Interval == 64 ? ~uint64_t{0} : (uint64_t{1} << Interval) - 1;
+        auto Unresolved = [&](uint64_t Mask, unsigned long r) { return !(Mask >> ((r - P.Lo) % Interval) & 1); };
+        for (std::vector<Item>& K : Kids) K.clear();
+        if (F->inverseSa0 >= P.Lo && F->inverseSa0 <= P.Hi) {  // the $ row has no character: as a group, same step
+            for (unsigned long r = P.Lo; r <= P.Hi; r++)
+                if (Unresolved(P.Mask, r)) Kids[0].push_back({r, P.Out + (r - P.Lo)});
+            Emit_Kids(F, P.Skipped);
+            return;
+        }
+        uint64_t Mask = P.Mask;
+        const unsigned k = (Interval - P.Lo % Interval) % Interval;  // the class of the sampled rows
+        if (!(Mask >> k & 1)) {
+            for (unsigned long r = P.Lo + k; r <= P.Hi; r += Interval) {
+                Values[P.Out + (r - P.Lo)] = F->saValue[r / Interval] + P.Skipped;
+#ifdef BATMAN_BATCH_STATS
+                Decode_Stats.Direct++;
+#endif
+            }
+            Mask |= uint64_t{1} << k;
+        }
+        if (Mask == Full) return;
+#ifdef BATMAN_BATCH_STATS
+        Decode_Stats.Span_Steps++;
+#endif
+        const unsigned long Width = P.Hi - P.Lo + 1;
+        unsigned ALIGN_16 Occ[ALPHABET_SIZE], Occ_Hi[ALPHABET_SIZE];
+        BWTAllOccValue(F, static_cast<unsigned>(P.Lo), Occ);
+        if (P.Hi < F->textLength) {
+            BWTAllOccValue(F, static_cast<unsigned>(P.Hi + 1), Occ_Hi);
+            for (unsigned c = 0; c < 4; c++)
+                if (Occ_Hi[c] - Occ[c] == Width) {
+                    const unsigned long Lo = F->cumulativeFreq[c] + Occ[c] + 1;
+                    Next_Spans.push_back({F, P.Skipped + 1, Lo, Lo + Width - 1, P.Out, Mask});
+                    return;
+                }
+        }
+        for (unsigned long s = P.Lo; s <= P.Hi;) {
+            const unsigned c = Char_At(F, s);
+            unsigned long e = s;
+            while (e < P.Hi && Char_At(F, e + 1) == c) e++;
+            const unsigned long Lo = F->cumulativeFreq[c] + Occ[c] + 1;
+            if (e - s + 1 >= SA_SPAN_MIN) {
+                const unsigned d = (s - P.Lo) % Interval;  // class j of the run is class j + d of the span
+                const uint64_t Run_Mask = d ? ((Mask >> d) | (Mask << (Interval - d))) & Full : Mask;
+                Next_Spans.push_back({F, P.Skipped + 1, Lo, Lo + (e - s), P.Out + (s - P.Lo), Run_Mask});
+            } else {
+                for (unsigned long r = s; r <= e; r++)
+                    if (Unresolved(Mask, r)) Kids[c].push_back({Lo + (r - s), P.Out + (r - P.Lo)});
+            }
+            Occ[c] += e - s + 1;
+            s = e + 1;
+        }
+        Emit_Kids(F, P.Skipped + 1);
+    };
+    while (!Walks.empty() || !Groups.empty() || !Spans.empty()) {
+        for (const Walk& W : Walks) {
+            if (W.Row % W.Fmi->saInterval == 0) __builtin_prefetch(W.Fmi->saValue + W.Row / W.Fmi->saInterval);
+            else Prefetch_Row(W.Fmi, W.Row + 1);
+        }
+        for (const Group& G : Groups) Prefetch_Row(G.Fmi, Items[G.Begin].Row);
+        for (const Span& P : Spans) {
+            Prefetch_Row(P.Fmi, P.Lo);
+            Prefetch_Row(P.Fmi, P.Hi + 1);
+        }
+        Next_Walks.clear();
+        Next_Groups.clear();
+        Next_Items.clear();
+        Next_Spans.clear();
+        for (const Walk& W : Walks) {
+            if (W.Row % W.Fmi->saInterval == 0) {
+                Values[W.Out] = W.Fmi->saValue[W.Row / W.Fmi->saInterval] + W.Skipped;
+                continue;
+            }
+#ifdef BATMAN_BATCH_STATS
+            Decode_Stats.Walk_Steps++;
+#endif
+            Next_Walks.push_back({W.Fmi, BWTPsiMinusValue(W.Fmi, static_cast<unsigned>(W.Row)), W.Skipped + 1, W.Out});
+        }
+        for (const Group& G : Groups) Group_Step(G);
+        for (const Span& P : Spans) Span_Step(P);
+        std::swap(Walks, Next_Walks);
+        std::swap(Groups, Next_Groups);
+        std::swap(Items, Next_Items);
+        std::swap(Spans, Next_Spans);
+    }
+}
+
+// A read's hits for SAM/BAM output, in output order: by mismatches, the read's strand
+// first on a tie (stable).
+struct Sam_Candidate {
+    int Mismatches, Strand;
+    const SARange* Hit;
+    bool Forward_Index;
+};
+
+void Sam_Candidates(const ForwardResults* const Res[2], const Hit_Stage* const Stages[2], std::vector<Sam_Candidate>& Out) {
+    Out.clear();
+    for (int Strand = 0; Strand < 2; Strand++) {
+        if (!Res[Strand]) continue;
+        for (const SARange& h : Res[Strand][RL_EXACT].hits) Out.push_back({0, Strand, &h, false});
+        for (const SARange& h : Res[Strand][RL_HITS].hits) {
+            const Hit_Stage& Stage = Stages[Strand][h.Stage];
+            Out.push_back({Stage.Mismatches, Strand, &h, Stage.Dir[0] == 'B'});
+        }
+    }
+    std::stable_sort(Out.begin(), Out.end(),
+                     [](const Sam_Candidate& a, const Sam_Candidate& b) { return a.Mismatches < b.Mismatches; });
+}
+
+// Whether a hit's position is known without decoding: located, or recorded at a sampled
+// row (Track_Pos).
+inline bool Hit_Has_Pos(const SARange& hit) { return hit.Skip && (Use_Ref || Track_Pos) && hit.Pos != NO_POS; }
+
+// The rows Write_Sam_Read will decode for a read, as decode requests: its candidates'
+// rows in output order, up to MaxHits locations (0: all) counting the ones with a known
+// Pos. Returns the number of values requested (from Values_At on). Origins gets each
+// request's candidate.
+std::size_t Sam_Requests(const std::vector<Sam_Candidate>& Candidates, unsigned MaxHits, std::size_t Values_At,
+                         std::vector<Sa_Request>& Requests, std::vector<const Sam_Candidate*>& Origins) {
+    std::size_t Locations = 0, Values = 0;
+    for (const Sam_Candidate& C : Candidates) {
+        if (MaxHits && Locations >= MaxHits) break;
+        const SARange& h = *C.Hit;
+        if (Hit_Has_Pos(h)) {
+            Locations++;
+            continue;
+        }
+        unsigned long Last = h.Skip ? h.Start : h.End;
+        if (MaxHits) Last = std::min<unsigned long>(Last, h.Start + (MaxHits - Locations) - 1);
+        Requests.push_back({C.Forward_Index ? fwfmi : revfmi, h.Start, Last, Values_At + Values});
+        Origins.push_back(&C);
+        Locations += Last - h.Start + 1;
+        Values += Last - h.Start + 1;
+    }
+    return Values;
+}
+
+// ---- Hit rows from the hit's range chain (Chain_Decode) ----
+//
+// A hit's range A_L is the SA range, in its index, of the hit string P' (the read on
+// its strand with the recorded mismatches), whatever route the search took. Exact
+// backward search of P' rebuilds the chain A_1 .. A_L (A_k: the first k characters the
+// index consumes; 2 lookups a step). LF keeps order: the t-th row of A_{k-1} whose BWT
+// character is the k-th consumed one maps to row s_k + t of A_k. So each hit row has an
+// exact ancestor in every A_k, a different row each time, with SA value (hit's) + L - k:
+// a sampled ancestor gives the hit row's value with no walk.
+//   - Where the width stays the same (a stretch), the ancestors are contiguous: a hit
+//     row keeps its offset o, and A_k samples it when (s_k + o) % saInterval == 0. A
+//     whole stretch is taken in one go: one k per class of s_k, each row looked up by
+//     its offset.
+//   - Where the width changes, one scan of A_{k-1}'s BWT characters, in order, finds
+//     the ancestors (select by counting).
+// Backtracking stops when every row is resolved, a scan would pass the budget
+// (A_{k-1} wider than CHAIN_SCAN_PER_ROW x the rows left + 4096), or a step after a
+// CHAIN_IDLE_SCANS scans in a row leave over 7/8 of the rows left (ancestors that stall,
+// as in a homopolymer run; independent ones resolve 1/8 a step); the rest go to
+// Sa_Decode. A hit is first tried on a sample of CHAIN_TRIAL rows. A hit that resolves less than 7/8 of its rows this way (e.g. a homopolymer
+// run, whose width changes every step, with no affordable scan) goes to Sa_Decode
+// whole: its spans beat walking the scattered rows left. Hits narrower than
+// CHAIN_MIN_ROWS skip this (the rebuild costs more than walking them).
+// Off unless built with SA_CHAIN: it measured no faster than Sa_Decode alone, whose spans
+// follow the copies of a repeat forward as cheaply as the chain follows them back (see
+// benchmark/sam_output.md, "Decoding SA rows").
+#ifndef CHAIN_MIN_ROWS
+#define CHAIN_MIN_ROWS 24
+#endif
+#ifndef CHAIN_SCAN_PER_ROW
+#define CHAIN_SCAN_PER_ROW 4
+#endif
+#ifndef CHAIN_IDLE_SCANS
+#define CHAIN_IDLE_SCANS 12
+#endif
+#ifndef CHAIN_TRIAL
+#define CHAIN_TRIAL 256
+#endif
+
+#ifdef BATMAN_BATCH_STATS
+struct {
+    unsigned long Hits = 0, Failed = 0, Rows = 0, Resolved = 0, Used = 0, Stretch_Steps = 0, Scans = 0, Scanned = 0,
+                  Single_Ranks = 0;
+} Chain_Stats;
+#endif
+
+// The BWT character of Row (not the $ row).
+inline unsigned Bwt_Char(const ActiveBWT* F, unsigned long Row) {
+    const unsigned long Index = Row - (Row > F->inverseSa0);
+    return F->bwtCode[Index / 16] << ((Index % 16) * 2) >> (BITS_IN_WORD - 2);
+}
+
+// Rows h.Start .. h.Start + Count - 1 of C's hit (Codes: the read): the ones resolved
+// from the chain get Values[j] (their SA value, as BWTSaValue) and Done[j] = 1. Returns
+// how many; 0 if the chain does not rebuild to the hit.
+std::size_t Chain_Decode(const Sam_Candidate& C, std::string_view Codes, unsigned long Count, unsigned* Values,
+                         unsigned char* Done) {
+    const SARange& h = *C.Hit;
+    ActiveBWT* F = C.Forward_Index ? fwfmi : revfmi;
+    const unsigned Interval = F->saInterval;
+    const int L = static_cast<int>(Codes.size());
+    if (Interval > 64 || L < 1) return 0;
+    static std::vector<unsigned char> P, Q;
+    static std::vector<unsigned long> S, E;
+    P.resize(L);
+    Q.assign(L + 1, 0);
+    S.assign(L + 1, 0);
+    E.assign(L + 1, 0);
+    for (int i = 0; i < L; i++) P[i] = C.Strand ? 3 - Codes[L - 1 - i] : Codes[i];
+    for (int i = 0; i < h.Mismatches && i < MAX_MISMATCHES_BOUND; i++) P[h.Mismatch_Pos[i]] = h.Mismatch_Char >> (2 * i) & 3;
+    for (int k = 1; k <= L; k++) Q[k] = C.Forward_Index ? P[L - k] : P[k - 1];  // fwfmi consumes P' from its end
+#ifdef BATMAN_BATCH_STATS
+    Chain_Stats.Hits++;
+    Chain_Stats.Rows += Count;
+#endif
+    // Widths never grow along the chain, so once one equals the hit's width the rest do
+    // too: those steps take one rank (the start) and the end is start + width - 1. The
+    // last step takes both, so the final check confirms the whole tail.
+    const unsigned long Hit_Width = h.End - h.Start + 1;
+    unsigned long s = F->cumulativeFreq[Q[1]] + 1, e = F->cumulativeFreq[Q[1] + 1];
+    S[1] = s;
+    E[1] = e;
+    for (int k = 2; k <= L && s && s <= e; k++) {
+        if (k < L && e - s + 1 == Hit_Width) {
+            s = F->cumulativeFreq[Q[k]] + BWTOccValue(F, static_cast<unsigned>(s), Q[k]) + 1;
+            e = s + Hit_Width - 1;
+#ifdef BATMAN_BATCH_STATS
+            Chain_Stats.Single_Ranks++;
+#endif
+        } else {
+            Get_SARange(Q[k], s, e, F);
+        }
+        S[k] = s;
+        E[k] = e;
+    }
+    if (!s || s != h.Start || e != h.End) {
+#ifdef BATMAN_BATCH_STATS
+        Chain_Stats.Failed++;
+#endif
+        return 0;
+    }
+    struct Row_Of {
+        unsigned long Row;  // the hit row's ancestor in the current range
+        unsigned long J;    // the hit row's offset
+    };
+    static std::vector<Row_Of> Rows;
+    int Class_K[64];
+    // Backtracks hit rows J0 .. J1 - 1; scan budgets count Scale rows per row left (a
+    // sample stands for the whole hit). Returns the rows resolved.
+    auto Backtrack = [&](unsigned long J0, unsigned long J1, unsigned long Scale) {
+        Rows.clear();
+        for (unsigned long j = J0; j < J1; j++) Rows.push_back({h.Start + j, j});
+        std::size_t Resolved = 0, Mark = Rows.size();
+        int Idle_Scans = 0;  // scans since the rows left last fell by 1/8
+        for (int k = L;;) {
+            // The stretch A_a .. A_k of equal width: one k per class of s_k.
+            const unsigned long Width = E[k] - S[k];
+            int a = k;
+            while (a > 1 && E[a - 1] - S[a - 1] == Width) a--;
+            std::fill(Class_K, Class_K + Interval, -1);
+            for (int k2 = k; k2 >= a; k2--)
+                if (Class_K[S[k2] % Interval] < 0) Class_K[S[k2] % Interval] = k2;
+            std::size_t Left = 0;
+            for (const Row_Of& R : Rows) {
+                const unsigned long o = R.Row - S[k];
+                const int k2 = Class_K[(Interval - o % Interval) % Interval];
+                if (k2 >= 0) {
+                    Values[R.J] = F->saValue[(S[k2] + o) / Interval] - static_cast<unsigned>(L - k2);
+                    Done[R.J] = 1;
+                    Resolved++;
+                } else {
+                    Rows[Left++] = {S[a] + o, R.J};
+                }
+            }
+            Rows.resize(Left);
+#ifdef BATMAN_BATCH_STATS
+            Chain_Stats.Stretch_Steps += k - a;
+#endif
+            if (8 * Left <= 7 * Mark) {
+                Mark = Left;
+                Idle_Scans = 0;
+            }
+            if (Rows.empty() || a == 1 || E[a - 1] - S[a - 1] + 1 > CHAIN_SCAN_PER_ROW * Scale * Rows.size() + 4096) break;
+            if (Idle_Scans++ >= CHAIN_IDLE_SCANS) break;  // ancestors stall (homopolymer)
+            // A_{a-1} -> A_a: the t-th row of A_{a-1} with character Q[a] is row S[a] + t.
+            // Scanned a BWT word (16 characters) at a time: a mask of the characters
+            // equal to Q[a], popcounted; only words holding a wanted occurrence are
+            // walked, and the scan stops after the last. Rows map to BWT positions
+            // skipping the $ row: Index = Row - (Row > inverseSa0).
+            const unsigned long Inv = F->inverseSa0;
+            const unsigned long Lo = S[a - 1] - (S[a - 1] > Inv), Hi = E[a - 1] - (E[a - 1] >= Inv);
+            const unsigned Pattern = Q[a] * 0x55555555u;
+            unsigned long t = 0, w = Lo / 16;
+            std::size_t i = 0;
+            for (; w <= Hi / 16 && i < Rows.size(); w++) {
+                const unsigned x = F->bwtCode[w] ^ Pattern;
+                unsigned m = ~(x | x >> 1) & 0x55555555u;  // low bit of each matching pair; pair p at bit 30 - 2p
+                if (w == Lo / 16) m &= (1u << (31 - 2 * (Lo % 16))) - 1;
+                if (w == Hi / 16) m &= ~((1u << (30 - 2 * (Hi % 16))) - 1);
+                const unsigned Count_W = __builtin_popcount(m);
+                if (S[a] + t + Count_W <= Rows[i].Row) {
+                    t += Count_W;
+                    continue;
+                }
+                for (; m && i < Rows.size(); t++) {
+                    const unsigned Bit = 31 - __builtin_clz(m);
+                    m &= ~(1u << Bit);
+                    if (S[a] + t == Rows[i].Row) {
+                        const unsigned long Index = w * 16 + (30 - Bit) / 2;
+                        Rows[i++].Row = Index + (Index >= Inv);
+                    }
+                }
+            }
+#ifdef BATMAN_BATCH_STATS
+            Chain_Stats.Scans++;
+            Chain_Stats.Scanned += 16 * (w - Lo / 16);
+#endif
+            k = a - 1;
+        }
+        return Resolved;
+    };
+    // A sample first (the first CHAIN_TRIAL rows: their ancestors come first in each
+    // scan, so it is cheap): the whole hit only if it resolves 7/8 of them.
+    const unsigned long Trial = std::min<unsigned long>(Count, CHAIN_TRIAL);
+    std::size_t Resolved = Backtrack(0, Trial, Count / Trial);
+    if (Resolved < Trial - Trial / 8) Resolved = 0;
+    else if (Trial < Count) Resolved += Backtrack(Trial, Count, 1);
+#ifdef BATMAN_BATCH_STATS
+    Chain_Stats.Resolved += Resolved;
+#endif
+    return Resolved;
+}
+
+// Requests[First ..] (Origins[i - First]: their candidates; Codes: the read): wide hits
+// are resolved from their chains first (Chain_Decode) and leave requests only for the
+// runs of rows left.
+void Chain_Requests(std::vector<Sa_Request>& Requests, std::size_t First, const std::vector<const Sam_Candidate*>& Origins,
+                    std::string_view Codes, std::vector<unsigned>& Values, std::vector<unsigned char>& Done) {
+    static std::vector<Sa_Request> Kept;
+    Kept.clear();
+    for (std::size_t i = First; i < Requests.size(); i++) {
+        const Sa_Request R = Requests[i];
+        const unsigned long Count = R.End - R.Start + 1;
+        const Sam_Candidate& C = *Origins[i - First];
+        if (Count < CHAIN_MIN_ROWS || C.Hit->Skip ||
+            Chain_Decode(C, Codes, Count, Values.data() + R.Out, Done.data() + R.Out) < Count - Count / 8) {
+            std::fill(Done.begin() + R.Out, Done.begin() + R.Out + Count, 0);
+            Kept.push_back(R);
+            continue;
+        }
+#ifdef BATMAN_BATCH_STATS
+        Chain_Stats.Used += std::count(Done.begin() + R.Out, Done.begin() + R.Out + Count, 1);
+#endif
+        for (unsigned long j = 0; j < Count;) {
+            if (Done[R.Out + j]) {
+                j++;
+                continue;
+            }
+            unsigned long k = j;
+            while (k < Count && !Done[R.Out + k]) k++;
+            Kept.push_back({R.Fmi, R.Start + j, R.Start + k - 1, R.Out + j});
+            j = k;
+        }
+    }
+    Requests.resize(First);
+    Requests.insert(Requests.end(), Kept.begin(), Kept.end());
 }
 
 // Writes one read's SAM/BAM records from its strands' lists (Res[1]: the reverse
 // complement's, or null): the hits in order of mismatches (forward strand first on a
 // tie), each location placed on its sequence (Genome_Map::Place; locations leaving a
-// sequence or covering an N are dropped), at most MaxHits records (0: all). The first is
-// primary. No record: one unmapped record. Returns the mapped records.
+// sequence or covering an N are dropped, but count toward MaxHits as if written), at
+// most MaxHits locations (0: all). The first record is primary. No record: one
+// unmapped record. Returns the mapped records. The SA values of the rows Sam_Requests
+// listed, which are all the rows that count, are Decoded[0 .. Count).
 unsigned long Write_Sam_Read(Sam_Output& S, const std::string& Id, const std::string& Seq_Text, const std::string& Qual,
-                             std::string_view Codes, const ForwardResults* const Res[2], const Hit_Stage* const Stages[2],
-                             unsigned MaxHits) {
-    struct Candidate {
-        int Mismatches, Strand;
-        const SARange* Hit;
-        bool Forward_Index;
-    };
+                             std::string_view Codes, const std::vector<Sam_Candidate>& Candidates, unsigned MaxHits,
+                             const unsigned* Decoded, std::size_t Count) {
     struct Record {
         int Tid, Strand;
         int64_t Pos;
         const SARange* Hit;
     };
-    static std::vector<Candidate> Candidates;
     static std::vector<Record> Records;
-    Candidates.clear();
     Records.clear();
-    for (int Strand = 0; Strand < 2; Strand++) {
-        if (!Res[Strand]) continue;
-        for (const SARange& h : Res[Strand][RL_EXACT].hits) Candidates.push_back({0, Strand, &h, false});
-        for (const SARange& h : Res[Strand][RL_HITS].hits) {
-            const Hit_Stage& Stage = Stages[Strand][h.Stage];
-            Candidates.push_back({Stage.Mismatches, Strand, &h, Stage.Dir[0] == 'B'});
-        }
-    }
-    std::stable_sort(Candidates.begin(), Candidates.end(),
-                     [](const Candidate& a, const Candidate& b) { return a.Mismatches < b.Mismatches; });
     const int L = static_cast<int>(Codes.size());
-    for (const Candidate& C : Candidates) {
-        S.Positions.clear();
-        Hit_Positions(*C.Hit, C.Forward_Index, L, S.Positions);
-        for (uint64_t G : S.Positions) {
-            int Tid;
-            int64_t Pos;
-            if (!S.Map.Place(G, L, Tid, Pos)) continue;
-            Records.push_back({Tid, C.Strand, Pos, C.Hit});
-            if (MaxHits && Records.size() >= MaxHits) break;
+    std::size_t Next = 0, Locations = 0;
+    auto Add = [&](const Sam_Candidate& C, uint64_t G) {
+        int Tid;
+        int64_t Pos;
+        if (S.Map.Place(G, L, Tid, Pos)) Records.push_back({Tid, C.Strand, Pos, C.Hit});
+        return MaxHits && ++Locations >= MaxHits;
+    };
+    for (const Sam_Candidate& C : Candidates) {
+        const SARange& h = *C.Hit;
+        if (Hit_Has_Pos(h)) {
+            if (Add(C, h.Pos)) break;
+            continue;
         }
-        if (MaxHits && Records.size() >= MaxHits) break;
+        bool Full = false;
+        const unsigned long Last = h.Skip ? h.Start : h.End;
+        for (unsigned long Row = h.Start; Row <= Last && !Full && Next < Count; Row++) {
+            const unsigned Sa = Decoded[Next++];
+            Full = Add(C, C.Forward_Index ? Sa : Text_Length - L - Sa);
+        }
+        if (Full) break;
     }
     if (!S.Write) return Records.size();
     const std::string Name = Id.substr(0, Id.find_first_of(" \t"));
@@ -2890,7 +3543,18 @@ bool Run_Batched(std::ifstream& in, std::ostream& out, unsigned B, int maxMismat
     std::vector<unsigned char> found(strands * BLOCK);
     std::vector<ForwardResults> results(MM_LISTS * strands * BLOCK);  // -n 1 to 3: each read's result lists
     std::vector<unsigned long> readHits(strands * BLOCK);
-    ForwardResults exactLists[2][RL_LISTS];  // SAM/BAM, exact search: a read's range as lists
+    // SAM/BAM: each read's hits in output order, and the SA rows decoded for them.
+    std::vector<std::vector<Sam_Candidate>> candidates(sam ? BLOCK : 0);
+    std::vector<std::size_t> decodeBegin(sam ? BLOCK : 0), decodeCount(sam ? BLOCK : 0);
+    std::vector<Sa_Request> decodeRequests;
+    std::vector<const Sam_Candidate*> origins;  // the current read's requests' candidates
+    std::vector<unsigned> decoded;
+    std::vector<unsigned char> decodeDone;      // decoded by Chain_Requests already
+#ifdef SA_CHAIN
+    constexpr bool useChain = true;
+#else
+    constexpr bool useChain = false;
+#endif
     std::string reads;  // codes of the searched reads, back to back
     std::string seq, lines;
     bool initialized = false, more = true;
@@ -2943,6 +3607,7 @@ bool Run_Batched(std::ifstream& in, std::ostream& out, unsigned B, int maxMismat
         }
         const unsigned total = strands * count;
         if (oneMismatch && strands == 2) Batch_Both_Strands(reads.data(), count, STRINGLENGTH, B, maxHits, maxMismatches, results, readHits);
+        else if (oneMismatch && maxMismatches == 4) Batch_Four_Mismatch(reads.data(), total, STRINGLENGTH, B, maxHits, results, readHits);
         else if (oneMismatch && maxMismatches == 3) Batch_Three_Mismatch(reads.data(), total, STRINGLENGTH, B, maxHits, results, readHits);
         else if (oneMismatch && maxMismatches == 2) Batch_Two_Mismatch(reads.data(), total, STRINGLENGTH, B, maxHits, results, readHits);
         else if (oneMismatch) Batch_One_Mismatch(reads.data(), total, STRINGLENGTH, B, maxHits, results, readHits);
@@ -2950,28 +3615,51 @@ bool Run_Batched(std::ifstream& in, std::ostream& out, unsigned B, int maxMismat
         searchSeconds += std::chrono::duration<double>(Clock::now() - searchStart).count();
 
         if (sam) {
+            // Each read's hits in output order, the rows to decode for them (Sam_Requests),
+            // all decoded together (Sa_Decode), then the records.
             const auto outputStart = Clock::now();
+            decodeRequests.clear();
+            decodeDone.clear();
+            std::size_t values = 0;
+            for (unsigned j = 0; j < n; j++) {
+                candidates[j].clear();
+                if (!searched[j]) continue;
+                if (oneMismatch) {
+                    const ForwardResults* res[2] = {nullptr, nullptr};
+                    const Hit_Stage* stages[2] = {Stages_Of(maxMismatches), Stages_Of(maxMismatches)};
+                    for (unsigned s = 0; s < strands; s++) res[s] = &results[MM_LISTS * (s * count + slot[j])];
+                    Sam_Candidates(res, stages, candidates[j]);
+                } else {
+                    for (unsigned s = 0; s < strands; s++) {
+                        const std::size_t at = s * count + slot[j];
+                        if (found[at] && ranges[at].Start) candidates[j].push_back({0, static_cast<int>(s), &ranges[at], false});
+                    }
+                }
+                decodeBegin[j] = values;
+                const std::size_t first = decodeRequests.size();
+                origins.clear();
+                decodeCount[j] = Sam_Requests(candidates[j], maxHits, values, decodeRequests, origins);
+                values += decodeCount[j];
+                decoded.resize(values);
+                decodeDone.resize(values, 0);
+                if (useChain)
+                    Chain_Requests(decodeRequests, first, origins,
+                                   std::string_view(reads.data() + static_cast<std::size_t>(slot[j]) * STRINGLENGTH, STRINGLENGTH),
+                                   decoded, decodeDone);
+            }
+            decoded.resize(values);
+            Sa_Decode(decodeRequests, decoded);
+#ifdef BATMAN_BATCH_STATS
+            Decode_Stats.Seconds += std::chrono::duration<double>(Clock::now() - outputStart).count();
+#endif
             for (unsigned j = 0; j < n; j++) {
                 if (!searched[j]) {
                     if (sam->Write) sam->Writer.Write_Unmapped(ids[j].substr(0, ids[j].find_first_of(" \t")), seqs[j], quals[j]);
                     continue;
                 }
-                const ForwardResults* res[2] = {nullptr, nullptr};
-                const Hit_Stage* stages[2] = {One_Stages, One_Stages};
-                for (unsigned s = 0; s < strands; s++) {
-                    const std::size_t at = s * count + slot[j];
-                    if (oneMismatch) {
-                        res[s] = &results[MM_LISTS * at];
-                        stages[s] = Stages_Of(maxMismatches);
-                        continue;
-                    }
-                    exactLists[s][RL_EXACT].hits.clear();
-                    if (found[at] && ranges[at].Start) exactLists[s][RL_EXACT].hits.push_back(ranges[at]);
-                    res[s] = exactLists[s];
-                }
                 reportedHits += Write_Sam_Read(*sam, ids[j], seqs[j], quals[j],
                                                std::string_view(reads.data() + static_cast<std::size_t>(slot[j]) * STRINGLENGTH, STRINGLENGTH),
-                                               res, stages, maxHits);
+                                               candidates[j], maxHits, decoded.data() + decodeBegin[j], decodeCount[j]);
             }
             outputSeconds += std::chrono::duration<double>(Clock::now() - outputStart).count();
             continue;
@@ -3009,7 +3697,7 @@ bool Run_Batched(std::ifstream& in, std::ostream& out, unsigned B, int maxMismat
 
 void Usage(const char* prog) {
     std::fprintf(stderr,
-    "Usage: %s -q <reads.fa/fq> -g <genome_prefix> [-n <0|1|2|3>] [-o <hits.txt>] [-m <maxhits>] [--no-ref] [--lookup <k>] [--batch <B>] [--sam|--bam] [--forward-only] [--quiet|-Q] [--timing]\n"
+    "Usage: %s -q <reads.fa/fq> -g <genome_prefix> [-n <0|1|2|3|4>] [-o <hits.txt>] [-m <maxhits>] [--no-ref] [--lookup <k>] [--batch <B>] [--sam|--bam] [--forward-only] [--quiet|-Q] [--timing]\n"
         "  -n  maximum mismatches, 0-3 (default 0); 1 to 3 also need the forward index\n"
         "      <genome_prefix>.bwt/.fmv\n"
         "  -m  maximum hits per read (default 1, 0 = all)\n"
@@ -3068,6 +3756,8 @@ int main(int argc, char** argv) {
                 maxMismatches = 2;
             } else if (std::strcmp(argv[i], "3") == 0) {
                 maxMismatches = 3;
+            } else if (std::strcmp(argv[i], "4") == 0) {
+                maxMismatches = 4;
             } else {
                 Usage(argv[0]);
                 return 1;
@@ -3288,7 +3978,8 @@ int main(int argc, char** argv) {
         if (maxMismatches >= 1 && LH > LOOKUPSIZE) {
             std::string lines;
             std::size_t tagged;
-            const unsigned long exactHits = maxMismatches == 3   ? Three_Mismatch_Search(all, range, maxHits, lists)
+            const unsigned long exactHits = maxMismatches == 4   ? Four_Mismatch_Search(all, range, maxHits, lists)
+                                            : maxMismatches == 3 ? Three_Mismatch_Search(all, range, maxHits, lists)
                                             : maxMismatches == 2 ? Two_Mismatch_Search(all, range, maxHits, lists)
                                                                  : One_Mismatch_Search(lh, rh, range, maxHits, lists, tagged);
             const unsigned long readHits = Format_Hits(id, lists, Stages_Of(maxMismatches), exactHits, maxHits, lines);
@@ -3362,6 +4053,17 @@ int main(int argc, char** argv) {
                 std::cerr << '\n';
             }
         }
+        if (Decode_Stats.Rows || Chain_Stats.Hits)
+            std::cerr << "decode: seconds=" << Decode_Stats.Seconds << " rows=" << Decode_Stats.Rows << " read_off=" << Decode_Stats.Direct
+                      << " group_lookups=" << Decode_Stats.Range_Steps << " span_steps=" << Decode_Stats.Span_Steps
+                      << " row_steps=" << Decode_Stats.Walk_Steps << " lookups_per_row="
+                      << double(Decode_Stats.Range_Steps + 2 * Decode_Stats.Span_Steps + Decode_Stats.Walk_Steps) / Decode_Stats.Rows
+                      << '\n';
+        if (Chain_Stats.Hits)
+            std::cerr << "chain: hits=" << Chain_Stats.Hits << " failed=" << Chain_Stats.Failed << " rows=" << Chain_Stats.Rows
+                      << " resolved=" << Chain_Stats.Resolved << " used=" << Chain_Stats.Used << " stretch_steps=" << Chain_Stats.Stretch_Steps
+                      << " scans=" << Chain_Stats.Scans << " scanned=" << Chain_Stats.Scanned
+                      << " single_ranks=" << Chain_Stats.Single_Ranks << '\n';
 #endif
     }
 
