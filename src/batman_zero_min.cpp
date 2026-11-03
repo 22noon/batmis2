@@ -19,7 +19,12 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+#include <thread>
 
 extern "C" {
 #include "MemManager.h"
@@ -141,8 +146,8 @@ struct Lookup_Entry {
 };
 std::vector<Lookup_Entry> Forward_Lookup;
 std::vector<Lookup_Entry> Backward_Lookup;
-unsigned Branch_Characters[4] = {0, 0, 0, 0};
-SARange Branch_Ranges[4];
+thread_local unsigned Branch_Characters[4] = {0, 0, 0, 0};  // Branch_Detect: per thread
+thread_local SARange Branch_Ranges[4];
 
 // Reference for located singletons (see Locate). Off with --no-ref.
 bool Use_Ref = false;
@@ -1067,11 +1072,13 @@ class Mm_Builder {
     }
 };
 
-// The program and stage table of -n K (0 to 5), built on first use.
+// The program and stage table of -n K (0 to 5), built on first use (thread-safe).
 const Mm_Program& Program_For(int K) {
-    static std::vector<Mm_Program> Programs;
-    if (Programs.empty())
-        for (int k = 0; k <= 5; k++) Programs.push_back(Mm_Builder(k).Build());
+    static const std::vector<Mm_Program> Programs = [] {  // built once, before any thread reads them
+        std::vector<Mm_Program> P;
+        for (int k = 0; k <= 5; k++) P.push_back(Mm_Builder(k).Build());
+        return P;
+    }();
     return Programs[K];
 }
 inline const Mm_Step* Program_Of(int K) { return Program_For(K).Steps.data(); }
@@ -1079,11 +1086,24 @@ inline const Hit_Stage* Stages_Of(int K) { return Program_For(K).Stages.data(); 
 
 #ifdef BATMAN_BATCH_STATS
 // Lane occupancy and step counts (build with -DBATMAN_BATCH_STATS; printed with --timing).
-struct {
+// Per thread; Run_Batched adds the workers' to the main thread's (Add).
+struct Batch_Stats_Counts {
     unsigned long Rounds = 0, Lane_Rounds = 0, Drain_Rounds = 0, Lanes = 0;
     unsigned long Steps[MM_PROGRAM_MAX][4][6] = {};  // [program step][task][sub]
     unsigned long Skipped[MM_PROGRAM_MAX] = {};      // searches skipped by their windows
-} Batch_Stats;
+    void Add(const Batch_Stats_Counts& O) {
+        Rounds += O.Rounds;
+        Lane_Rounds += O.Lane_Rounds;
+        Drain_Rounds += O.Drain_Rounds;
+        Lanes = std::max(Lanes, O.Lanes);
+        for (unsigned p = 0; p < MM_PROGRAM_MAX; p++) {
+            for (unsigned t = 0; t < 4; t++)
+                for (unsigned u = 0; u < 6; u++) Steps[p][t][u] += O.Steps[p][t][u];
+            Skipped[p] += O.Skipped[p];
+        }
+    }
+};
+thread_local Batch_Stats_Counts Batch_Stats;
 #endif
 
 // A read strand's state in a lane (two-strand programs): the lane's fields of the same
@@ -1855,7 +1875,7 @@ void Batch_Search(const char* Reads, unsigned Count, int Len, unsigned B, unsign
                   std::vector<ForwardResults>* Res, std::vector<unsigned long>* ReadHits, std::vector<SARange>* Ranges,
                   std::vector<unsigned char>* Found, bool Two_Strands = false, unsigned First = 0,
                   unsigned Last = ~0U) {
-    static Mm_Lane Lanes[MAX_BATCH];
+    static thread_local Mm_Lane Lanes[MAX_BATCH];
     unsigned Active = 0, Next = First;
     Last = std::min(Last, Count);
     auto Finish_Strand = [&](Mm_Lane& L) {
@@ -2034,12 +2054,14 @@ void Batch_Both_Strands(const char* Reads, unsigned Count, int Len, unsigned B, 
 
 // --batch auto: the lane count chosen on the fly. The best count depends on the machine
 // (how many cache misses a core keeps in flight), the index and the reads, while the
-// output does not depend on it. So the first blocks try the candidates, one block each,
+// output does not depend on it. So the first chunks try the candidates, one chunk each,
 // in rounds of alternating order (cancelling a drift such as caches warming up); each
-// block's first reads only warm up, so that its time is the candidate's steady state
+// chunk's first reads only warm up, so that its time is the candidate's steady state
 // (switching the lane count every few hundred reads favours many lanes). The candidate
 // with the lowest median search time per read is kept for the rest of the run, or,
-// within 3% of it, the one with the fewest lanes.
+// within 3% of it, the one with the fewest lanes. With threads (-t), each thread has its
+// own chooser, timed while the others run: they share the cores' and the memory's
+// capacity for misses in flight, and a thread may run on a P- or an E-core.
 struct Batch_Chooser {
     static constexpr unsigned Candidates[] = {1, 2, 4, 8, 16};
     static constexpr unsigned N = sizeof Candidates / sizeof Candidates[0];
@@ -2048,23 +2070,24 @@ struct Batch_Chooser {
     unsigned Trials = 0;
     std::vector<double> Seconds[N];  // per read, one per trial block
 
-    // Searches a block's reads [0, Units) with Search_Range(First, Last, Lanes).
+    // Searches a block's reads [First, Last) (one thread's chunk) with
+    // Search_Range(First, Last, Lanes).
     template <class Search>
-    void Run(unsigned Units, Search&& Search_Range) {
+    void Run(unsigned First, unsigned Last, Search&& Search_Range) {
         if (Chosen) {
-            Search_Range(0, Units, Chosen);
+            Search_Range(First, Last, Chosen);
             return;
         }
         const unsigned Round = Trials / N, C = Round % 2 ? N - 1 - Trials % N : Trials % N;
-        if (Units < 2 * Warm_Up) {  // a short (last) block: too noisy to count
-            Search_Range(0, Units, Candidates[C]);
+        if (Last - First < 2 * Warm_Up) {  // a short (last) chunk: too noisy to count
+            Search_Range(First, Last, Candidates[C]);
             return;
         }
-        Search_Range(0, Warm_Up, Candidates[C]);
+        Search_Range(First, First + Warm_Up, Candidates[C]);
         const auto Start = std::chrono::steady_clock::now();
-        Search_Range(Warm_Up, Units, Candidates[C]);
+        Search_Range(First + Warm_Up, Last, Candidates[C]);
         Seconds[C].push_back(std::chrono::duration<double>(std::chrono::steady_clock::now() - Start).count() /
-                             (Units - Warm_Up));
+                             (Last - First - Warm_Up));
         if (++Trials == N * Rounds) Choose();
     }
 
@@ -2256,10 +2279,18 @@ struct Sa_Request {
 };
 
 #ifdef BATMAN_BATCH_STATS
-struct {
+struct Decode_Stats_Counts {  // per thread, as Batch_Stats
     unsigned long Rows = 0, Direct = 0, Walk_Steps = 0, Range_Steps = 0, Span_Steps = 0;
     double Seconds = 0;  // SAM output up to the records: candidates, chains, Sa_Decode
-} Decode_Stats;
+    void Add(const Decode_Stats_Counts& O) {
+        Rows += O.Rows;
+        Direct += O.Direct;
+        Walk_Steps += O.Walk_Steps;
+        Range_Steps += O.Range_Steps;
+        Span_Steps += O.Span_Steps;
+    }
+};
+thread_local Decode_Stats_Counts Decode_Stats;
 #endif
 
 void Sa_Decode(const std::vector<Sa_Request>& Requests, std::vector<unsigned>& Values) {
@@ -2285,10 +2316,10 @@ void Sa_Decode(const std::vector<Sa_Request>& Requests, std::vector<unsigned>& V
         std::size_t Out;
         uint64_t Mask;  // resolved classes of (r - Lo) % saInterval
     };
-    static std::vector<Walk> Walks, Next_Walks;
-    static std::vector<Item> Items, Next_Items, Kids[4];
-    static std::vector<Group> Groups, Next_Groups;
-    static std::vector<Span> Spans, Next_Spans;
+    static thread_local std::vector<Walk> Walks, Next_Walks;
+    static thread_local std::vector<Item> Items, Next_Items, Kids[4];
+    static thread_local std::vector<Group> Groups, Next_Groups;
+    static thread_local std::vector<Span> Spans, Next_Spans;
     Walks.clear();
     Items.clear();
     Groups.clear();
@@ -2552,10 +2583,22 @@ std::size_t Sam_Requests(const std::vector<Sam_Candidate>& Candidates, unsigned 
 #endif
 
 #ifdef BATMAN_BATCH_STATS
-struct {
+struct Chain_Stats_Counts {  // per thread, as Batch_Stats
     unsigned long Hits = 0, Failed = 0, Rows = 0, Resolved = 0, Used = 0, Stretch_Steps = 0, Scans = 0, Scanned = 0,
                   Single_Ranks = 0;
-} Chain_Stats;
+    void Add(const Chain_Stats_Counts& O) {
+        Hits += O.Hits;
+        Failed += O.Failed;
+        Rows += O.Rows;
+        Resolved += O.Resolved;
+        Used += O.Used;
+        Stretch_Steps += O.Stretch_Steps;
+        Scans += O.Scans;
+        Scanned += O.Scanned;
+        Single_Ranks += O.Single_Ranks;
+    }
+};
+thread_local Chain_Stats_Counts Chain_Stats;
 #endif
 
 // The BWT character of Row (not the $ row).
@@ -2574,8 +2617,8 @@ std::size_t Chain_Decode(const Sam_Candidate& C, std::string_view Codes, unsigne
     const unsigned Interval = F->saInterval;
     const int L = static_cast<int>(Codes.size());
     if (Interval > 64 || L < 1) return 0;
-    static std::vector<unsigned char> P, Q;
-    static std::vector<unsigned long> S, E;
+    static thread_local std::vector<unsigned char> P, Q;
+    static thread_local std::vector<unsigned long> S, E;
     P.resize(L);
     Q.assign(L + 1, 0);
     S.assign(L + 1, 0);
@@ -2617,7 +2660,7 @@ std::size_t Chain_Decode(const Sam_Candidate& C, std::string_view Codes, unsigne
         unsigned long Row;  // the hit row's ancestor in the current range
         unsigned long J;    // the hit row's offset
     };
-    static std::vector<Row_Of> Rows;
+    static thread_local std::vector<Row_Of> Rows;
     int Class_K[64];
     // Backtracks hit rows J0 .. J1 - 1; scan budgets count Scale rows per row left (a
     // sample stands for the whole hit). Returns the rows resolved.
@@ -2710,7 +2753,7 @@ std::size_t Chain_Decode(const Sam_Candidate& C, std::string_view Codes, unsigne
 // runs of rows left.
 void Chain_Requests(std::vector<Sa_Request>& Requests, std::size_t First, const std::vector<const Sam_Candidate*>& Origins,
                     std::string_view Codes, std::vector<unsigned>& Values, std::vector<unsigned char>& Done) {
-    static std::vector<Sa_Request> Kept;
+    static thread_local std::vector<Sa_Request> Kept;
     Kept.clear();
     for (std::size_t i = First; i < Requests.size(); i++) {
         const Sa_Request R = Requests[i];
@@ -2755,7 +2798,7 @@ unsigned long Write_Sam_Read(Sam_Output& S, const std::string& Id, const std::st
         int64_t Pos;
         const SARange* Hit;
     };
-    static std::vector<Record> Records;
+    static thread_local std::vector<Record> Records;
     Records.clear();
     const int L = static_cast<int>(Codes.size());
     std::size_t Next = 0, Locations = 0;
@@ -2807,6 +2850,72 @@ unsigned long Write_Sam_Read(Sam_Output& S, const std::string& Id, const std::st
     return Records.size();
 }
 
+// The threads of Run_Batched (-t): Run(Job) calls Job(t) on each of the Size() threads
+// (the caller is thread 0) and returns when all have finished. At_Exit runs on each
+// worker as it ends (the stats builds add its counts to the main thread's).
+class Thread_Pool {
+public:
+    Thread_Pool(unsigned Count, std::function<void()> At_Exit) {
+        for (unsigned t = 1; t < Count; t++)
+            Threads.emplace_back([this, t, At_Exit] {
+                Work(t);
+                At_Exit();
+            });
+    }
+    ~Thread_Pool() {
+        {
+            std::lock_guard<std::mutex> Lock(Mutex);
+            Stop = true;
+        }
+        Wake.notify_all();
+        for (std::thread& T : Threads) T.join();
+    }
+    unsigned Size() const { return static_cast<unsigned>(Threads.size()) + 1; }
+
+    void Run(const std::function<void(unsigned)>& Job) {
+        if (Threads.empty()) {
+            Job(0);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> Lock(Mutex);
+            Current = &Job;
+            Pending = static_cast<unsigned>(Threads.size());
+            Generation++;
+        }
+        Wake.notify_all();
+        Job(0);
+        std::unique_lock<std::mutex> Lock(Mutex);
+        Done.wait(Lock, [&] { return Pending == 0; });
+    }
+
+private:
+    void Work(unsigned t) {
+        unsigned long Seen = 0;
+        for (;;) {
+            const std::function<void(unsigned)>* Job;
+            {
+                std::unique_lock<std::mutex> Lock(Mutex);
+                Wake.wait(Lock, [&] { return Stop || Generation != Seen; });
+                if (Stop) return;
+                Seen = Generation;
+                Job = Current;
+            }
+            (*Job)(t);
+            std::lock_guard<std::mutex> Lock(Mutex);
+            if (--Pending == 0) Done.notify_one();
+        }
+    }
+
+    std::vector<std::thread> Threads;
+    std::mutex Mutex;
+    std::condition_variable Wake, Done;
+    const std::function<void(unsigned)>* Current = nullptr;
+    unsigned Pending = 0;
+    unsigned long Generation = 0;
+    bool Stop = false;
+};
+
 // Reads the records in blocks, searches each
 // block with Batch_Exact (-n 0, or reads too short to split into halves) or the -n k
 // program (Batch_One_Mismatch ... Batch_Five_Mismatch, Batch_Both_Strands) and writes
@@ -2815,19 +2924,39 @@ unsigned long Write_Sam_Read(Sam_Output& S, const std::string& Id, const std::st
 // With sam, writes SAM/BAM records instead (Write_Sam_Read). The reverse complements of
 // the block's reads, if searched, follow the reads: one lane searches both strands of a
 // read in zig-zag order (Batch_Both_Strands); the exact search takes them as more reads.
+// With Threads > 1, a block holds 2 * Threads chunks of reads, which the threads take in
+// turn to search (each with its own lanes and Batch_Chooser); then each thread formats
+// (or, for SAM/BAM, decodes) a contiguous part of the block, and the main thread writes
+// the parts in order. The output does not depend on Threads.
 std::string Batch_Report;  // the lanes used, for --timing (Run_Batched)
 
-bool Run_Batched(std::ifstream& in, std::ostream& out, unsigned B, int maxMismatches, unsigned maxHits, bool quiet,
-                 uint64_t& records, uint64_t& reportedHits, double& tableBuildSeconds,
+bool Run_Batched(std::ifstream& in, std::ostream& out, unsigned B, unsigned Threads, int maxMismatches,
+                 unsigned maxHits, bool quiet, uint64_t& records, uint64_t& reportedHits, double& tableBuildSeconds,
                  double& inputParseSeconds, double& searchSeconds, double& outputSeconds, Sam_Output* sam = nullptr) {
     using Clock = std::chrono::steady_clock;
 #ifdef BATMAN_BATCH_BLOCK
-    constexpr unsigned BLOCK = BATMAN_BATCH_BLOCK;
+    constexpr unsigned CHUNK = BATMAN_BATCH_BLOCK;
 #else
-    constexpr unsigned BLOCK = 4096;
+    constexpr unsigned CHUNK = 4096;
 #endif
+    const unsigned BLOCK = Threads > 1 ? 2 * Threads * CHUNK : CHUNK;
     const unsigned strands = sam && sam->Reverse ? 2 : 1;  // searched copies of each read
-    Batch_Chooser chooser;  // B = 0: --batch auto
+#ifdef BATMAN_BATCH_STATS
+    Batch_Stats_Counts* const mainBatch = &Batch_Stats;
+    Decode_Stats_Counts* const mainDecode = &Decode_Stats;
+    Chain_Stats_Counts* const mainChain = &Chain_Stats;
+    std::mutex statsMutex;
+    auto atExit = [&] {
+        std::lock_guard<std::mutex> Lock(statsMutex);
+        mainBatch->Add(Batch_Stats);
+        mainDecode->Add(Decode_Stats);
+        mainChain->Add(Chain_Stats);
+    };
+#else
+    auto atExit = [] {};
+#endif
+    Thread_Pool pool(Threads, atExit);
+    std::vector<Batch_Chooser> choosers(Threads);  // B = 0: --batch auto
     std::vector<std::string> ids(BLOCK);
     std::vector<std::string> seqs(sam ? BLOCK : 0), quals(sam ? BLOCK : 0);  // SAM/BAM: the reads as given
     std::vector<unsigned char> searched(BLOCK);  // valid read of the right length
@@ -2836,20 +2965,26 @@ bool Run_Batched(std::ifstream& in, std::ostream& out, unsigned B, int maxMismat
     std::vector<unsigned char> found(strands * BLOCK);
     std::vector<ForwardResults> results(MM_LISTS * strands * BLOCK);  // -n 1 to 5: each read's result lists
     std::vector<unsigned long> readHits(strands * BLOCK);
-    // SAM/BAM: each read's hits in output order, and the SA rows decoded for them.
+    // SAM/BAM: each read's hits in output order, and the SA rows decoded for them (in its
+    // thread's part).
     std::vector<std::vector<Sam_Candidate>> candidates(sam ? BLOCK : 0);
     std::vector<std::size_t> decodeBegin(sam ? BLOCK : 0), decodeCount(sam ? BLOCK : 0);
-    std::vector<Sa_Request> decodeRequests;
-    std::vector<const Sam_Candidate*> origins;  // the current read's requests' candidates
-    std::vector<unsigned> decoded;
-    std::vector<unsigned char> decodeDone;      // decoded by Chain_Requests already
+    struct Part {  // a thread's part of the block's output
+        std::vector<Sa_Request> decodeRequests;
+        std::vector<const Sam_Candidate*> origins;  // the current read's requests' candidates
+        std::vector<unsigned> decoded;
+        std::vector<unsigned char> decodeDone;      // decoded by Chain_Requests already
+        std::string lines;
+        uint64_t hits = 0;
+    };
+    std::vector<Part> parts(Threads);
 #ifdef SA_CHAIN
     constexpr bool useChain = true;
 #else
     constexpr bool useChain = false;
 #endif
     std::string reads;  // codes of the searched reads, back to back
-    std::string seq, lines;
+    std::string seq;
     bool initialized = false, more = true;
     while (more) {
         unsigned n = 0, count = 0;
@@ -2899,9 +3034,10 @@ bool Run_Batched(std::ifstream& in, std::ostream& out, unsigned B, int maxMismat
                     reads[half + r * STRINGLENGTH + i] = static_cast<char>(3 - reads[r * STRINGLENGTH + STRINGLENGTH - 1 - i]);
         }
         // The block's search: the -n k program (both strands of a read in one lane, zig-zag)
-        // or the exact search (each strand a read).
+        // or the exact search (each strand a read), in chunks (one with a single thread).
         const bool zigZag = oneMismatch && strands == 2;
         const unsigned units = zigZag ? count : strands * count;
+        const unsigned chunk = Threads > 1 ? CHUNK : std::max(units, 1U);
         auto Search_Range = [&](unsigned First, unsigned Last, unsigned Lanes) {
             if (oneMismatch)
                 Batch_Search(reads.data(), units, STRINGLENGTH, Lanes, maxHits,
@@ -2911,95 +3047,123 @@ bool Run_Batched(std::ifstream& in, std::ostream& out, unsigned B, int maxMismat
                 Batch_Search(reads.data(), units, STRINGLENGTH, Lanes, 0, Program_Of(0), nullptr, nullptr, &ranges, &found,
                              false, First, Last);
         };
-        if (B) Search_Range(0, units, B);
-        else chooser.Run(units, Search_Range);
+        std::atomic<unsigned> nextChunk{0};
+        pool.Run([&](unsigned t) {
+            for (unsigned first; (first = nextChunk.fetch_add(chunk)) < units;) {
+                const unsigned last = std::min(units, first + chunk);
+                if (B) Search_Range(first, last, B);
+                else choosers[t].Run(first, last, Search_Range);
+            }
+        });
         searchSeconds += std::chrono::duration<double>(Clock::now() - searchStart).count();
 
+        // Thread t's part of the block: records [Part_Begin(t), Part_Begin(t + 1)).
+        auto Part_Begin = [&](unsigned t) { return static_cast<unsigned>(uint64_t(n) * t / Threads); };
+        const auto outputStart = Clock::now();
         if (sam) {
             // Each read's hits in output order, the rows to decode for them (Sam_Requests),
-            // all decoded together (Sa_Decode), then the records.
-            const auto outputStart = Clock::now();
-            decodeRequests.clear();
-            decodeDone.clear();
-            std::size_t values = 0;
-            for (unsigned j = 0; j < n; j++) {
-                candidates[j].clear();
-                if (!searched[j]) continue;
-                if (oneMismatch) {
-                    const ForwardResults* res[2] = {nullptr, nullptr};
-                    const Hit_Stage* stages[2] = {Stages_Of(maxMismatches), Stages_Of(maxMismatches)};
-                    for (unsigned s = 0; s < strands; s++) res[s] = &results[MM_LISTS * (s * count + slot[j])];
-                    Sam_Candidates(res, stages, candidates[j]);
-                } else {
-                    for (unsigned s = 0; s < strands; s++) {
-                        const std::size_t at = s * count + slot[j];
-                        if (found[at] && ranges[at].Start) candidates[j].push_back({0, static_cast<int>(s), &ranges[at], false});
+            // all of the part's decoded together (Sa_Decode), then the records.
+            pool.Run([&](unsigned t) {
+                Part& p = parts[t];
+                p.decodeRequests.clear();
+                p.decodeDone.clear();
+                std::size_t values = 0;
+                for (unsigned j = Part_Begin(t); j < Part_Begin(t + 1); j++) {
+                    candidates[j].clear();
+                    if (!searched[j]) continue;
+                    if (oneMismatch) {
+                        const ForwardResults* res[2] = {nullptr, nullptr};
+                        const Hit_Stage* stages[2] = {Stages_Of(maxMismatches), Stages_Of(maxMismatches)};
+                        for (unsigned s = 0; s < strands; s++) res[s] = &results[MM_LISTS * (s * count + slot[j])];
+                        Sam_Candidates(res, stages, candidates[j]);
+                    } else {
+                        for (unsigned s = 0; s < strands; s++) {
+                            const std::size_t at = s * count + slot[j];
+                            if (found[at] && ranges[at].Start) candidates[j].push_back({0, static_cast<int>(s), &ranges[at], false});
+                        }
                     }
+                    decodeBegin[j] = values;
+                    const std::size_t first = p.decodeRequests.size();
+                    p.origins.clear();
+                    decodeCount[j] = Sam_Requests(candidates[j], maxHits, values, p.decodeRequests, p.origins);
+                    values += decodeCount[j];
+                    p.decoded.resize(values);
+                    p.decodeDone.resize(values, 0);
+                    if (useChain)
+                        Chain_Requests(p.decodeRequests, first, p.origins,
+                                       std::string_view(reads.data() + static_cast<std::size_t>(slot[j]) * STRINGLENGTH, STRINGLENGTH),
+                                       p.decoded, p.decodeDone);
                 }
-                decodeBegin[j] = values;
-                const std::size_t first = decodeRequests.size();
-                origins.clear();
-                decodeCount[j] = Sam_Requests(candidates[j], maxHits, values, decodeRequests, origins);
-                values += decodeCount[j];
-                decoded.resize(values);
-                decodeDone.resize(values, 0);
-                if (useChain)
-                    Chain_Requests(decodeRequests, first, origins,
-                                   std::string_view(reads.data() + static_cast<std::size_t>(slot[j]) * STRINGLENGTH, STRINGLENGTH),
-                                   decoded, decodeDone);
-            }
-            decoded.resize(values);
-            Sa_Decode(decodeRequests, decoded);
+                p.decoded.resize(values);
+                Sa_Decode(p.decodeRequests, p.decoded);
+            });
 #ifdef BATMAN_BATCH_STATS
             Decode_Stats.Seconds += std::chrono::duration<double>(Clock::now() - outputStart).count();
 #endif
-            for (unsigned j = 0; j < n; j++) {
-                if (!searched[j]) {
-                    if (sam->Write) sam->Writer.Write_Unmapped(ids[j].substr(0, ids[j].find_first_of(" \t")), seqs[j], quals[j]);
-                    continue;
+            for (unsigned t = 0; t < Threads; t++)
+                for (unsigned j = Part_Begin(t); j < Part_Begin(t + 1); j++) {
+                    if (!searched[j]) {
+                        if (sam->Write) sam->Writer.Write_Unmapped(ids[j].substr(0, ids[j].find_first_of(" \t")), seqs[j], quals[j]);
+                        continue;
+                    }
+                    reportedHits += Write_Sam_Read(*sam, ids[j], seqs[j], quals[j],
+                                                   std::string_view(reads.data() + static_cast<std::size_t>(slot[j]) * STRINGLENGTH, STRINGLENGTH),
+                                                   candidates[j], maxHits, parts[t].decoded.data() + decodeBegin[j], decodeCount[j]);
                 }
-                reportedHits += Write_Sam_Read(*sam, ids[j], seqs[j], quals[j],
-                                               std::string_view(reads.data() + static_cast<std::size_t>(slot[j]) * STRINGLENGTH, STRINGLENGTH),
-                                               candidates[j], maxHits, decoded.data() + decodeBegin[j], decodeCount[j]);
-            }
             outputSeconds += std::chrono::duration<double>(Clock::now() - outputStart).count();
             continue;
         }
 
-        const auto outputStart = Clock::now();
-        lines.clear();
-        for (unsigned j = 0; j < n && oneMismatch; j++) {
-            unsigned long hits = 0;
-            if (searched[j]) {
-                const ForwardResults* r = &results[MM_LISTS * static_cast<std::size_t>(slot[j])];
-                const std::size_t at = lines.size();
-                hits = Format_Hits(ids[j], r, Stages_Of(maxMismatches), readHits[slot[j]], maxHits, lines);
-                if (quiet) lines.resize(at);
+        pool.Run([&](unsigned t) {
+            std::string& lines = parts[t].lines;
+            uint64_t& partHits = parts[t].hits;
+            lines.clear();
+            partHits = 0;
+            for (unsigned j = Part_Begin(t); j < Part_Begin(t + 1) && oneMismatch; j++) {
+                unsigned long hits = 0;
+                if (searched[j]) {
+                    const ForwardResults* r = &results[MM_LISTS * static_cast<std::size_t>(slot[j])];
+                    const std::size_t at = lines.size();
+                    hits = Format_Hits(ids[j], r, Stages_Of(maxMismatches), readHits[slot[j]], maxHits, lines);
+                    if (quiet) lines.resize(at);
+                }
+                partHits += hits;
+                if (!hits && !quiet) lines += ids[j] + "\tF\t0\t0\t0\n";
             }
-            reportedHits += hits;
-            if (!hits && !quiet) lines += ids[j] + "\tF\t0\t0\t0\n";
-        }
-        for (unsigned j = 0; j < n && !oneMismatch; j++) {
-            const SARange& range = ranges[slot[j]];
-            if (!searched[j] || !found[slot[j]] || range.Start == 0) {
-                if (!quiet) lines += ids[j] + "\tF\t0\t0\t0\n";
-                continue;
+            for (unsigned j = Part_Begin(t); j < Part_Begin(t + 1) && !oneMismatch; j++) {
+                const SARange& range = ranges[slot[j]];
+                if (!searched[j] || !found[slot[j]] || range.Start == 0) {
+                    if (!quiet) lines += ids[j] + "\tF\t0\t0\t0\n";
+                    continue;
+                }
+                unsigned long hitCount = range.Skip ? 1UL : (range.End >= range.Start ? (range.End - range.Start + 1UL) : 0UL);
+                if (maxHits > 0 && hitCount > maxHits) hitCount = maxHits;
+                partHits += hitCount;
+                if (!quiet) lines += ids[j] + Hit_Text(range, "F") + "\t" + std::to_string(hitCount) + "\n";
             }
-            unsigned long hitCount = range.Skip ? 1UL : (range.End >= range.Start ? (range.End - range.Start + 1UL) : 0UL);
-            if (maxHits > 0 && hitCount > maxHits) hitCount = maxHits;
-            reportedHits += hitCount;
-            if (!quiet) lines += ids[j] + Hit_Text(range, "F") + "\t" + std::to_string(hitCount) + "\n";
+        });
+        for (const Part& p : parts) {
+            reportedHits += p.hits;
+            if (!quiet) out << p.lines;
         }
-        if (!quiet) out << lines;
         outputSeconds += std::chrono::duration<double>(Clock::now() - outputStart).count();
     }
-    Batch_Report = B ? "batch=" + std::to_string(B) : chooser.Report;
+    if (B) {
+        Batch_Report = "batch=" + std::to_string(B);
+    } else if (Threads == 1) {
+        Batch_Report = choosers[0].Report;
+    } else {  // each thread's choice
+        Batch_Report = "batch=auto:[";
+        for (unsigned t = 0; t < Threads; t++)
+            Batch_Report += (t ? "," : "") + (choosers[t].Chosen ? std::to_string(choosers[t].Chosen) : std::string("-"));
+        Batch_Report += "]";
+    }
     return true;
 }
 
 void Usage(const char* prog) {
     std::fprintf(stderr,
-    "Usage: %s -q <reads.fa/fq> -g <genome_prefix> [-n <0|1|2|3|4|5>] [-o <hits.txt>] [-m <maxhits>] [--no-ref] [--lookup <k>] [--batch <B|auto>] [--sam|--bam] [--forward-only] [--quiet|-Q] [--timing]\n"
+    "Usage: %s -q <reads.fa/fq> -g <genome_prefix> [-n <0|1|2|3|4|5>] [-o <hits.txt>] [-m <maxhits>] [--no-ref] [--lookup <k>] [--batch <B|auto>] [-t <threads>] [--sam|--bam] [--forward-only] [--quiet|-Q] [--timing]\n"
         "  -n  maximum mismatches, 0-3 (default 0); 1 to 3 also need the forward index\n"
         "      <genome_prefix>.bwt/.fmv\n"
         "  -m  maximum hits per read (default 1, 0 = all)\n"
@@ -3016,6 +3180,8 @@ void Usage(const char* prog) {
         "  --batch   search B reads at a time, 1-64, so that their memory accesses\n"
         "            overlap; auto (default) times a few B on the first reads and keeps\n"
         "            the fastest (see benchmark/batched_reads.md)\n"
+        "  -t, --threads  search with N threads (default 1, 0 = all CPUs); the output\n"
+        "            does not depend on N (see benchmark/threads.md)\n"
         "Output, one line per SA range or located hit:\n"
         "  exact:      query_id\tF\tSA_start\tSA_end\thit_count\n"
         "  1 or 2 mismatches: query_id\tF|B\tSA_start\tSA_end\thit_count\t1|2\n"
@@ -3037,6 +3203,7 @@ int main(int argc, char** argv) {
     bool timing = false;
     bool useRef = true;
     int batchSize = 0;  // --batch auto
+    int threads = 1;    // -t; 0: all CPUs
     int samFormat = 0;  // 1 SAM, 2 BAM (--sam / --bam, or the -o extension)
     bool forwardOnly = false;
 
@@ -3078,6 +3245,13 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "--batch must be auto or 1-%u\n", MAX_BATCH);
                 return 1;
             }
+        } else if ((std::strcmp(argv[i], "-t") == 0 || std::strcmp(argv[i], "--threads") == 0) && i + 1 < argc) {
+            threads = std::atoi(argv[++i]);
+            if (threads < 0 || threads > 1024) {
+                std::fprintf(stderr, "-t must be 0-1024\n");
+                return 1;
+            }
+            if (threads == 0) threads = static_cast<int>(std::max(1U, std::thread::hardware_concurrency()));
         } else if (std::strcmp(argv[i], "--lookup") == 0 && i + 1 < argc) {
             LOOKUP_DEPTH = std::atoi(argv[++i]);
             if (LOOKUP_DEPTH < 3 || LOOKUP_DEPTH > 14) {
@@ -3179,7 +3353,7 @@ int main(int argc, char** argv) {
         std::string error, commandLine = argv[0];
         for (int i = 1; i < argc; i++) commandLine += std::string(" ") + argv[i];
         if (!sam.Map.Load(genomePrefix, error) ||
-            (!quiet && !sam.Writer.Open(outputFile.empty() ? "-" : outputFile, samFormat == 2, sam.Map, commandLine, error))) {
+            (!quiet && !sam.Writer.Open(outputFile.empty() ? "-" : outputFile, samFormat == 2, sam.Map, commandLine, error, threads))) {
             std::fprintf(stderr, "%s\n", error.c_str());
             return 1;
         }
@@ -3213,7 +3387,7 @@ int main(int argc, char** argv) {
     uint64_t records = 0;
     uint64_t reportedHits = 0;
 
-    if (!Run_Batched(in, *out, batchSize, maxMismatches, maxHits, quiet, records, reportedHits, tableBuildSeconds,
+    if (!Run_Batched(in, *out, batchSize, threads, maxMismatches, maxHits, quiet, records, reportedHits, tableBuildSeconds,
                      inputParseSeconds, searchSeconds, outputSeconds, samFormat ? &sam : nullptr)) {
         return 1;
     }

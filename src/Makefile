@@ -4,7 +4,7 @@
 # Native build variant via DEFS: DEFS=-DBATMAN_ZERO_MIN_USE_PAIRED_RANK
 
 CXX ?= g++
-CXXFLAGS ?= -O3 -funroll-loops -mpopcnt
+CXXFLAGS ?= -O3 -funroll-loops -mpopcnt -pthread
 DEFS ?=
 BINDIR ?= ../bin
 
@@ -25,6 +25,12 @@ batman_zero_min.o: batman_zero_min.cpp genome_map.hpp sam_writer.hpp
 
 batman_zero_min: batman_zero_min.o $(FMINDEX_LIB) $(HTSLIB)
 	$(CXX) -std=c++17 $(CXXFLAGS) -o $@ batman_zero_min.o $(FMINDEX_LIB) $(HTSLIB) $(HTSLIB_LIBS)
+
+# The same with 16-read chunks, so that the tests' few reads span several blocks,
+# chunks and threads (-t).
+batman_zero_min_chunk16: batman_zero_min.cpp genome_map.hpp sam_writer.hpp $(FMINDEX_LIB) $(HTSLIB)
+	$(CXX) -std=c++17 -fpermissive -I$(INDEX_DIR) -I$(HTSLIB_DIR) $(CXXFLAGS) $(DEFS) -DBATMAN_BATCH_BLOCK=16 -o $@ $< \
+	    $(FMINDEX_LIB) $(HTSLIB) $(HTSLIB_LIBS)
 
 # Old name for batman_zero_min
 batman_zero_min_fmindex: batman_zero_min
@@ -51,7 +57,7 @@ test-structured: batman_zero_min batman_zero_structured test_exact_search_interv
 test_located_hits: ../tests/test_located_hits.cpp batman_zero_min.cpp genome_map.hpp sam_writer.hpp $(FMINDEX_LIB) $(HTSLIB)
 	$(CXX) -std=c++17 -fpermissive -I. -I$(INDEX_DIR) -I$(HTSLIB_DIR) $(CXXFLAGS) $(DEFS) -o $@ $< $(FMINDEX_LIB) $(HTSLIB) $(HTSLIB_LIBS)
 
-test-located: batman_zero_min test_located_hits
+test-located: batman_zero_min batman_zero_min_chunk16 test_located_hits
 	$(MAKE) -C $(INDEX_DIR) bwt_build_index
 	../tests/test_located_hits.sh . $(INDEX_DIR)/bwt_build_index ./test_located_hits
 
@@ -68,7 +74,7 @@ bench_sa_decode: ../tests/bench_sa_decode.cpp batman_zero_min.cpp genome_map.hpp
 test_chain_decode: ../tests/test_chain_decode.cpp batman_zero_min.cpp genome_map.hpp sam_writer.hpp $(FMINDEX_LIB) $(HTSLIB)
 	$(CXX) -std=c++17 -fpermissive -I. -I$(INDEX_DIR) -I$(HTSLIB_DIR) $(CXXFLAGS) $(DEFS) -DBATMAN_BATCH_STATS -o $@ $< $(FMINDEX_LIB) $(HTSLIB) $(HTSLIB_LIBS)
 
-test-sam: batman_zero_min test_genome_map test_sa_decode test_chain_decode
+test-sam: batman_zero_min batman_zero_min_chunk16 test_genome_map test_sa_decode test_chain_decode
 	$(MAKE) -C $(INDEX_DIR) bwt_build_index
 	$(MAKE) -C $(HTSLIB_DIR) test/test_view
 	../tests/test_sam_output.sh . $(INDEX_DIR)/bwt_build_index ./test_genome_map $(HTSLIB_DIR)/test/test_view \
@@ -97,6 +103,7 @@ clean:
 	rm -f batman_zero_min.o batman_zero_min_bwa.o batman_zero_min batman_zero_min_bwa \
 	      batman_zero_min_spot.o batman_zero_min_spot batman_zero_structured.o \
 	      exact_search.o batman_zero_structured test_exact_search_intervals.o \
-	      test_exact_search_intervals test_located_hits test_genome_map test_sa_decode test_chain_decode bench_sa_decode
+	      test_exact_search_intervals test_located_hits test_genome_map test_sa_decode test_chain_decode bench_sa_decode \
+	      batman_zero_min_chunk16
 
 FORCE:
