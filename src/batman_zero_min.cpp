@@ -35,6 +35,8 @@ extern "C" {
 #include "genome_map.hpp"
 #include "sam_writer.hpp"
 
+#include <zlib.h>
+
 namespace {
 
 constexpr int MAXTAG = 4096;
@@ -2128,23 +2130,87 @@ std::string Hit_Text(const SARange& hit, const char* dir) {
     return std::string("\t") + dir + "\t" + std::to_string(hit.Start) + "\t" + std::to_string(hit.Skip ? hit.Start : hit.End);
 }
 
+// The reads file, plain or gzip-compressed (zlib reads either; "-" is stdin), line by
+// line through a buffer of its own.
+class Read_File {
+public:
+    explicit Read_File(const std::string& Path)
+        : File(Path == "-" ? gzdopen(fileno(stdin), "rb") : gzopen(Path.c_str(), "rb")), Buffer(1 << 20) {
+        if (File) gzbuffer(File, 1 << 20);
+    }
+    ~Read_File() {
+        if (File) gzclose(File);
+    }
+    Read_File(const Read_File&) = delete;
+    Read_File& operator=(const Read_File&) = delete;
+
+    bool Is_Open() const { return File != nullptr; }
+    // A read error or corrupt compressed data ended the input early.
+    bool Failed() const { return Error; }
+
+    // The next line, without its '\n' (as std::getline); false at the end.
+    bool Get_Line(std::string& Line) {
+        if (Has_Pending) {
+            Line.swap(Pending);
+            Has_Pending = false;
+            return true;
+        }
+        Line.clear();
+        for (;;) {
+            if (Pos == End && !Fill()) return !Line.empty();
+            const char* Start = Buffer.data() + Pos;
+            const char* Newline = static_cast<const char*>(std::memchr(Start, '\n', End - Pos));
+            if (Newline) {
+                Line.append(Start, Newline);
+                Pos += Newline - Start + 1;
+                return true;
+            }
+            Line.append(Start, End - Pos);
+            Pos = End;
+        }
+    }
+    // Line is returned again by the next Get_Line.
+    void Unget_Line(std::string& Line) {
+        Pending.swap(Line);
+        Has_Pending = true;
+    }
+
+private:
+    bool Fill() {
+        if (!File) return false;
+        const int N = gzread(File, Buffer.data(), static_cast<unsigned>(Buffer.size()));
+        int Status = Z_OK;
+        if (N <= 0) gzerror(File, &Status);  // Z_BUF_ERROR: the compressed data ended early
+        if (N < 0 || Status != Z_OK) Error = true;
+        Pos = 0;
+        End = N > 0 ? static_cast<std::size_t>(N) : 0;
+        return End > 0;
+    }
+
+    gzFile File;
+    std::vector<char> Buffer;
+    std::size_t Pos = 0, End = 0;
+    std::string Pending;
+    bool Has_Pending = false, Error = false;
+};
+
 // The next FASTA or FASTQ record; with qual, also its quality line (empty for FASTA).
-bool ReadNextRecord(std::ifstream& in, std::string& id, std::string& seq, std::string* qual = nullptr) {
+bool ReadNextRecord(Read_File& in, std::string& id, std::string& seq, std::string* qual = nullptr) {
     std::string line;
-    while (std::getline(in, line)) {
+    while (in.Get_Line(line)) {
         if (line.empty()) {
             continue;
         }
 
         if (line[0] == '@') {
             id = line.substr(1);
-            if (!std::getline(in, seq)) {
+            if (!in.Get_Line(seq)) {
                 return false;
             }
-            if (!std::getline(in, line)) {
+            if (!in.Get_Line(line)) {
                 return false;
             }
-            if (!std::getline(in, qual ? *qual : line)) {
+            if (!in.Get_Line(qual ? *qual : line)) {
                 return false;
             }
             return true;
@@ -2154,14 +2220,9 @@ bool ReadNextRecord(std::ifstream& in, std::string& id, std::string& seq, std::s
             id = line.substr(1);
             seq.clear();
             if (qual) qual->clear();
-            std::streampos pos;
-            while (true) {
-                pos = in.tellg();
-                if (!std::getline(in, line)) {
-                    break;
-                }
+            while (in.Get_Line(line)) {
                 if (!line.empty() && (line[0] == '>' || line[0] == '@')) {
-                    in.seekg(pos);
+                    in.Unget_Line(line);
                     break;
                 }
                 seq += line;
@@ -2938,7 +2999,7 @@ struct Input_Block {
 // returned before stays valid until it is called again.
 class Block_Reader {
 public:
-    Block_Reader(std::ifstream& In, unsigned Size, bool Qual, bool Ahead) : In(In), Qual(Qual) {
+    Block_Reader(Read_File& In, unsigned Size, bool Qual, bool Ahead) : In(In), Qual(Qual) {
         for (Input_Block& B : Blocks) {
             B.Ids.resize(Size);
             B.Seqs.resize(Size);
@@ -2996,7 +3057,7 @@ private:
         }
     }
 
-    std::ifstream& In;
+    Read_File& In;
     const bool Qual;
     Input_Block Blocks[2];
     std::thread Thread;
@@ -3024,7 +3085,7 @@ private:
 // inputSeconds otherwise).
 std::string Batch_Report;  // the lanes used, for --timing (Run_Batched)
 
-bool Run_Batched(std::ifstream& in, std::ostream& out, unsigned B, unsigned Threads, int maxMismatches,
+bool Run_Batched(Read_File& in, std::ostream& out, unsigned B, unsigned Threads, int maxMismatches,
                  unsigned maxHits, bool quiet, uint64_t& records, uint64_t& reportedHits, double& tableBuildSeconds,
                  double& inputSeconds, double& readSeconds, double& searchSeconds, double& outputSeconds,
                  Sam_Output* sam = nullptr) {
@@ -3275,8 +3336,9 @@ bool Run_Batched(std::ifstream& in, std::ostream& out, unsigned B, unsigned Thre
 
 void Usage(const char* prog) {
     std::fprintf(stderr,
-    "Usage: %s -q <reads.fa/fq> -g <genome_prefix> [-n <0|1|2|3|4|5>] [-o <hits.txt>] [-m <maxhits>] [--no-ref] [--lookup <k>] [--batch <B|auto>] [-t <threads>] [--sam|--bam] [--forward-only] [--quiet|-Q] [--timing]\n"
-        "  -n  maximum mismatches, 0-3 (default 0); 1 to 3 also need the forward index\n"
+    "Usage: %s -q <reads.fa/fq[.gz]> -g <genome_prefix> [-n <0|1|2|3|4|5>] [-o <hits.txt>] [-m <maxhits>] [--no-ref] [--lookup <k>] [--batch <B|auto>] [-t <threads>] [--sam|--bam] [--forward-only] [--quiet|-Q] [--timing]\n"
+        "  -q  the reads: FASTA or FASTQ, plain or gzip-compressed (- for stdin)\n"
+        "  -n  maximum mismatches, 0-5 (default 0); 1 to 5 also need the forward index\n"
         "      <genome_prefix>.bwt/.fmv\n"
         "  -m  maximum hits per read (default 1, 0 = all)\n"
         "  --no-ref  do not load the SA samples (.sa) and packed genome (.pac); single-row\n"
@@ -3480,8 +3542,8 @@ int main(int argc, char** argv) {
     }
     indexLoadSeconds = std::chrono::duration<double>(Clock::now() - loadStart).count();
 
-    std::ifstream in(queryFile.c_str());
-    if (!in) {
+    Read_File in(queryFile);
+    if (!in.Is_Open()) {
         std::fprintf(stderr, "Cannot open query file: %s\n", queryFile.c_str());
         return 1;
     }
@@ -3502,6 +3564,10 @@ int main(int argc, char** argv) {
 
     if (!Run_Batched(in, *out, batchSize, threads, maxMismatches, maxHits, quiet, records, reportedHits, tableBuildSeconds,
                      inputParseSeconds, inputReadSeconds, searchSeconds, outputSeconds, samFormat ? &sam : nullptr)) {
+        return 1;
+    }
+    if (in.Failed()) {
+        std::fprintf(stderr, "Error reading %s (corrupt or truncated compressed data?)\n", queryFile.c_str());
         return 1;
     }
 
