@@ -41,6 +41,7 @@ namespace {
 
 constexpr int MAXTAG = 4096;
 constexpr int MAX_MISMATCHES_BOUND = 16;
+constexpr int MAX_MISMATCH_SEARCH = 7;  // -n up to this (Mm_Builder)
 constexpr int SAINTERVAL = 8;
 // Ranges with End-Start below this count their BWT characters directly (Count_Range)
 // instead of a second stored-count lookup. Counting is faster up to ~256 rows (cold) and
@@ -87,7 +88,7 @@ struct ForwardResults {
     unsigned long hitCount = 0;       // locations in hits
 };
 
-// Each read's result lists for -n 1 to 3 (Res[RL_LISTS]). The stages run in output
+// Each read's result lists for -n 1 to 7 (Res[RL_LISTS]). The stages run in output
 // order and add their hits to RL_HITS; End_Stage tags each with its stage, and keeps
 // the stage's rejects (collected in RL_HITS.mismatches) as its chain's latest round,
 // so each chain of resumed rejects holds one round, whatever the mismatch count.
@@ -95,11 +96,12 @@ enum Result_List : unsigned {
     RL_EXACT,              // 0|0 hits; its rejects are the forward chain's first round
     RL_HITS,               // every mismatch hit, in stage order; the running stage's rejects
     RL_FWD,                // the chains' latest rejects, one list each (Mm_Builder): 0|k,
-    RL_BWD,                // k|0, then the seed families' in order (1|k, k|1, 2|k for -n 5)
-    RL_CHAINS_END = RL_FWD + 5,
+    RL_BWD,                // k|0, then the seed families' in order (1|k, k|1, 2|k, k|2, 3|k for -n 7)
+    RL_CHAINS_END = RL_FWD + 7,
     RL_SEED_1 = RL_CHAINS_END,  // the running stage's seeds: in the crossing's index,
-    RL_SEED_2,                  // switched to it, and (2-mismatch seeds, case C3) before
-    RL_SEED_3,                  // the switch
+    RL_SEED_2,                  // switched to it, and (2- and 3-mismatch seeds extended in
+    RL_SEED_3,                  // two steps) before the switch
+    RL_SEED_4,
     RL_LISTS,
     RL_NONE = 0xFF         // End_Stage: drop the rejects
 };
@@ -123,7 +125,7 @@ inline void End_Stage(ForwardResults* Res, std::size_t& Tagged, int Stage, unsig
     std::vector<SARange>& Rejects = Res[RL_HITS].mismatches;
     if (Keep != RL_NONE) Res[Keep].mismatches.swap(Rejects);
     Rejects.clear();
-    for (unsigned k : {RL_SEED_1, RL_SEED_2, RL_SEED_3}) {
+    for (unsigned k : {RL_SEED_1, RL_SEED_2, RL_SEED_3, RL_SEED_4}) {
         Res[k].hits.clear();
         Res[k].mismatches.clear();
         Res[k].hitCount = 0;
@@ -860,7 +862,7 @@ struct Mm_Step {
     unsigned char Stored;     // OP_SEARCH / OP_SEARCH_KEEP: 1 + the slot of the kept range (0: none)
     unsigned char Strand;     // two-strand programs (Zig_Zag): 0 the read, 1 its reverse complement
 };
-constexpr unsigned MM_PROGRAM_MAX = 224;  // longest program (-n 5 zig-zag), for the stats
+constexpr unsigned MM_PROGRAM_MAX = 320;  // longest program (-n 7 zig-zag: 307 steps), for the stats
 constexpr unsigned MM_LISTS = RL_LISTS;  // each read's lists (Result_List)
 
 // The mismatch programs, built by one rule (benchmark/five_mismatch.md). A hit splits as
@@ -1059,6 +1061,10 @@ class Mm_Builder {
             Add({OP_EXTEND, !D, Q_Out, 0, RL_SEED_2, 0, false, false, W_Out});
             return;
         }
+        if (S == 3) {
+            Three_Seeds(D, Slot, Seg, Q_Out, Q_In);
+            return;
+        }
         if (S != 2) {
             std::fprintf(stderr, "-n %d needs seeds with %d mismatches in a half (not built)\n", K, S);
             std::exit(1);
@@ -1080,13 +1086,50 @@ class Mm_Builder {
         Add({OP_EXTEND, D, H_In, 0, RL_SEED_3, 0, false, false, W_H_In});
         Add({OP_CROSS, !D, H_Out, 0, RL_SEED_2, RL_SEED_3, false, true, W_H_Out, Seg(1, 3, 1, 1)});
     }
+
+    // Seeds with exactly 3 mismatches in a half: the -n 3 search on it, by its quarters
+    // (Q_out, Q_in) and eighths E1 = [0, 1/4), E2 = [1/4, 1/2), E3 = [1/2, 3/4), E4 = [3/4, 1),
+    // from its outer end; p is the outer mismatch, r the inner one:
+    //   (0, 3) in (Q_out, Q_in): Q_out exact (the half scan's), extended inward over Q_in;
+    //   (3, 0): Q_in exact, extended outward over Q_out;
+    //   (1, 2), p in E2: E1 exact, extended inward over [1/4, 1);
+    //   (1, 2), p in E1: E2 exact, extended outward over E1, switched and extended inward
+    //           over Q_in;
+    //   (2, 1), r in E3: E4 exact, extended outward over [0, 3/4);
+    //   (2, 1), r in E4: E3 exact, extended inward over E4, switched and extended outward
+    //           over Q_out.
+    // The smallest seed is an eighth of the half: three mismatches at its quarter points
+    // leave no longer exact part (benchmark/seven_mismatch.md).
+    template <class Seg_Of>
+    void Three_Seeds(bool D, unsigned char Slot, Seg_Of& Seg, unsigned char Q_Out, unsigned char Q_In) {
+        const unsigned char E1 = Seg(0, 1, 1, 4), E2 = Seg(1, 4, 1, 2), E3 = Seg(1, 2, 3, 4), E4 = Seg(3, 4, 1, 1);
+        const unsigned char W_03 = Windows({{Q_In, 3, WIN_AFTER_SEED}}), W_30 = Windows({{Q_Out, 3, WIN_FREE}}),
+                            W_12a = Windows({{E2, 1, WIN_NARROW}, {Q_In, 2, WIN_FREE}}),
+                            W_E1 = Windows({{E1, 1, WIN_NARROW}}), W_Q_In2 = Windows({{Q_In, 2, WIN_FREE}}),
+                            W_21a = Windows({{Q_Out, 2, WIN_FREE}, {E3, 1, WIN_FREE}}),
+                            W_E4 = Windows({{E4, 1, WIN_FREE}}), W_Q_Out2 = Windows({{Q_Out, 2, WIN_FREE}});
+        Add({OP_SEARCH, D, Q_Out, 0, 0, 0, false, false, W_03, 0, Slot});  // (0, 3)
+        Add({OP_EXTEND, D, Q_In, 0, RL_SEED_1, 0, false, false, W_03});
+        Add({OP_SEARCH, !D, Q_In});  // (3, 0)
+        Add({OP_EXTEND, !D, Q_Out, 0, RL_SEED_2, 0, false, false, W_30});
+        Add({OP_SEARCH, D, E1, 0, 0, 0, false, false, W_12a});  // (1, 2), p in E2
+        Add({OP_EXTEND, D, Seg(1, 4, 1, 1), 0, RL_SEED_1, 0, false, false, W_12a});
+        Add({OP_SEARCH, !D, E2, 0, 0, 0, false, false, W_E1});  // (1, 2), p in E1
+        Add({OP_EXTEND, !D, E1, 0, RL_SEED_3, 0, false, false, W_E1});
+        Add({OP_CROSS, D, Q_In, 0, RL_SEED_1, RL_SEED_3, false, true, W_Q_In2, Q_Out});
+        Add({OP_SEARCH, !D, E4, 0, 0, 0, false, false, W_21a});  // (2, 1), r in E3
+        Add({OP_EXTEND, !D, Seg(0, 1, 3, 4), 0, RL_SEED_2, 0, false, false, W_21a});
+        Add({OP_SEARCH, D, E3});  // (2, 1), r in E4
+        Add({OP_EXTEND, D, E4, 0, RL_SEED_4, 0, false, false, W_E4});
+        Add({OP_CROSS, !D, Q_Out, 0, RL_SEED_2, RL_SEED_4, false, true, W_Q_Out2, Q_In});
+    }
 };
 
-// The program and stage table of -n K (0 to 5), built on first use (thread-safe).
+// The program and stage table of -n K (0 to MAX_MISMATCH_SEARCH), built on first use (thread-safe).
 const Mm_Program& Program_For(int K) {
     static const std::vector<Mm_Program> Programs = [] {  // built once, before any thread reads them
         std::vector<Mm_Program> P;
-        for (int k = 0; k <= 5; k++) P.push_back(Mm_Builder(k).Build());
+        for (int k = 0; k <= MAX_MISMATCH_SEARCH; k++) P.push_back(Mm_Builder(k).Build());
         return P;
     }();
     return Programs[K];
@@ -2048,12 +2091,15 @@ std::vector<Mm_Step> Zig_Zag(const Mm_Step* P) {
     return Out;
 }
 
-// -n 1 to 5 on both strands of each read (Zig_Zag): Reads holds 2 * Count reads, read
+// -n 1 to 7 on both strands of each read (Zig_Zag): Reads holds 2 * Count reads, read
 // Count + i the reverse complement of read i; Res and ReadHits are indexed the same way.
-// The zig-zag program of -n K (1 to 5).
+// The zig-zag program of -n K (1 to MAX_MISMATCH_SEARCH).
 const Mm_Step* Zig_Zag_Program(int K) {
-    static const std::vector<Mm_Step> Programs[5] = {Zig_Zag(Program_Of(1)), Zig_Zag(Program_Of(2)), Zig_Zag(Program_Of(3)),
-                                                     Zig_Zag(Program_Of(4)), Zig_Zag(Program_Of(5))};
+    static const std::vector<std::vector<Mm_Step>> Programs = [] {
+        std::vector<std::vector<Mm_Step>> P;
+        for (int k = 1; k <= MAX_MISMATCH_SEARCH; k++) P.push_back(Zig_Zag(Program_Of(k)));
+        return P;
+    }();
     return Programs[K - 1].data();
 }
 
@@ -2131,14 +2177,23 @@ std::string Hit_Text(const SARange& hit, const char* dir) {
 }
 
 // The reads file, plain or gzip-compressed (zlib reads either; "-" is stdin), line by
-// line through a buffer of its own.
+// line. With Inflate_Ahead, a thread of its own reads and inflates the file into a ring
+// of buffers while Get_Line splits the lines of the one before; otherwise Get_Line reads
+// each buffer itself.
 class Read_File {
 public:
     explicit Read_File(const std::string& Path)
-        : File(Path == "-" ? gzdopen(fileno(stdin), "rb") : gzopen(Path.c_str(), "rb")), Buffer(1 << 20) {
+        : File(Path == "-" ? gzdopen(fileno(stdin), "rb") : gzopen(Path.c_str(), "rb")) {
         if (File) gzbuffer(File, 1 << 20);
+        for (Chunk& C : Ring) C.Data.resize(1 << 20);
     }
     ~Read_File() {
+        {
+            std::lock_guard<std::mutex> Lock(Mutex);
+            Stop = true;
+        }
+        Changed.notify_all();
+        if (Inflater.joinable()) Inflater.join();
         if (File) gzclose(File);
     }
     Read_File(const Read_File&) = delete;
@@ -2147,6 +2202,11 @@ public:
     bool Is_Open() const { return File != nullptr; }
     // A read error or corrupt compressed data ended the input early.
     bool Failed() const { return Error; }
+
+    // Starts the inflate thread; call before the first Get_Line.
+    void Inflate_Ahead() {
+        if (File && !Inflater.joinable()) Inflater = std::thread([this] { Inflate(); });
+    }
 
     // The next line, without its '\n' (as std::getline); false at the end.
     bool Get_Line(std::string& Line) {
@@ -2158,7 +2218,7 @@ public:
         Line.clear();
         for (;;) {
             if (Pos == End && !Fill()) return !Line.empty();
-            const char* Start = Buffer.data() + Pos;
+            const char* Start = Data + Pos;
             const char* Newline = static_cast<const char*>(std::memchr(Start, '\n', End - Pos));
             if (Newline) {
                 Line.append(Start, Newline);
@@ -2176,22 +2236,75 @@ public:
     }
 
 private:
-    bool Fill() {
-        if (!File) return false;
-        const int N = gzread(File, Buffer.data(), static_cast<unsigned>(Buffer.size()));
+    struct Chunk {
+        std::vector<char> Data;
+        std::size_t Size = 0;  // 0: the end of the input
+        bool Error = false;
+    };
+    static constexpr unsigned RING = 4;
+
+    // Reads the next buffer into C; false at the end or on an error (C.Error).
+    bool Read(Chunk& C) {
+        const int N = gzread(File, C.Data.data(), static_cast<unsigned>(C.Data.size()));
         int Status = Z_OK;
         if (N <= 0) gzerror(File, &Status);  // Z_BUF_ERROR: the compressed data ended early
-        if (N < 0 || Status != Z_OK) Error = true;
-        Pos = 0;
-        End = N > 0 ? static_cast<std::size_t>(N) : 0;
+        C.Error = N < 0 || Status != Z_OK;
+        C.Size = N > 0 ? static_cast<std::size_t>(N) : 0;
+        return C.Size > 0;
+    }
+
+    // The inflate thread: chunk I goes to Ring[I % RING] once chunk I - RING is released.
+    void Inflate() {
+        for (unsigned long I = 0;; I++) {
+            {
+                std::unique_lock<std::mutex> Lock(Mutex);
+                Changed.wait(Lock, [&] { return Stop || I < Released + RING; });
+                if (Stop) return;
+            }
+            const bool More = Read(Ring[I % RING]);
+            std::lock_guard<std::mutex> Lock(Mutex);
+            Produced++;
+            Changed.notify_all();
+            if (!More) return;
+        }
+    }
+
+    // The next buffer of the file into Data[0, End); false at the end.
+    bool Fill() {
+        Pos = End = 0;
+        if (!File || Ended) return false;
+        Chunk* C = &Ring[0];
+        if (Inflater.joinable()) {
+            std::unique_lock<std::mutex> Lock(Mutex);
+            if (Holding) Released++;  // the chunk used up
+            Holding = true;
+            Changed.notify_all();
+            Changed.wait(Lock, [&] { return Produced > Released; });
+            C = &Ring[Released % RING];
+        } else {
+            Read(*C);
+        }
+        Data = C->Data.data();
+        End = C->Size;
+        if (!End) {
+            Ended = true;
+            Error = C->Error;
+        }
         return End > 0;
     }
 
     gzFile File;
-    std::vector<char> Buffer;
+    Chunk Ring[RING];
+    const char* Data = nullptr;
     std::size_t Pos = 0, End = 0;
     std::string Pending;
-    bool Has_Pending = false, Error = false;
+    bool Has_Pending = false, Error = false, Ended = false;
+    // The inflate thread's hand-over: chunks inflated, and released by Fill.
+    std::thread Inflater;
+    std::mutex Mutex;
+    std::condition_variable Changed;
+    unsigned long Produced = 0, Released = 0;
+    bool Holding = false, Stop = false;
 };
 
 // The next FASTA or FASTQ record; with qual, also its quality line (empty for FASTA).
@@ -2350,7 +2463,7 @@ struct Sa_Request {
 #ifdef BATMAN_BATCH_STATS
 struct Decode_Stats_Counts {  // per thread, as Batch_Stats
     unsigned long Rows = 0, Direct = 0, Walk_Steps = 0, Range_Steps = 0, Span_Steps = 0;
-    double Seconds = 0;  // SAM output up to the records: candidates, chains, Sa_Decode
+    double Seconds = 0;  // SAM output up to writing: candidates, chains, Sa_Decode, the records built
     void Add(const Decode_Stats_Counts& O) {
         Rows += O.Rows;
         Direct += O.Direct;
@@ -2588,7 +2701,7 @@ void Sam_Candidates(const ForwardResults* const Res[2], const Hit_Stage* const S
 // row (Track_Pos).
 inline bool Hit_Has_Pos(const SARange& hit) { return hit.Skip && (Use_Ref || Track_Pos) && hit.Pos != NO_POS; }
 
-// The rows Write_Sam_Read will decode for a read, as decode requests: its candidates'
+// The rows Encode_Sam_Read will decode for a read, as decode requests: its candidates'
 // rows in output order, up to MaxHits locations (0: all) counting the ones with a known
 // Pos. Returns the number of values requested (from Values_At on). Origins gets each
 // request's candidate.
@@ -2852,14 +2965,14 @@ void Chain_Requests(std::vector<Sa_Request>& Requests, std::size_t First, const 
     Requests.insert(Requests.end(), Kept.begin(), Kept.end());
 }
 
-// Writes one read's SAM/BAM records from its strands' lists (Res[1]: the reverse
+// Builds one read's SAM/BAM records (into E) from its strands' lists (Res[1]: the reverse
 // complement's, or null): the hits in order of mismatches (forward strand first on a
 // tie), each location placed on its sequence (Genome_Map::Place; locations leaving a
 // sequence or covering an N are dropped, but count toward MaxHits as if written), at
 // most MaxHits locations (0: all). The first record is primary. No record: one
 // unmapped record. Returns the mapped records. The SA values of the rows Sam_Requests
 // listed, which are all the rows that count, are Decoded[0 .. Count).
-unsigned long Write_Sam_Read(Sam_Output& S, const std::string& Id, const std::string& Seq_Text, const std::string& Qual,
+unsigned long Encode_Sam_Read(const Sam_Output& S, Sam_Encoder& E, const std::string& Id, const std::string& Seq_Text, const std::string& Qual,
                              std::string_view Codes, const std::vector<Sam_Candidate>& Candidates, unsigned MaxHits,
                              const unsigned* Decoded, std::size_t Count) {
     struct Record {
@@ -2894,7 +3007,7 @@ unsigned long Write_Sam_Read(Sam_Output& S, const std::string& Id, const std::st
     if (!S.Write) return Records.size();
     const std::string Name = Id.substr(0, Id.find_first_of(" \t"));
     if (Records.empty()) {
-        S.Writer.Write_Unmapped(Name, Seq_Text, Qual);
+        E.Unmapped(Name, Seq_Text, Qual);
         return 0;
     }
     std::string Seq[2], Qual_Of[2];
@@ -2913,8 +3026,7 @@ unsigned long Write_Sam_Read(Sam_Output& S, const std::string& Id, const std::st
         for (int i = 0; i < R.Hit->Mismatches && i < MAX_MISMATCHES_BOUND; i++)
             Mismatches.push_back({R.Hit->Mismatch_Pos[i], static_cast<int>(R.Hit->Mismatch_Char >> (2 * i) & 3)});
         const uint16_t Flag = (R.Strand ? BAM_FREVERSE : 0) | (k ? BAM_FSECONDARY : 0);
-        S.Writer.Write_Mapped(Name, Flag, R.Tid, R.Pos, Seq[R.Strand], Qual_Of[R.Strand], Mismatches,
-                              static_cast<int>(Records.size()));
+        E.Mapped(Name, Flag, R.Tid, R.Pos, Seq[R.Strand], Qual_Of[R.Strand], Mismatches, static_cast<int>(Records.size()));
     }
     return Records.size();
 }
@@ -3000,6 +3112,7 @@ struct Input_Block {
 class Block_Reader {
 public:
     Block_Reader(Read_File& In, unsigned Size, bool Qual, bool Ahead) : In(In), Qual(Qual) {
+        if (Ahead) In.Inflate_Ahead();
         for (Input_Block& B : Blocks) {
             B.Ids.resize(Size);
             B.Seqs.resize(Size);
@@ -3072,7 +3185,7 @@ private:
 // program (Batch_One_Mismatch ... Batch_Five_Mismatch, Batch_Both_Strands) and writes
 // its lines in input order. Encoding the
 // reads counts as input here. Returns false on an unsupported read length.
-// With sam, writes SAM/BAM records instead (Write_Sam_Read). The reverse complements of
+// With sam, writes SAM/BAM records instead (Encode_Sam_Read, Sam_Writer::Write). The reverse complements of
 // the block's reads, if searched, follow the reads: one lane searches both strands of a
 // read in zig-zag order (Batch_Both_Strands); the exact search takes them as more reads.
 // With Threads > 1, a block holds 2 * Threads chunks of reads, which the threads take in
@@ -3130,6 +3243,7 @@ bool Run_Batched(Read_File& in, std::ostream& out, unsigned B, unsigned Threads,
         std::vector<unsigned> decoded;
         std::vector<unsigned char> decodeDone;      // decoded by Chain_Requests already
         std::string lines;
+        Sam_Encoder records;  // SAM/BAM: the part's records
         uint64_t hits = 0;
     };
     std::vector<Part> parts(Threads);
@@ -3235,7 +3349,8 @@ bool Run_Batched(Read_File& in, std::ostream& out, unsigned B, unsigned Threads,
         const auto outputStart = Clock::now();
         if (sam) {
             // Each read's hits in output order, the rows to decode for them (Sam_Requests),
-            // all of the part's decoded together (Sa_Decode), then the records.
+            // all of the part's decoded together (Sa_Decode), then its records, which the
+            // main thread writes part by part.
             pool.Run([&](unsigned t) {
                 Part& p = parts[t];
                 p.decodeRequests.clear();
@@ -3269,20 +3384,28 @@ bool Run_Batched(Read_File& in, std::ostream& out, unsigned B, unsigned Threads,
                 }
                 p.decoded.resize(values);
                 Sa_Decode(p.decodeRequests, p.decoded);
+                p.hits = 0;
+                if (sam->Write) sam->Writer.Start(p.records);
+                for (unsigned j = Part_Begin(t); j < Part_Begin(t + 1); j++) {
+                    if (!searched[j]) {
+                        if (sam->Write) p.records.Unmapped(ids[j].substr(0, ids[j].find_first_of(" \t")), seqs[j], quals[j]);
+                        continue;
+                    }
+                    p.hits += Encode_Sam_Read(*sam, p.records, ids[j], seqs[j], quals[j],
+                                              std::string_view(reads.data() + static_cast<std::size_t>(slot[j]) * STRINGLENGTH, STRINGLENGTH),
+                                              candidates[j], maxHits, p.decoded.data() + decodeBegin[j], decodeCount[j]);
+                }
             });
 #ifdef BATMAN_BATCH_STATS
             Decode_Stats.Seconds += std::chrono::duration<double>(Clock::now() - outputStart).count();
 #endif
-            for (unsigned t = 0; t < Threads; t++)
-                for (unsigned j = Part_Begin(t); j < Part_Begin(t + 1); j++) {
-                    if (!searched[j]) {
-                        if (sam->Write) sam->Writer.Write_Unmapped(ids[j].substr(0, ids[j].find_first_of(" \t")), seqs[j], quals[j]);
-                        continue;
-                    }
-                    reportedHits += Write_Sam_Read(*sam, ids[j], seqs[j], quals[j],
-                                                   std::string_view(reads.data() + static_cast<std::size_t>(slot[j]) * STRINGLENGTH, STRINGLENGTH),
-                                                   candidates[j], maxHits, parts[t].decoded.data() + decodeBegin[j], decodeCount[j]);
+            for (const Part& p : parts) {
+                reportedHits += p.hits;
+                if (sam->Write && !sam->Writer.Write(p.records)) {
+                    std::fprintf(stderr, "Error writing the SAM/BAM output\n");
+                    return false;
                 }
+            }
             outputSeconds += std::chrono::duration<double>(Clock::now() - outputStart).count();
             continue;
         }
@@ -3336,9 +3459,9 @@ bool Run_Batched(Read_File& in, std::ostream& out, unsigned B, unsigned Threads,
 
 void Usage(const char* prog) {
     std::fprintf(stderr,
-    "Usage: %s -q <reads.fa/fq[.gz]> -g <genome_prefix> [-n <0|1|2|3|4|5>] [-o <hits.txt>] [-m <maxhits>] [--no-ref] [--lookup <k>] [--batch <B|auto>] [-t <threads>] [--sam|--bam] [--forward-only] [--quiet|-Q] [--timing]\n"
+    "Usage: %s -q <reads.fa/fq[.gz]> -g <genome_prefix> [-n <0-7>] [-o <hits.txt>] [-m <maxhits>] [--no-ref] [--lookup <k>] [--batch <B|auto>] [-t <threads>] [--sam|--bam] [--forward-only] [--quiet|-Q] [--timing]\n"
         "  -q  the reads: FASTA or FASTQ, plain or gzip-compressed (- for stdin)\n"
-        "  -n  maximum mismatches, 0-5 (default 0); 1 to 5 also need the forward index\n"
+        "  -n  maximum mismatches, 0-7 (default 0); 1 to 7 also need the forward index\n"
         "      <genome_prefix>.bwt/.fmv\n"
         "  -m  maximum hits per read (default 1, 0 = all)\n"
         "  --no-ref  do not load the SA samples (.sa) and packed genome (.pac); single-row\n"
@@ -3392,22 +3515,11 @@ int main(int argc, char** argv) {
             maxHits = static_cast<unsigned>(std::strtoul(argv[++i], nullptr, 10));
         } else if (std::strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
             ++i;
-            if (std::strcmp(argv[i], "0") == 0) {
-                maxMismatches = 0;
-            } else if (std::strcmp(argv[i], "1") == 0) {
-                maxMismatches = 1;
-            } else if (std::strcmp(argv[i], "2") == 0) {
-                maxMismatches = 2;
-            } else if (std::strcmp(argv[i], "3") == 0) {
-                maxMismatches = 3;
-            } else if (std::strcmp(argv[i], "4") == 0) {
-                maxMismatches = 4;
-            } else if (std::strcmp(argv[i], "5") == 0) {
-                maxMismatches = 5;
-            } else {
+            if (std::strlen(argv[i]) != 1 || argv[i][0] < '0' || argv[i][0] > '0' + MAX_MISMATCH_SEARCH) {
                 Usage(argv[0]);
                 return 1;
             }
+            maxMismatches = argv[i][0] - '0';
         } else if (std::strcmp(argv[i], "--quiet") == 0 || std::strcmp(argv[i], "-Q") == 0) {
             quiet = true;
         } else if (std::strcmp(argv[i], "--timing") == 0) {
