@@ -32,6 +32,7 @@ extern "C" {
 #include "BWT.h"
 }
 
+#include "fm_occ.hpp"
 #include "genome_map.hpp"
 #include "sam_writer.hpp"
 
@@ -347,7 +348,7 @@ void Extend_Located(const SARange& Tag, bool Right, int Offset, int Len, int Cou
     }
 }
 
-// Prefetches the occurrence and BWT words BWTOccValue reads for row Index
+// Prefetches the occurrence and BWT words an Occ lookup reads for row Index
 // (as BWTPrefetchOccValueExplicit/BWTPrefetchBWT in index/BWT.c).
 inline void Prefetch_Row(const ActiveBWT* fmi, unsigned long Index) {
     Index -= (Index > fmi->inverseSa0);
@@ -361,40 +362,7 @@ inline void Prefetch_Row(const ActiveBWT* fmi, unsigned long Index) {
 // Counts each base among the BWT characters of rows Start..End. Row inverseSa0
 // holds $, which is not stored in bwtCode, so it is skipped (as in BWTOccValue).
 inline void Count_Range(const ActiveBWT* fmi, unsigned long Start, unsigned long End, unsigned Count[4]) {
-    const unsigned long First = Start - (Start > fmi->inverseSa0);
-    const unsigned long Last = End + 1 - (End + 1 > fmi->inverseSa0);	// exclusive
-    const unsigned* Code = fmi->bwtCode;
-    if (First >= Last) { Count[0] = Count[1] = Count[2] = Count[3] = 0; return; }
-
-    // Characters are packed high bits first: character k occupies bits 31-2k..30-2k.
-    // Three bit-planes instead of four base comparisons: low bit of the pair set
-    // means C or T, high bit set means G or T, both means T; A is what remains.
-    // Only the first and last words are masked; whole words in between are counted
-    // two at a time.
-    const unsigned long W0 = First / 16, W1 = (Last - 1) / 16;
-    const unsigned Head = ~0u >> (2 * (First % 16));			// characters k >= First%16
-    const unsigned Tail = ~0u << (30 - 2 * ((Last - 1) % 16));	// characters k <= (Last-1)%16
-    unsigned long CT = 0, GT = 0, T = 0;
-    auto Word32 = [&](unsigned W, unsigned M) {
-        M &= 0x55555555u;
-        const unsigned L = W & M, H = (W >> 1) & M;
-        CT += __builtin_popcount(L); GT += __builtin_popcount(H); T += __builtin_popcount(L & H);
-    };
-    if (W0 == W1) Word32(Code[W0], Head & Tail);
-    else {
-        Word32(Code[W0], Head);
-        unsigned long W = W0 + 1;
-        for (; W + 2 <= W1; W += 2) {
-            uint64_t X; std::memcpy(&X, Code + W, 8);
-            // (X >> 1) moves bit 32 into bit 31, an odd bit that the mask drops.
-            const uint64_t L = X & 0x5555555555555555ULL, H = (X >> 1) & 0x5555555555555555ULL;
-            CT += __builtin_popcountll(L); GT += __builtin_popcountll(H); T += __builtin_popcountll(L & H);
-        }
-        if (W < W1) Word32(Code[W], ~0u);
-        Word32(Code[W1], Tail);
-    }
-    const unsigned long N = Last - First;
-    Count[3] = T; Count[1] = CT - T; Count[2] = GT - T; Count[0] = N - CT - GT + T;
+    fm_occ::Count_Codes(fmi->bwtCode, Start - (Start > fmi->inverseSa0), End + 1 - (End + 1 > fmi->inverseSa0), Count);
 }
 
 // Narrows Start..End to the rows preceded by newChar (Start=0 if none). Ranges
@@ -408,7 +376,7 @@ void Get_SARange(long newChar, unsigned long& start, unsigned long& end, ActiveB
             start = 0;
             return;
         }
-        start = fmi->cumulativeFreq[newChar] + BWTOccValue(fmi, start, newChar) + 1;
+        start = fmi->cumulativeFreq[newChar] + fm_occ::Occ_One(fmi, start, newChar) + 1;
         end = start + count[newChar] - 1;
         return;
     }
@@ -420,8 +388,8 @@ void Get_SARange(long newChar, unsigned long& start, unsigned long& end, ActiveB
     start = fmi->cumulativeFreq[newChar] + occValue[0] + 1;
     end = fmi->cumulativeFreq[newChar] + occValue[1];
 #else
-    start = fmi->cumulativeFreq[newChar] + BWTOccValue(fmi, start, newChar) + 1;
-    end = fmi->cumulativeFreq[newChar] + BWTOccValue(fmi, end + 1, newChar);
+    start = fmi->cumulativeFreq[newChar] + fm_occ::Occ_One(fmi, start, newChar) + 1;
+    end = fmi->cumulativeFreq[newChar] + fm_occ::Occ_One(fmi, end + 1, newChar);
 #endif
     if (end < start) {
         start = 0;
@@ -554,7 +522,7 @@ __attribute__((noinline)) bool Search_Right_Singleton(std::string_view currentTa
         const unsigned int expected = static_cast<unsigned char>(currentTag[tag.Level - 1]);
         const unsigned base = Read_Base(expected);
         if (expected == now) {
-            tag.Start = fmi->cumulativeFreq[base] + BWTOccValue(fmi, tag.Start, base) + 1;
+            tag.Start = fmi->cumulativeFreq[base] + fm_occ::Occ_One(fmi, tag.Start, base) + 1;
             if (!tag.Skip && tag.Start % SAINTERVAL == 0) {
                 if (Use_Ref) {
                     if (!Search_Located(fmi, tag, true, offset, stringLength, tag.Level)) return false;
@@ -612,7 +580,7 @@ void Branch_Detect (const struct SARange Tag,BWT *fmi,int Start)
 		// Occurrences at Start, plus the range's own characters (no second lookup).
 		unsigned int ALIGN_16 Occ_Start[ALPHABET_SIZE];
 		unsigned Count[4];
-		BWTAllOccValue(fmi, Tag.Start, Occ_Start);
+		fm_occ::Occ_All(fmi, Tag.Start, Occ_Start);
 		Count_Range(fmi, Tag.Start, Tag.End, Count);
 		for (int Branch=0;Branch<4;Branch++)
 		{
@@ -626,9 +594,10 @@ void Branch_Detect (const struct SARange Tag,BWT *fmi,int Start)
 	}
 	else
 	{
-		// Occurrences of all four bases at both ends in one call (one decode per end).
+		// Occurrences of all four bases at both ends.
 		unsigned int ALIGN_16 Occ_Start[ALPHABET_SIZE], Occ_End[ALPHABET_SIZE];
-		BWTAllOccValueTwoIndex(fmi, Tag.Start, Tag.End+1, Occ_Start, Occ_End);
+		fm_occ::Occ_All(fmi, Tag.Start, Occ_Start);
+		fm_occ::Occ_All(fmi, Tag.End + 1, Occ_End);
 		for (int Branch=0;Branch<4;Branch++)
 		{
 				Branch_Ranges[Branch].Start = fmi->cumulativeFreq[Branch] + Occ_Start[Branch] + 1;
@@ -1279,7 +1248,7 @@ inline bool Mm_Search_Step(Mm_Lane& L) {
             const unsigned Expected = Mm_Base(L, T.Level);
             const unsigned Base = Read_Base(Expected);
             if (Expected != Now) return Mm_Search_End(L, false);
-            T.Start = L.Fmi->cumulativeFreq[Base] + BWTOccValue(L.Fmi, T.Start, Base) + 1;
+            T.Start = L.Fmi->cumulativeFreq[Base] + fm_occ::Occ_One(L.Fmi, T.Start, Base) + 1;
             if (!T.Skip && T.Start % SAINTERVAL == 0) {
                 if (Use_Ref) {
                     L.Done = T.Level;
@@ -1412,8 +1381,8 @@ inline bool Mm_Extend_Step(Mm_Lane& L) {
                 return Mm_Single_Done(L);
             }
             T.Forbidden_Base = NO_BASE;
-            if (Now == Expected) T.Start = L.Fmi->cumulativeFreq[Base] + BWTOccValue(L.Fmi, T.Start, Base) + 1;
-            else T.Start = L.Fmi->cumulativeFreq[Now] + BWTOccValue(L.Fmi, T.Start, Now) + 1;
+            if (Now == Expected) T.Start = L.Fmi->cumulativeFreq[Base] + fm_occ::Occ_One(L.Fmi, T.Start, Base) + 1;
+            else T.Start = L.Fmi->cumulativeFreq[Now] + fm_occ::Occ_One(L.Fmi, T.Start, Now) + 1;
             if (!T.Skip && T.Start % SAINTERVAL == 0) {
                 Mark_Sampled(L.Fmi, T, L.Right, L.Offset, Len, T.Level);
             }
@@ -1554,8 +1523,8 @@ inline bool Mm_Window_Step(Mm_Lane& L) {
             const unsigned Base = Read_Base(Expected);
             const int x = Mm_Read_Pos(L, T.Level);
             if (Now != Expected && !Window_Can_Change(T, L.W, x)) return Mm_Single_Done(L);
-            if (Now == Expected) T.Start = L.Fmi->cumulativeFreq[Base] + BWTOccValue(L.Fmi, T.Start, Base) + 1;
-            else T.Start = L.Fmi->cumulativeFreq[Now] + BWTOccValue(L.Fmi, T.Start, Now) + 1;
+            if (Now == Expected) T.Start = L.Fmi->cumulativeFreq[Base] + fm_occ::Occ_One(L.Fmi, T.Start, Base) + 1;
+            else T.Start = L.Fmi->cumulativeFreq[Now] + fm_occ::Occ_One(L.Fmi, T.Start, Now) + 1;
             if (!T.Skip && T.Start % SAINTERVAL == 0) {
                 Mark_Sampled(L.Fmi, T, L.Right, L.Offset, Len, T.Level);
             }
@@ -1635,7 +1604,7 @@ inline bool Mm_Switch_Step(Mm_Lane& L) {
         return true;
     }
     const unsigned c = Mm_Base(L, T.Level);
-    T.Start = L.Fmi->cumulativeFreq[c] + BWTOccValue(L.Fmi, T.Start, c) + 1;
+    T.Start = L.Fmi->cumulativeFreq[c] + fm_occ::Occ_One(L.Fmi, T.Start, c) + 1;
     T.Level++;
     return false;
 }
@@ -2428,15 +2397,15 @@ struct Sam_Output {
 // whose rows are Skipped steps from their requests:
 //   - a span: rows Lo..Hi, of which the ones whose (row - Lo) % saInterval is a class
 //     in Mask are resolved. Its sampled rows form one class, read off from saValue
-//     together. If all its rows have one BWT character (BWTAllOccValue at both ends),
+//     together. If all its rows have one BWT character (Occ_All at both ends),
 //     LF shifts it whole: the same rows, classes and outputs, at O(1) a step however
 //     long it stalls. Otherwise it splits into its runs of one character: runs of at
 //     least SA_SPAN_MIN rows stay spans, the others' unresolved rows become groups.
 //   - a group: unresolved rows in row order. Its sampled rows (and the $ row) are read
 //     off; the rest map by LF to at most 4 child groups (the rows with each BWT
-//     character; LF keeps their order). Occ comes from one BWTAllOccValue at the first
+//     character; LF keeps their order). Occ comes from one Occ_All at the first
 //     row, then by counting the BWT characters between neighbouring rows, or a fresh
-//     BWTAllOccValue across a gap over SA_GAP_LOOKUP rows.
+//     Occ_All across a gap over SA_GAP_LOOKUP rows.
 //   - a walk: a single row (SA_SINGLE_WALK), stepped like BWTSaValue; the walks of a
 //     round go side by side with prefetching, so their cache misses overlap.
 // SA_DECODE 0 walks every row; SA_SPAN_MIN 0 makes no spans.
@@ -2569,7 +2538,7 @@ void Sa_Decode(const std::vector<Sa_Request>& Requests, std::vector<unsigned>& V
         for (std::size_t i = 0; i < Left; i++) {
             const unsigned long Row = It[i].Row;
             if (i == 0 || Row - Prev > SA_GAP_LOOKUP) {
-                BWTAllOccValue(F, static_cast<unsigned>(Row), Occ);
+                fm_occ::Occ_All(F, Row, Occ);
 #ifdef BATMAN_BATCH_STATS
                 Decode_Stats.Range_Steps++;
 #endif
@@ -2614,9 +2583,9 @@ void Sa_Decode(const std::vector<Sa_Request>& Requests, std::vector<unsigned>& V
 #endif
         const unsigned long Width = P.Hi - P.Lo + 1;
         unsigned ALIGN_16 Occ[ALPHABET_SIZE], Occ_Hi[ALPHABET_SIZE];
-        BWTAllOccValue(F, static_cast<unsigned>(P.Lo), Occ);
+        fm_occ::Occ_All(F, P.Lo, Occ);
         if (P.Hi < F->textLength) {
-            BWTAllOccValue(F, static_cast<unsigned>(P.Hi + 1), Occ_Hi);
+            fm_occ::Occ_All(F, P.Hi + 1, Occ_Hi);
             for (unsigned c = 0; c < 4; c++)
                 if (Occ_Hi[c] - Occ[c] == Width) {
                     const unsigned long Lo = F->cumulativeFreq[c] + Occ[c] + 1;
@@ -2821,7 +2790,7 @@ std::size_t Chain_Decode(const Sam_Candidate& C, std::string_view Codes, unsigne
     E[1] = e;
     for (int k = 2; k <= L && s && s <= e; k++) {
         if (k < L && e - s + 1 == Hit_Width) {
-            s = F->cumulativeFreq[Q[k]] + BWTOccValue(F, static_cast<unsigned>(s), Q[k]) + 1;
+            s = F->cumulativeFreq[Q[k]] + fm_occ::Occ_One(F, static_cast<unsigned>(s), Q[k]) + 1;
             e = s + Hit_Width - 1;
 #ifdef BATMAN_BATCH_STATS
             Chain_Stats.Single_Ranks++;
