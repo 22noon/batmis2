@@ -349,7 +349,7 @@ void Extend_Located(const SARange& Tag, bool Right, int Offset, int Len, int Cou
 
 // Prefetches the occurrence and BWT words an Occ lookup reads for row Index
 // (as BWTPrefetchOccValueExplicit/BWTPrefetchBWT in index/BWT.c).
-inline void Prefetch_Row(const ActiveBWT* fmi, unsigned long Index) {
+PREFETCH_ONLY void Prefetch_Row(const ActiveBWT* fmi, unsigned long Index) {
     Index -= (Index > fmi->inverseSa0);
     const unsigned long Explicit = (Index + OCC_INTERVAL / 2 - 1) / OCC_INTERVAL;
     __builtin_prefetch(fmi->occValue + Explicit / OCC_VALUE_PER_WORD * ALPHABET_SIZE);
@@ -1835,7 +1835,7 @@ void Mm_Run(Mm_Lane& L, unsigned MaxHits) {
     }
 }
 
-inline void Mm_Prefetch(const Mm_Lane& L) {
+PREFETCH_ONLY void Mm_Prefetch(const Mm_Lane& L) {
     const SARange* T = &L.Cur;
     switch (L.Sub) {
         case MM_POP:

@@ -5,6 +5,11 @@
 > Code these write-ups mention but outside batmis1 (the structured search, the inline Occ,
 > `Chain_Decode`, the BWA variant) is in `attic/`.
 
+> **Prefetches (2026-11-15):** the batched timings here and in the other write-ups were
+> measured with binaries from which the compiler had dropped the prefetches. Fixed in both
+> mappers; batched search is 35–42% faster (`prefetch_fix.md`). The numbers below are not
+> redone.
+
 ## What changed
 
 Each item has its own write-up in this directory.

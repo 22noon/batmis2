@@ -37,6 +37,7 @@ decoding.
 ```sh
 cd src
 make            # batmis1 and batmis2 (builds index/ and htslib's library as needed)
+                # then checks that their prefetches are in the binaries
 make test       # both suites, about 5 minutes
 make install    # batmis1, batmis2 and bwt_build_index to ../bin
 ```
@@ -56,6 +57,10 @@ Each mapper runs:
 - **`test_sam_output.sh`:** SAM/BAM records checked against the genome; `-m 0` against
   brute force on both strands (`sam_oracle.py`); `--no-ref`, `--batch`, threads and BAM
   output; `Sa_Decode` on every row.
+
+`make` and `make test` also run **`check_prefetch.sh`** on both binaries: the compiler
+can drop the batched search's prefetches without any change in output
+(`benchmark/prefetch_fix.md`).
 
 batmis2 also runs **`test_batmis2.sh`**:
 - with `--switch-walk --own-row`, byte-identical to batmis1, at `-n 0` to `-n 7` in text and

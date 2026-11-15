@@ -19,6 +19,13 @@ extern "C" {
 #include "BWT.h"
 }
 
+// For a function that only prefetches. GCC knows of no side effect in __builtin_prefetch,
+// so a call to such a function that it does not inline is removed as dead code, silently
+// (GCC 13.3 -O3 dropped every Prefetch_Row and Mm_Prefetch that way; see
+// benchmark/interleaved_index.md). Forced inline, the prefetches land in a caller that
+// has other effects and stay. tests/check_prefetch.sh checks the binaries.
+#define PREFETCH_ONLY __attribute__((always_inline)) inline
+
 namespace fm_occ {
 
 // Counts each base among the stored characters [First, Last) of Code (character k in

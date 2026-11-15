@@ -2,7 +2,7 @@
 #   batmis1   the search on a pair of one-direction FM indexes (batmis1.cpp)
 #   batmis2   the same search on bidirectional SA ranges (batmis2.cpp)
 #
-#   make                both
+#   make                both, and check-prefetch (the prefetches are in the binaries)
 #   make test           both test suites (test-batmis1, test-batmis2)
 #   make install        to $(BINDIR), with the index builder
 # Build variants: DEFS=-DBATMAN_BATCH_STATS (step counts, printed with --timing);
@@ -26,9 +26,15 @@ HEADERS = fm_occ.hpp genome_map.hpp sam_writer.hpp
 COMPILE = $(CXX) -std=c++17 -fpermissive -I. -I$(INDEX_DIR) -I$(HTSLIB_DIR) $(CXXFLAGS) $(DEFS)
 LIBS = $(FMINDEX_LIB) $(HTSLIB) $(HTSLIB_LIBS)
 
-.PHONY: all test test-batmis1 test-batmis2 install clean FORCE
+.PHONY: all test test-batmis1 test-batmis2 check-prefetch install clean FORCE
 
-all: batmis1 batmis2
+all: batmis1 batmis2 check-prefetch
+
+# The compiler can drop prefetches without a word (fm_occ.hpp, PREFETCH_ONLY): check that
+# they are in the binaries.
+check-prefetch: batmis1 batmis2
+	$(TESTS)/check_prefetch.sh batmis1 batmis1.cpp
+	$(TESTS)/check_prefetch.sh batmis2 batmis2.cpp
 
 batmis1: batmis1.cpp $(HEADERS) $(FMINDEX_LIB) $(HTSLIB)
 	$(COMPILE) -o $@ $< $(LIBS)
@@ -81,7 +87,7 @@ test-batmis2: batmis1 batmis2 batmis2_chunk16 batmis2_verify test_located_hits_b
 	MAPPER=batmis2 $(TESTS)/test_sam_output.sh . $(INDEX_BUILDER) ./test_genome_map $(TEST_VIEW) ./test_sa_decode_batmis2
 	$(TESTS)/test_batmis2.sh . $(INDEX_BUILDER)
 
-test: test-batmis1 test-batmis2
+test: check-prefetch test-batmis1 test-batmis2
 
 # index/ owns the library and the index builder; let its Makefile decide.
 $(FMINDEX_LIB): FORCE
