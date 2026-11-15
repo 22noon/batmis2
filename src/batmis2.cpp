@@ -2237,9 +2237,13 @@ void Batch_Both_Strands(const char* Reads, unsigned Count, int Len, unsigned B, 
     Batch_Search(Reads, Count, Len, B, MaxHits, Zig_Zag_Program(MaxMismatches), &Res, &ReadHits, nullptr, nullptr, true);
 }
 
-// --batch auto: the lane count chosen on the fly. The best count depends on the machine
-// (how many cache misses a core keeps in flight), the index and the reads, while the
-// output does not depend on it. So the first chunks try the candidates, one chunk each,
+// --batch auto: the lane count chosen on the fly, and a profile of the candidates printed
+// at the end (Auto_Profile). The best count depends on the machine (how many cache misses
+// a core keeps in flight), the index and the reads, while the output does not depend on
+// it. With working prefetches the time is flat from about 8 lanes up
+// (benchmark/prefetch_fix.md), so a fixed count is the default (DEFAULT_BATCH, or
+// $BATMIS_BATCH) and this is for checking that default on a new machine or workload.
+// The first chunks try the candidates, one chunk each,
 // in rounds of alternating order (cancelling a drift such as caches warming up); each
 // chunk's first reads only warm up, so that its time is the candidate's steady state
 // (switching the lane count every few hundred reads favours many lanes). The candidate
@@ -2248,7 +2252,7 @@ void Batch_Both_Strands(const char* Reads, unsigned Count, int Len, unsigned B, 
 // own chooser, timed while the others run: they share the cores' and the memory's
 // capacity for misses in flight, and a thread may run on a P- or an E-core.
 struct Batch_Chooser {
-    static constexpr unsigned Candidates[] = {1, 2, 4, 8, 16};
+    static constexpr unsigned Candidates[] = {4, 8, 16};
     static constexpr unsigned N = sizeof Candidates / sizeof Candidates[0];
     static constexpr unsigned Warm_Up = 256, Rounds = 3;
     unsigned Chosen = 0;  // 0: still trying
@@ -2276,14 +2280,23 @@ struct Batch_Chooser {
         if (++Trials == N * Rounds) Choose();
     }
 
-    void Choose() {
-        double Median[N], Best = 0;
+    // Each candidate's median seconds per read over its trial chunks so far; false if
+    // one has none yet.
+    bool Medians(double Median[N]) const {
         for (unsigned c = 0; c < N; c++) {
             std::vector<double> S = Seconds[c];
+            if (S.empty()) return false;
             std::nth_element(S.begin(), S.begin() + S.size() / 2, S.end());
             Median[c] = S[S.size() / 2];
-            if (!c || Median[c] < Best) Best = Median[c];
         }
+        return true;
+    }
+
+    void Choose() {
+        double Median[N], Best = 0;
+        Medians(Median);
+        for (unsigned c = 0; c < N; c++)
+            if (!c || Median[c] < Best) Best = Median[c];
         for (unsigned c = 0; c < N && !Chosen; c++)
             if (Median[c] <= Best * 1.03) Chosen = Candidates[c];
         Report = "batch=auto:" + std::to_string(Chosen) + " (ns/read";
@@ -2295,6 +2308,56 @@ struct Batch_Chooser {
     // For --timing; "batch=auto:-" if the input ended before the trial did.
     std::string Report = "batch=auto:-";
 };
+
+constexpr unsigned DEFAULT_BATCH = 16;  // --batch, when neither it nor $BATMIS_BATCH is given
+
+// --batch auto's profile, one line for stderr: each candidate's search time per read (with
+// threads, the median over the threads that timed it), what was chosen, and how far the
+// default lane count is from the fastest candidate. A few runs of it on a machine show
+// whether the default suits it; if not, set --batch or $BATMIS_BATCH.
+std::string Auto_Profile(const std::vector<Batch_Chooser>& Choosers) {
+    constexpr unsigned N = Batch_Chooser::N;
+    std::vector<double> Times[N];
+    unsigned Chose[N] = {}, Finished = 0;
+    for (const Batch_Chooser& C : Choosers) {
+        double Median[N];
+        if (C.Medians(Median))
+            for (unsigned c = 0; c < N; c++) Times[c].push_back(Median[c]);
+        for (unsigned c = 0; c < N; c++) Chose[c] += C.Chosen == Batch_Chooser::Candidates[c];
+        Finished += C.Chosen != 0;
+    }
+    const unsigned Threads = static_cast<unsigned>(Choosers.size());
+    const unsigned long Needed = static_cast<unsigned long>(N) * Batch_Chooser::Rounds;
+    std::string Out = "batch auto: ";
+    if (Times[0].empty())
+        return Out + "too few reads to time the candidates (the trial takes " + std::to_string(Needed) +
+               " chunks per thread)";
+    double Typical[N];
+    unsigned Fastest = 0, Default = N;
+    Out += "ns/read";
+    for (unsigned c = 0; c < N; c++) {
+        std::nth_element(Times[c].begin(), Times[c].begin() + Times[c].size() / 2, Times[c].end());
+        Typical[c] = Times[c][Times[c].size() / 2];
+        if (Typical[c] < Typical[Fastest]) Fastest = c;
+        if (Batch_Chooser::Candidates[c] == DEFAULT_BATCH) Default = c;
+        Out += " " + std::to_string(Batch_Chooser::Candidates[c]) + ":" + std::to_string(static_cast<long>(Typical[c] * 1e9));
+    }
+    if (Threads == 1) {
+        Out += Finished ? "; chosen " + std::to_string(Choosers[0].Chosen) : std::string("; trial unfinished");
+    } else {
+        Out += "; chosen";
+        for (unsigned c = 0; c < N; c++) Out += " " + std::to_string(Batch_Chooser::Candidates[c]) + ":" + std::to_string(Chose[c]);
+        Out += " threads";
+        if (Finished < Threads) Out += " (" + std::to_string(Threads - Finished) + " did not finish the trial)";
+    }
+    if (Default < N) {
+        char Text[96];
+        std::snprintf(Text, sizeof Text, "; default %u is %+.1f%% against the fastest (%u)", DEFAULT_BATCH,
+                      (Typical[Default] / Typical[Fastest] - 1) * 100, Batch_Chooser::Candidates[Fastest]);
+        Out += Text;
+    }
+    return Out;
+}
 
 // "\t<dir>\t<start>\t<end>" for an SA range, or "\tP\t<pos>\t<pos>" for a located hit.
 std::string Hit_Text(const SARange& hit, const char* dir) {
@@ -3328,6 +3391,7 @@ bool Run_Batched(Read_File& in, std::ostream& out, unsigned B, unsigned Threads,
             Batch_Report += (t ? "," : "") + (choosers[t].Chosen ? std::to_string(choosers[t].Chosen) : std::string("-"));
         Batch_Report += "]";
     }
+    if (!B) std::fprintf(stderr, "%s\n", Auto_Profile(choosers).c_str());
     return true;
 }
 
@@ -3353,8 +3417,10 @@ void Usage(const char* prog) {
         "            per index; deeper is faster once there are more than about 4^k/3 reads\n"
         "            (see benchmark/lookup_table.md)\n"
         "  --batch   search B reads at a time, 1-64, so that their memory accesses\n"
-        "            overlap; auto (default) times a few B on the first reads and keeps\n"
-        "            the fastest (see benchmark/batched_reads.md)\n"
+        "            overlap (default 16, or $BATMIS_BATCH). auto times B = 4, 8, 16\n"
+        "            on the first reads, keeps the fastest and prints the times to\n"
+        "            stderr: a check of the default on a new machine or workload\n"
+        "            (see benchmark/prefetch_fix.md)\n"
         "  -t, --threads  search with N threads (default 1, 0 = all CPUs); the output\n"
         "            does not depend on N (see benchmark/threads.md)\n"
         "Output, one line per SA range or located hit:\n"
@@ -3377,7 +3443,16 @@ int main(int argc, char** argv) {
     bool quiet = false;
     bool timing = false;
     bool useRef = true;
-    int batchSize = 0;  // --batch auto
+    int batchSize = DEFAULT_BATCH;  // --batch; 0: auto
+    // "auto" or 1-MAX_BATCH, from --batch or $BATMIS_BATCH.
+    auto Parse_Batch = [&](const char* Text, const char* From) {
+        batchSize = std::strcmp(Text, "auto") == 0 ? 0 : std::atoi(Text);
+        if (std::strcmp(Text, "auto") == 0 || (batchSize >= 1 && batchSize <= static_cast<int>(MAX_BATCH))) return true;
+        std::fprintf(stderr, "%s must be auto or 1-%u\n", From, MAX_BATCH);
+        return false;
+    };
+    if (const char* Env = std::getenv("BATMIS_BATCH"))
+        if (!Parse_Batch(Env, "BATMIS_BATCH")) return 1;
     int threads = 1;    // -t; 0: all CPUs
     int samFormat = 0;  // 1 SAM, 2 BAM (--sam / --bam, or the -o extension)
     bool forwardOnly = false;
@@ -3403,12 +3478,7 @@ int main(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--timing") == 0) {
             timing = true;
         } else if (std::strcmp(argv[i], "--batch") == 0 && i + 1 < argc) {
-            ++i;
-            batchSize = std::strcmp(argv[i], "auto") == 0 ? 0 : std::atoi(argv[i]);
-            if (std::strcmp(argv[i], "auto") != 0 && (batchSize < 1 || batchSize > static_cast<int>(MAX_BATCH))) {
-                std::fprintf(stderr, "--batch must be auto or 1-%u\n", MAX_BATCH);
-                return 1;
-            }
+            if (!Parse_Batch(argv[++i], "--batch")) return 1;
         } else if ((std::strcmp(argv[i], "-t") == 0 || std::strcmp(argv[i], "--threads") == 0) && i + 1 < argc) {
             threads = std::atoi(argv[++i]);
             if (threads < 0 || threads > 1024) {

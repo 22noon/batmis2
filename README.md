@@ -49,6 +49,12 @@ batmis1 -g genome.fa -q reads.fq -n 2 -m 10 --sam -t 8 -o hits.sam
 batmis2 -g genome.fa -q reads.fq -n 2 -m 10 --sam -t 8 -o hits.sam
 ```
 
+**Batch size.** Both search 16 reads at a time (`--batch`), which does not affect the
+output. To check that on another machine, run a workload a few times with `--batch auto`:
+it times 4, 8 and 16, and prints the times and how far 16 is from the fastest. If another
+size is clearly better there, set it with `--batch` or the environment variable
+`BATMIS_BATCH` (`benchmark/prefetch_fix.md`).
+
 **Tests** (`make test`; `make test-batmis1` and `make test-batmis2` run them separately).
 Each mapper runs:
 - **`test_located_hits.sh`:** the batched lanes against one read at a time, field by field;

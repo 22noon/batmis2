@@ -100,8 +100,8 @@ The fuller grid, on a scratch build of batmis2 before the fix went into `src/`
 Their numbers stand as measured, but they were measured without prefetches. Not redone:
 
 - **Best B** (`batched_reads.md`, `threads.md`): with prefetches B = 16 beats B = 4 in
-  every case tried here; before, the two were level and threads preferred B = 2–4.
-  `--batch auto` picks B by timing, so it follows by itself.
+  every case tried here; before, the two were level and threads preferred B = 2–4. The
+  default changed with it (next section).
 - **Batched timings everywhere** (`recap.md`, the `-n` write-ups): expect about a third
   less search time at B ≥ 4.
 - **Experiments judged under the old behaviour** could come out differently now that
@@ -111,3 +111,57 @@ Their numbers stand as measured, but they were measured without prefetches. Not 
   working prefetches).
 - **batmis1 against batmis2:** both got the fix, so the comparison is still like for
   like. On these runs batmis1 is 4–11% ahead in search time at `-m 1`, before and after.
+
+## The batch size after the fix
+
+`--batch auto` was the default. It still chose well, but its trial became the expensive
+part, so the default is now a fixed size and auto is a check on it.
+
+**Fixed sizes.** batmis2, 1M reads, one P-core, search seconds (a build was running
+alongside, so these are noisier than the tables above):
+
+| reads | `-n` | B = 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 100 bp | 0 | 1.72 | 1.02 | 0.75 | 0.68 | 0.67 | 0.68 | 0.69 |
+| 100 bp | 2 | 3.54 | 2.35 | 1.79 | 1.52 | 1.84 | 1.55 | 1.55 |
+| 32 bp | 0 | 1.88 | 0.95 | 0.71 | 0.58 | 0.55 | 0.58 | 0.58 |
+| 32 bp | 2 | 12.6 | 9.1 | 7.4 | 6.3 | 6.3 | 6.4 | 6.7 |
+
+The time is flat from 8 to 64, so a size anywhere in that range is within a few percent
+of the best. (The 1.84 at 100 bp `-n 2`, B = 16 is the build's noise: 1.24–1.25 s in the
+runs below.)
+
+**The old trial.** Auto tried B = 1, 2, 4, 8, 16 three times each on 4,096-read chunks:
+61k reads per thread, 1.35M at `-t 22`. Without prefetches the sizes differed little and
+that cost nothing. With them the B = 1 and B = 2 chunks run 1.5–2.5× slower than the
+best:
+- **`-t 22`, 1M reads, 100 bp `-n 2`:** no thread finished its trial; 0.225–0.230 s
+  against 0.188–0.202 s at fixed B = 4–32.
+- **`-t 22`, 4M reads:** 0.99–1.04 s against 0.88–0.98 s fixed.
+- **One thread:** within 2–5% of the best fixed size.
+
+**Now:**
+- **Default:** `--batch 16` (`DEFAULT_BATCH`), with no trial.
+- **`BATMIS_BATCH`:** an environment variable, `auto` or 1–64, that sets the size when
+  `--batch` is not given. For a machine where 16 turns out not to suit.
+- **`--batch auto`:** tries B = 4, 8, 16 only (nine chunks a thread), and prints its
+  measurements to stderr, with or without `--timing`:
+
+  ```
+  batch auto: ns/read 4:1529 8:1277 16:1236; chosen 16; default 16 is +0.0% against the fastest (16)
+  batch auto: ns/read 4:10054 8:9372 16:9894; chosen 4:5 8:12 16:5 threads; default 16 is +5.6% against the fastest (8)
+  ```
+
+  The first is one thread; the second is `-t 22`, where each time is the median over the
+  threads and `chosen` counts the threads that settled on each size. An input too short
+  for the trial still prints the times it has.
+
+**Checking a new machine.** Run the workload a few times with `--batch auto` and read the
+last figure. If the default is repeatedly more than a few percent from the fastest, set
+`BATMIS_BATCH` there. If the fastest is at an end of the range (4 or 16), time
+`--batch 2` or `--batch 32` by hand as well. The threaded figures move by 5% or so from
+run to run, so one run is not enough. Only this machine (Core Ultra 7 165H) has been
+measured.
+
+The output does not depend on the batch size: the default, `--batch 16`, `--batch auto`,
+`BATMIS_BATCH=4` and `-t 22 --batch auto` gave byte-identical files.
