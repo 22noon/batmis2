@@ -703,8 +703,49 @@ about 2–2.5, so rounds vary up to 10%):
   faster one read at a time, 3–7% faster at 32 bp `-n 4`, and level to about 5% behind
   batched at 32 bp `-n 1–3`.
 
+## Search schemes for `-n 4`'s 2|2 stage (tried, not adopted)
+
+Could plans built for free direction changes (search schemes: Lam et al.'s 2BWT,
+Kucherov et al. 2016) beat `batman_zero_min`'s half-based plans? The check was a
+prototype first, with a go/no-go gate: at least 25% fewer steps before porting
+(`tools/scheme_eval.cpp`, built by hand against `bi_index.hpp` / `bi_ref.hpp`).
+
+**Where the time is.** At 32 bp, `-n 3` and `-n 4` are dominated by one kind of stage: seeds
+of one half with mismatches, grown from a short exact piece (5–8 bases, thousands of
+rows on 500 Mb), then crossed over the other half.
+- **`-n 3`:** 300 of 440 steps a read are four explorations (an exact quarter, then the
+  next quarter with exactly one mismatch). Any scheme set needs the same four, for the
+  cases with no two adjacent exact quarters, so the ceiling was about 10%. Not
+  prototyped.
+- **`-n 4`:** 80% of 3,720 steps a read are the 2|2 stage (2,180 seed steps, 460
+  crossing, 340 switch).
+
+**The prototype**, for the 2|2 class:
+- **Cases:** the read in eighths, every distribution with 2 mismatches in each half (100
+  cases).
+- **Search:** each case seeded from a run of exact eighths, extended toward the fewer
+  mismatches first; cases sharing a seed searched once, a bitmask of the cases still
+  possible at each node, located singletons from either row.
+- **Correctness:** the same 2.2M hits as brute force on the toy index.
+
+| 2\|2 stage, steps per read (10k reads, 500 Mb) | 32 bp | 100 bp |
+|---|---:|---:|
+| `batman_zero_min` (steps 48–59) | about 2,980 (2,640 without switches) | about 55 |
+| prototype, each case's longest exact run (30 seeds) | 4,594 | 360 |
+| prototype, seeds by greedy set cover (21 seeds) | 3,729 | 250 |
+
+**Not adopted.** The prototype does more work than `batman_zero_min`, at both lengths.
+- **Every seed costs a search per read.** At 100 bp that is 21–30 seeds × about 12 steps.
+  `batman_zero_min`'s handful of seeds reuse the ranges of earlier stages
+  (`OP_SEARCH_KEEP`, the chains) and are bounded by pass 1's failure depths.
+- **Cases with no adjacent exact pair** still need 4–5-base seeds, as
+  `batman_zero_min`'s thirds do.
+
+The bidirectional index's gains stay the ones in `bi_batman`: the O(1) switch (7–11% at
+32 bp `-n 4`) and locating from either row.
+
 ## Next steps
 
-1. **In the port (`bi_batman.cpp`):** search plans that turn direction more often, now
-   that a turn is free (the standard bidirectional search schemes), for `-n 3` and up.
+1. **Search schemes:** tried for `-n 4`'s 2|2 stage and not adopted (above). A
+   scheme design would have to keep `batman_zero_min`'s reuse of earlier stages to compete.
 2. **`bi_mm` and `bi_two_mismatch.hpp`** stay as references until the port has those.

@@ -1,5 +1,10 @@
 # Recap: the port against the original BatMis 3.00
 
+> **Naming (2026-11-05):** `batman_zero_min` here is now **batmis1** (`src/batmis1.cpp`);
+> its bidirectional version is batmis2 (`src/batmis2.cpp`, see the top-level `README.md`).
+> Code these write-ups mention but outside batmis1 (the structured search, the inline Occ,
+> `Chain_Decode`, the BWA variant) is in `attic/`.
+
 ## What changed
 
 Each item has its own write-up in this directory.

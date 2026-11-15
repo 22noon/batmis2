@@ -1,0 +1,6 @@
+tests
+tmp
+#benchmark
+*/*.o
+*/*.a
+htslib-1.24

@@ -1,10 +1,12 @@
-# Builds the batman_zero_min exact-match searchers.
-#   make                     batman_zero_min.cpp, native BatMis FM index (../index)
-#   make batman_zero_min_bwa batman_zero_min_bwa.cpp, BWA index (needs a built bwa-fmd)
-# Native build variant via DEFS: DEFS=-DBATMAN_ZERO_MIN_USE_PAIRED_RANK
-#   make batman_zero_min_inlineocc  fm_occ.hpp's inline Occ instead of the library's
-#                                   (BWTOccValue, BWTAllOccValue), for comparison
-#   make test-occ                fm_occ.hpp's Occ against the library's
+# BatMis mappers (README.md):
+#   batmis1   the search on a pair of one-direction FM indexes (batmis1.cpp)
+#   batmis2   the same search on bidirectional SA ranges (batmis2.cpp)
+#
+#   make                both
+#   make test           both test suites (test-batmis1, test-batmis2)
+#   make install        to $(BINDIR), with the index builder
+# Build variants: DEFS=-DBATMAN_BATCH_STATS (step counts, printed with --timing);
+# batmis2_verify checks every bidirectional range against the other index.
 
 CXX ?= g++
 CXXFLAGS ?= -O3 -funroll-loops -mpopcnt -pthread
@@ -13,111 +15,91 @@ BINDIR ?= ../bin
 
 INDEX_DIR ?= ../index
 FMINDEX_LIB = $(INDEX_DIR)/libfmindex_core.a
+INDEX_BUILDER = $(INDEX_DIR)/bwt_build_index
 # htslib (SAM/BAM output), built from source; its configure picked these libraries.
 HTSLIB_DIR ?= ../htslib-1.24
 HTSLIB = $(HTSLIB_DIR)/libhts.a
 HTSLIB_LIBS ?= -llzma -lbz2 -lz -lm -lpthread
-BWA_ROOT ?= ../../../bwa-fmd
+TESTS = ../tests
 
-.PHONY: all test-occ batman_zero_min_fmindex batman_zero_structured test_exact_search_intervals test-structured test-located test-sam bench_sa_decode install clean FORCE
+HEADERS = fm_occ.hpp genome_map.hpp sam_writer.hpp
+COMPILE = $(CXX) -std=c++17 -fpermissive -I. -I$(INDEX_DIR) -I$(HTSLIB_DIR) $(CXXFLAGS) $(DEFS)
+LIBS = $(FMINDEX_LIB) $(HTSLIB) $(HTSLIB_LIBS)
 
-all: batman_zero_min
+.PHONY: all test test-batmis1 test-batmis2 install clean FORCE
 
-batman_zero_min.o: batman_zero_min.cpp fm_occ.hpp genome_map.hpp sam_writer.hpp
-	$(CXX) -std=c++17 -fpermissive -I$(INDEX_DIR) -I$(HTSLIB_DIR) $(CXXFLAGS) $(DEFS) -c $< -o $@
+all: batmis1 batmis2
 
-batman_zero_min: batman_zero_min.o $(FMINDEX_LIB) $(HTSLIB)
-	$(CXX) -std=c++17 $(CXXFLAGS) -o $@ batman_zero_min.o $(FMINDEX_LIB) $(HTSLIB) $(HTSLIB_LIBS)
+batmis1: batmis1.cpp $(HEADERS) $(FMINDEX_LIB) $(HTSLIB)
+	$(COMPILE) -o $@ $< $(LIBS)
 
-# The same with 16-read chunks, so that the tests' few reads span several blocks,
-# chunks and threads (-t).
-batman_zero_min_chunk16: batman_zero_min.cpp fm_occ.hpp genome_map.hpp sam_writer.hpp $(FMINDEX_LIB) $(HTSLIB)
-	$(CXX) -std=c++17 -fpermissive -I$(INDEX_DIR) -I$(HTSLIB_DIR) $(CXXFLAGS) $(DEFS) -DBATMAN_BATCH_BLOCK=16 -o $@ $< \
-	    $(FMINDEX_LIB) $(HTSLIB) $(HTSLIB_LIBS)
+batmis2: batmis2.cpp $(HEADERS) $(FMINDEX_LIB) $(HTSLIB)
+	$(COMPILE) -o $@ $< $(LIBS)
 
-batman_zero_min_inlineocc: batman_zero_min.cpp fm_occ.hpp genome_map.hpp sam_writer.hpp $(FMINDEX_LIB) $(HTSLIB)
-	$(CXX) -std=c++17 -fpermissive -I$(INDEX_DIR) -I$(HTSLIB_DIR) $(CXXFLAGS) $(DEFS) -DBATMAN_INLINE_OCC -o $@ $< \
-	    $(FMINDEX_LIB) $(HTSLIB) $(HTSLIB_LIBS)
+# batmis2 checking each range's other-index start and each other-row locate (slow).
+batmis2_verify: batmis2.cpp $(HEADERS) $(FMINDEX_LIB) $(HTSLIB)
+	$(COMPILE) -DBATMIS2_VERIFY -o $@ $< $(LIBS)
 
-test_occ_inline: ../tests/test_occ_inline.cpp fm_occ.hpp $(FMINDEX_LIB)
-	$(CXX) -std=c++17 -I. -I$(INDEX_DIR) $(CXXFLAGS) -DBATMAN_INLINE_OCC -o $@ $< $(FMINDEX_LIB) -lm
+# 16-read chunks, so that the tests' few reads span several blocks, chunks and threads.
+batmis1_chunk16: batmis1.cpp $(HEADERS) $(FMINDEX_LIB) $(HTSLIB)
+	$(COMPILE) -DBATMAN_BATCH_BLOCK=16 -o $@ $< $(LIBS)
 
-test-occ: test_occ_inline
-	$(MAKE) -C $(INDEX_DIR) bwt_build_index
-	../tests/test_occ_inline.sh $(INDEX_DIR)/bwt_build_index ./test_occ_inline
+batmis2_chunk16: batmis2.cpp $(HEADERS) $(FMINDEX_LIB) $(HTSLIB)
+	$(COMPILE) -DBATMAN_BATCH_BLOCK=16 -o $@ $< $(LIBS)
 
-# Old name for batman_zero_min
-batman_zero_min_fmindex: batman_zero_min
+# Test programs, per mapper (they include its source).
+test_located_hits_batmis1: $(TESTS)/test_located_hits.cpp batmis1.cpp $(HEADERS) $(FMINDEX_LIB) $(HTSLIB)
+	$(COMPILE) -DMAPPER_SOURCE='"batmis1.cpp"' -o $@ $< $(LIBS)
 
-batman_zero_structured.o: batman_zero_structured.cpp exact_search.hpp
-	$(CXX) -std=c++17 -fpermissive -I$(INDEX_DIR) $(CXXFLAGS) -c $< -o $@
+test_located_hits_batmis2: $(TESTS)/test_located_hits.cpp batmis2.cpp $(HEADERS) $(FMINDEX_LIB) $(HTSLIB)
+	$(COMPILE) -DMAPPER_SOURCE='"batmis2.cpp"' -o $@ $< $(LIBS)
 
-exact_search.o: exact_search.cpp exact_search.hpp
-	$(CXX) -std=c++17 -fpermissive -I$(INDEX_DIR) $(CXXFLAGS) -c $< -o $@
+test_sa_decode_batmis1: $(TESTS)/test_sa_decode.cpp batmis1.cpp $(HEADERS) $(FMINDEX_LIB) $(HTSLIB)
+	$(COMPILE) -DMAPPER_SOURCE='"batmis1.cpp"' -o $@ $< $(LIBS)
 
-batman_zero_structured: batman_zero_structured.o exact_search.o $(FMINDEX_LIB)
-	$(CXX) -std=c++17 $(CXXFLAGS) -o $@ batman_zero_structured.o exact_search.o $(FMINDEX_LIB) -lm
+test_sa_decode_batmis2: $(TESTS)/test_sa_decode.cpp batmis2.cpp $(HEADERS) $(FMINDEX_LIB) $(HTSLIB)
+	$(COMPILE) -DMAPPER_SOURCE='"batmis2.cpp"' -o $@ $< $(LIBS)
 
-test_exact_search_intervals.o: ../tests/test_exact_search_intervals.cpp exact_search.hpp
-	$(CXX) -std=c++17 -fpermissive -I. -I$(INDEX_DIR) $(CXXFLAGS) -c $< -o $@
-
-test_exact_search_intervals: test_exact_search_intervals.o exact_search.o $(FMINDEX_LIB)
-	$(CXX) -std=c++17 $(CXXFLAGS) -o $@ test_exact_search_intervals.o exact_search.o $(FMINDEX_LIB) -lm
-
-test-structured: batman_zero_min batman_zero_structured test_exact_search_intervals
-	$(MAKE) -C $(INDEX_DIR) bwt_build_index
-	../tests/test_structured_exact_search.sh . $(INDEX_DIR)/bwt_build_index ./test_exact_search_intervals
-
-test_located_hits: ../tests/test_located_hits.cpp batman_zero_min.cpp fm_occ.hpp genome_map.hpp sam_writer.hpp $(FMINDEX_LIB) $(HTSLIB)
-	$(CXX) -std=c++17 -fpermissive -I. -I$(INDEX_DIR) -I$(HTSLIB_DIR) $(CXXFLAGS) $(DEFS) -o $@ $< $(FMINDEX_LIB) $(HTSLIB) $(HTSLIB_LIBS)
-
-test-located: batman_zero_min batman_zero_min_chunk16 test_located_hits
-	$(MAKE) -C $(INDEX_DIR) bwt_build_index
-	../tests/test_located_hits.sh . $(INDEX_DIR)/bwt_build_index ./test_located_hits
-
-test_genome_map: ../tests/test_genome_map.cpp genome_map.hpp
+test_genome_map: $(TESTS)/test_genome_map.cpp genome_map.hpp
 	$(CXX) -std=c++17 -I. $(CXXFLAGS) -o $@ $<
 
-test_sa_decode: ../tests/test_sa_decode.cpp batman_zero_min.cpp fm_occ.hpp genome_map.hpp sam_writer.hpp $(FMINDEX_LIB) $(HTSLIB)
-	$(CXX) -std=c++17 -fpermissive -I. -I$(INDEX_DIR) -I$(HTSLIB_DIR) $(CXXFLAGS) $(DEFS) -o $@ $< $(FMINDEX_LIB) $(HTSLIB) $(HTSLIB_LIBS)
+TEST_VIEW = $(HTSLIB_DIR)/test/test_view
 
-# Replays recorded decode requests (tests/bench_sa_decode.cpp); not part of the tests.
-bench_sa_decode: ../tests/bench_sa_decode.cpp batman_zero_min.cpp fm_occ.hpp genome_map.hpp sam_writer.hpp $(FMINDEX_LIB) $(HTSLIB)
-	$(CXX) -std=c++17 -fpermissive -I. -I$(INDEX_DIR) -I$(HTSLIB_DIR) $(CXXFLAGS) $(DEFS) -DBATMAN_BATCH_STATS -o $@ $< $(FMINDEX_LIB) $(HTSLIB) $(HTSLIB_LIBS)
-
-test_chain_decode: ../tests/test_chain_decode.cpp batman_zero_min.cpp fm_occ.hpp genome_map.hpp sam_writer.hpp $(FMINDEX_LIB) $(HTSLIB)
-	$(CXX) -std=c++17 -fpermissive -I. -I$(INDEX_DIR) -I$(HTSLIB_DIR) $(CXXFLAGS) $(DEFS) -DBATMAN_BATCH_STATS -o $@ $< $(FMINDEX_LIB) $(HTSLIB) $(HTSLIB_LIBS)
-
-test-sam: batman_zero_min batman_zero_min_chunk16 test_genome_map test_sa_decode test_chain_decode
-	$(MAKE) -C $(INDEX_DIR) bwt_build_index
+$(TEST_VIEW): FORCE
 	$(MAKE) -C $(HTSLIB_DIR) test/test_view
-	../tests/test_sam_output.sh . $(INDEX_DIR)/bwt_build_index ./test_genome_map $(HTSLIB_DIR)/test/test_view \
-	    ./test_sa_decode ./test_chain_decode
 
-# index/ owns the library; let its Makefile decide whether it is up to date.
+# Each mapper's suite: located hits (lanes, walked against located, brute force for
+# -n 1 to 7) and SAM/BAM output (brute force on both strands, Sa_Decode).
+test-batmis1: batmis1 batmis1_chunk16 test_located_hits_batmis1 test_sa_decode_batmis1 test_genome_map $(INDEX_BUILDER) $(TEST_VIEW)
+	MAPPER=batmis1 $(TESTS)/test_located_hits.sh . $(INDEX_BUILDER) ./test_located_hits_batmis1
+	MAPPER=batmis1 $(TESTS)/test_sam_output.sh . $(INDEX_BUILDER) ./test_genome_map $(TEST_VIEW) ./test_sa_decode_batmis1
+
+# batmis2's also compares it with batmis1 and runs batmis2_verify (test_batmis2.sh).
+test-batmis2: batmis1 batmis2 batmis2_chunk16 batmis2_verify test_located_hits_batmis2 test_sa_decode_batmis2 test_genome_map \
+              $(INDEX_BUILDER) $(TEST_VIEW)
+	MAPPER=batmis2 $(TESTS)/test_located_hits.sh . $(INDEX_BUILDER) ./test_located_hits_batmis2
+	MAPPER=batmis2 $(TESTS)/test_sam_output.sh . $(INDEX_BUILDER) ./test_genome_map $(TEST_VIEW) ./test_sa_decode_batmis2
+	$(TESTS)/test_batmis2.sh . $(INDEX_BUILDER)
+
+test: test-batmis1 test-batmis2
+
+# index/ owns the library and the index builder; let its Makefile decide.
 $(FMINDEX_LIB): FORCE
 	$(MAKE) -C $(INDEX_DIR) libfmindex_core.a
+
+$(INDEX_BUILDER): FORCE
+	$(MAKE) -C $(INDEX_DIR) bwt_build_index
 
 $(HTSLIB): FORCE
 	$(MAKE) -C $(HTSLIB_DIR) lib-static
 
-batman_zero_min_bwa.o: batman_zero_min_bwa.cpp
-	$(CXX) -std=c++17 -fpermissive -I$(BWA_ROOT) $(CXXFLAGS) -c $< -o $@
-
-batman_zero_min_bwa: batman_zero_min_bwa.o
-	$(CXX) -std=c++17 $(CXXFLAGS) -o $@ $< $(BWA_ROOT)/libbwa.a -lz -lpthread -lm
-
-install: batman_zero_min
+install: batmis1 batmis2 $(INDEX_BUILDER)
 	mkdir -p $(BINDIR)
-	cp batman_zero_min $(BINDIR)
-	if [ -f batman_zero_min_bwa ]; then cp batman_zero_min_bwa $(BINDIR); fi
-	if [ -f $(INDEX_DIR)/bwt_build_index ]; then cp $(INDEX_DIR)/bwt_build_index $(BINDIR); fi
+	cp batmis1 batmis2 $(INDEX_BUILDER) $(BINDIR)
 
 clean:
-	rm -f batman_zero_min.o batman_zero_min_bwa.o batman_zero_min batman_zero_min_bwa \
-	      batman_zero_min_spot.o batman_zero_min_spot batman_zero_structured.o \
-	      exact_search.o batman_zero_structured test_exact_search_intervals.o \
-	      test_exact_search_intervals test_located_hits test_genome_map test_sa_decode test_chain_decode bench_sa_decode \
-	      batman_zero_min_chunk16 batman_zero_min_inlineocc test_occ_inline
+	rm -f batmis1 batmis2 batmis2_verify batmis1_chunk16 batmis2_chunk16 \
+	      test_located_hits_batmis1 test_located_hits_batmis2 test_sa_decode_batmis1 test_sa_decode_batmis2 \
+	      test_genome_map
 
 FORCE:

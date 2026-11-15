@@ -1,11 +1,22 @@
-// batman_zero_min: exact-match search using the native BatMis FM index
-// (rev<genome>.bwt/.fmv built by index/bwt_build_index). With -n 1 it also
-// finds one-mismatch hits, using the forward index <genome>.bwt/.fmv too.
+// batmis2: batmis1 (batmis1.cpp) with bidirectional SA ranges.
+// Every SARange also keeps Other_Start, the start of the same string's range in the other
+// index (revfmi <-> fwfmi), so a range is one in both: a step with c moves it past the
+// rows of the range whose BWT character is $ or below c (Get_SARange, Branch_Detect); a
+// single-row step leaves it; a 1-base range starts at the same row in both indexes; an
+// index switch ends at the seed's own Start. Two uses (Switch_Walk, Both_Rows): an index
+// switch reads the switched range off the seed instead of re-walking the seed in the
+// other index, and a single row is located from either index's sampled row. The search
+// is otherwise batmis1's, with the same hits (byte-identical output with --switch-walk
+// --own-row). -DBATMIS2_VERIFY checks Other_Start and every other-row locate against
+// the other index. What follows is batmis1's description.
+//
+// batmis1: the BatMis short-read mapper on a pair of one-direction FM indexes, the
+// reverse index rev<genome>.bwt/.fmv and the forward index <genome>.bwt/.fmv (built by
+// index/bwt_build_index): exact search, and with -n 1 to 7 hits with up to that many
+// mismatches.
 // By default it also loads the SA samples (.sa) and the packed genome (.pac):
 // a single-row path that reaches a sampled row is finished by comparing the read
 // with the genome there (see Locate). --no-ref skips them to save memory.
-// The BWA-index variant lives in batman_zero_min_bwa.cpp.
-// Optional build variant: -DBATMAN_ZERO_MIN_USE_PAIRED_RANK.
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -74,12 +85,15 @@ struct SARange {
     unsigned char Mismatch_Pos[MAX_MISMATCHES_BOUND];
     unsigned Mismatch_Char;
     unsigned long Pos;           // located: forward-genome start of the read
+    unsigned long Other_Start = 0;  // the same string's range start in the other index
+    int Anchor = 0;  // the string's start in the read (revfmi ranges) or its end (fwfmi): Locate_Other
 };
 
 struct Range {
     unsigned Start;
     unsigned End;
     int Label;
+    unsigned Other;  // Other_Start
 };
 
 // A result list of the mismatch search (Result_List). The caller clears it before each search.
@@ -149,6 +163,7 @@ int STRINGLENGTH = 36;
 struct Lookup_Entry {
     unsigned Start;
     unsigned End;
+    unsigned Other;  // Other_Start
 };
 std::vector<Lookup_Entry> Forward_Lookup;
 std::vector<Lookup_Entry> Backward_Lookup;
@@ -157,6 +172,17 @@ thread_local SARange Branch_Ranges[4];
 
 // Reference for located singletons (see Locate). Off with --no-ref.
 bool Use_Ref = false;
+// --switch-walk: index switches re-walk the seed's string in the other index, as
+// batmis1 (Mm_Start_Switch); off (the default), they read it off the seed's
+// Other_Start (Switched_Range).
+bool Switch_Walk = false;
+// A single row is located from either index's row (default; --own-row: its own index's
+// only, as batmis1): the other row stays put on a single-row path, so it is
+// tested where the path becomes single (Mm_Search_Enter, Mm_Single_Enter), the moving own
+// row after each step. Needs both indexes' SA samples (fwfmi loaded for -n 0 too).
+bool Both_Rows = true;
+// Whether the backward table (fwfmi) is needed: -n 1 and up.
+bool Need_Backward = true;
 // Without the reference, but with the SA samples loaded (SAM/BAM output): a single-row
 // path records its genome position in Pos at the first sampled row (Mark_Sampled).
 bool Track_Pos = false;
@@ -263,14 +289,42 @@ void Record_Mismatches(SARange& Tag, bool Right, int A, int B, const uint64_t* P
 // are matched. Right: revfmi, which indexes the reversed genome; the row stands for
 // read[0..Offset+Done). Otherwise fwfmi; the row stands for read[Offset+Len-Done..).
 // Returns false if the read would run off the genome (where the walk meets $).
-bool Locate(const ActiveBWT* fmi, SARange& Tag, bool Right, int Offset, int Len, int Done) {
-    const long P = fmi->saValue[Tag.Start / SAINTERVAL];
-    const long S = Right ? static_cast<long>(Text_Length) - (Offset + Done) - P : P - (Offset + Len - Done);
+#ifdef BATMIS2_VERIFY
+extern unsigned long Other_Checked, Other_Failed;
+#endif
+
+// Other: from the other index's row (Other_Start) instead: fwfmi's gives the string's
+// start in T, read position Anchor for a revfmi range; revfmi's gives n - its end, read
+// position Anchor for an fwfmi range (Both_Rows).
+bool Locate(const ActiveBWT* fmi, SARange& Tag, bool Right, int Offset, int Len, int Done, bool Other = false) {
+    long S;
+    if (Other) {
+        const ActiveBWT* O = Right ? fwfmi : revfmi;
+        const long P = O->saValue[Tag.Other_Start / SAINTERVAL];
+        S = Right ? P - Tag.Anchor : static_cast<long>(Text_Length) - P - Tag.Anchor;
+#ifdef BATMIS2_VERIFY
+        // Against the own row's walk (BWTSaValue).
+        const long Q = BWTSaValue(fmi, static_cast<unsigned>(Tag.Start));
+        const long Own = Right ? static_cast<long>(Text_Length) - (Offset + Done) - Q : Q - (Offset + Len - Done);
+        Other_Checked++;
+        if (Own != S && Other_Failed++ < 5)
+            std::fprintf(stderr, "Verify_Other: other row locates at %ld, own row at %ld (Right %d Offset %d Len %d Done %d Anchor %d Mismatches %d)\n",
+                         S, Own, Right, Offset, Len, Done, Tag.Anchor, Tag.Mismatches);
+#endif
+    } else {
+        const long P = fmi->saValue[Tag.Start / SAINTERVAL];
+        S = Right ? static_cast<long>(Text_Length) - (Offset + Done) - P : P - (Offset + Len - Done);
+    }
     Tag.Skip = 1;
     Tag.End = Tag.Start;
     if (S < 0 || S + STRINGLENGTH > static_cast<long>(Text_Length)) return false;
     Tag.Pos = S;
     return true;
+}
+
+// Whether a single row's other-index row is sampled, to locate from (Both_Rows).
+inline bool Other_Sampled(const SARange& T) {
+    return Use_Ref && Both_Rows && T.Other_Start && T.Other_Start % SAINTERVAL == 0;
 }
 
 // A single-row path without the reference reaching a sampled row: from now on Skip (a
@@ -365,12 +419,47 @@ inline void Count_Range(const ActiveBWT* fmi, unsigned long Start, unsigned long
     fm_occ::Count_Codes(fmi->bwtCode, Start - (Start > fmi->inverseSa0), End + 1 - (End + 1 > fmi->inverseSa0), Count);
 }
 
-// Narrows Start..End to the rows preceded by newChar (Start=0 if none). Ranges
-// with End-Start below BRANCHTHRESHOLD count their characters directly (Count_Range)
-// instead of a second occurrence lookup; see benchmark/branch_threshold.md.
-void Get_SARange(long newChar, unsigned long& start, unsigned long& end, ActiveBWT* fmi) {
+#ifdef BATMIS2_VERIFY
+// Checks Other_Start of a range of up to 32 rows in fmi: the other index's rows from
+// Other give the same occurrences, a string length apart (fwfmi gives starts, revfmi
+// n - ends). Counts the checks and failures (printed at exit).
+unsigned long Other_Checked = 0, Other_Failed = 0;
+void Verify_Other(const ActiveBWT* fmi, unsigned long Start, unsigned long End, unsigned long Other) {
+    if (!fwfmi || !Start || End < Start || End - Start >= 32) return;
+    const ActiveBWT* O = fmi == revfmi ? fwfmi : revfmi;
+    std::vector<long> A, B;
+    for (unsigned long r = Start; r <= End; r++) {
+        const long v = BWTSaValue(fmi, static_cast<unsigned>(r));
+        A.push_back(fmi == fwfmi ? v : static_cast<long>(Text_Length) - v);
+    }
+    for (unsigned long r = Other; r <= Other + (End - Start); r++) {
+        const long v = BWTSaValue(O, static_cast<unsigned>(r));
+        B.push_back(O == fwfmi ? v : static_cast<long>(Text_Length) - v);
+    }
+    std::sort(A.begin(), A.end());
+    std::sort(B.begin(), B.end());
+    const std::vector<long>& Starts = fmi == fwfmi ? A : B;
+    const std::vector<long>& Ends = fmi == fwfmi ? B : A;
+    Other_Checked++;
+    for (std::size_t k = 0; k < A.size(); k++)
+        if (Ends[k] - Starts[k] != Ends[0] - Starts[0] || Ends[0] <= Starts[0]) {
+            if (Other_Failed++ < 5) std::fprintf(stderr, "Verify_Other: rows %lu..%lu other %lu differ\n", Start, End, Other);
+            return;
+        }
+}
+struct Verify_Report {
+    ~Verify_Report() { std::fprintf(stderr, "Verify_Other: checked=%lu failed=%lu\n", Other_Checked, Other_Failed); }
+} Verify_Report_At_Exit;
+#endif
+
+// Get_SARange with Other_Start: it moves past the range's rows whose BWT character is $
+// or smaller than newChar, which come first in the other index. Ranges below
+// BRANCHTHRESHOLD have the counts already; wider ones take all four bases' Occ at both
+// ends (batmis1 takes newChar's alone), the bidirectional step's extra cost.
+void Get_SARange(long newChar, unsigned long& start, unsigned long& end, unsigned long& other, ActiveBWT* fmi) {
+    const unsigned long Dollar = fmi->inverseSa0 >= start && fmi->inverseSa0 <= end;
+    unsigned count[4];
     if (end - start < BRANCHTHRESHOLD) {
-        unsigned count[4];
         Count_Range(fmi, start, end, count);
         if (!count[newChar]) {
             start = 0;
@@ -378,26 +467,27 @@ void Get_SARange(long newChar, unsigned long& start, unsigned long& end, ActiveB
         }
         start = fmi->cumulativeFreq[newChar] + fm_occ::Occ_One(fmi, start, newChar) + 1;
         end = start + count[newChar] - 1;
-        return;
+    } else {
+        unsigned At_Start[4], At_End[4];
+        fm_occ::Occ_All(fmi, start, At_Start);
+        fm_occ::Occ_All(fmi, end + 1, At_End);
+        for (int b = 0; b < 4; b++) count[b] = At_End[b] - At_Start[b];
+        start = fmi->cumulativeFreq[newChar] + At_Start[newChar] + 1;
+        end = fmi->cumulativeFreq[newChar] + At_End[newChar];
+        if (end < start) {
+            start = 0;
+            return;
+        }
     }
-#ifdef BATMAN_ZERO_MIN_USE_PAIRED_RANK
-    unsigned int occValue[2];
-    BWTOccValueTwoIndex(fmi, static_cast<unsigned int>(start),
-                        static_cast<unsigned int>(end + 1),
-                        static_cast<unsigned int>(newChar), occValue);
-    start = fmi->cumulativeFreq[newChar] + occValue[0] + 1;
-    end = fmi->cumulativeFreq[newChar] + occValue[1];
-#else
-    start = fmi->cumulativeFreq[newChar] + fm_occ::Occ_One(fmi, start, newChar) + 1;
-    end = fmi->cumulativeFreq[newChar] + fm_occ::Occ_One(fmi, end + 1, newChar);
+    other += Dollar;
+    for (int b = 0; b < newChar; b++) other += count[b];
+#ifdef BATMIS2_VERIFY
+    Verify_Other(fmi, start, end, other);
 #endif
-    if (end < start) {
-        start = 0;
-    }
 }
 
 inline void Get_SARange(long newChar, SARange& range, ActiveBWT* fmi) {
-    Get_SARange(newChar, range.Start, range.End, fmi);
+    Get_SARange(newChar, range.Start, range.End, range.Other_Start, fmi);
 }
 
 // Returns Base unchanged, as a value the compiler cannot relate to anything
@@ -413,6 +503,7 @@ Range InitialBaseRange(ActiveBWT* fmi, int base) {
     range.Start = fmi->cumulativeFreq[base] + 1;
     range.End = fmi->cumulativeFreq[base + 1];
     if (range.Start > range.End) range.Start = 0;
+    range.Other = range.Start;  // a 1-base string: the same rows in both indexes
     return range;
 }
 
@@ -421,23 +512,23 @@ void Build_Preindex_Forward(Range range, int level, int bit) {
         assert(range.Start <= range.End);
         range.Label = range.Label | (bit << (2 * (level - 1)));
         if (range.Start) {
-            unsigned long start = range.Start;
-            unsigned long end = range.End;
-            Get_SARange(bit, start, end, revfmi);
+            unsigned long start = range.Start, end = range.End, other = range.Other;
+            Get_SARange(bit, start, end, other, revfmi);
             range.Start = static_cast<unsigned>(start);
             range.End = static_cast<unsigned>(end);
+            range.Other = static_cast<unsigned>(other);
         }
-        Forward_Lookup[range.Label] = {range.Start, range.End};
+        Forward_Lookup[range.Label] = {range.Start, range.End, range.Other};
         assert(range.Start <= range.End);
     } else {
         assert(range.Start <= range.End);
         range.Label = range.Label | (bit << (2 * (level - 1)));
         if (range.Start) {
-            unsigned long start = range.Start;
-            unsigned long end = range.End;
-            Get_SARange(bit, start, end, revfmi);
+            unsigned long start = range.Start, end = range.End, other = range.Other;
+            Get_SARange(bit, start, end, other, revfmi);
             range.Start = static_cast<unsigned>(start);
             range.End = static_cast<unsigned>(end);
+            range.Other = static_cast<unsigned>(other);
         }
         level++;
         for (int i = 0; i < 4; i++) {
@@ -452,14 +543,14 @@ void Build_Preindex_Backward(Range range, int level, int bit) {
     assert(range.Start <= range.End);
     range.Label = range.Label | (bit << (2 * (level - 1)));
     if (range.Start) {
-        unsigned long start = range.Start;
-        unsigned long end = range.End;
-        Get_SARange(bit, start, end, fwfmi);
+        unsigned long start = range.Start, end = range.End, other = range.Other;
+        Get_SARange(bit, start, end, other, fwfmi);
         range.Start = static_cast<unsigned>(start);
         range.End = static_cast<unsigned>(end);
+        range.Other = static_cast<unsigned>(other);
     }
     if (LOOKUPSIZE == level) {
-        Backward_Lookup[range.Label] = {range.Start, range.End};
+        Backward_Lookup[range.Label] = {range.Start, range.End, range.Other};
         assert(range.Start <= range.End);
     } else {
         level++;
@@ -474,7 +565,7 @@ void Build_Tables(ActiveBWT* fmi) {
     // than the left half. Reads too short for that (under 8 bp) keep the minimum 3.
     LOOKUPSIZE = std::max(3, std::min(LOOKUP_DEPTH, STRINGLENGTH / 2 - 1));
     Forward_Lookup.assign(1ul << (2 * LOOKUPSIZE), Lookup_Entry{});
-    if (fwfmi) Backward_Lookup.assign(1ul << (2 * LOOKUPSIZE), Lookup_Entry{});
+    if (fwfmi && Need_Backward) Backward_Lookup.assign(1ul << (2 * LOOKUPSIZE), Lookup_Entry{});
 
     Range lRange{};
     for (int i = 0; i < 4; i++) {
@@ -485,7 +576,7 @@ void Build_Tables(ActiveBWT* fmi) {
         }
     }
 
-    if (fwfmi) {
+    if (fwfmi && Need_Backward) {
         for (int i = 0; i < 4; i++) {
             lRange = InitialBaseRange(fwfmi, i);
             lRange.Label = i;
@@ -582,6 +673,8 @@ void Branch_Detect (const struct SARange Tag,BWT *fmi,int Start)
 		unsigned Count[4];
 		fm_occ::Occ_All(fmi, Tag.Start, Occ_Start);
 		Count_Range(fmi, Tag.Start, Tag.End, Count);
+		// Other_Start: past the range's $ row and the smaller bases' rows.
+		unsigned long Other = Tag.Other_Start + (fmi->inverseSa0 >= Tag.Start && fmi->inverseSa0 <= Tag.End);
 		for (int Branch=0;Branch<4;Branch++)
 		{
 			Branch_Characters[Branch]=Count[Branch];
@@ -589,7 +682,12 @@ void Branch_Detect (const struct SARange Tag,BWT *fmi,int Start)
 			{
 				Branch_Ranges[Branch].Start = fmi->cumulativeFreq[Branch] + Occ_Start[Branch] + 1;
 				Branch_Ranges[Branch].End = Branch_Ranges[Branch].Start + Count[Branch]-1;// Calculate SAranges
+				Branch_Ranges[Branch].Other_Start = Other;
+#ifdef BATMIS2_VERIFY
+				Verify_Other(fmi, Branch_Ranges[Branch].Start, Branch_Ranges[Branch].End, Other);
+#endif
 			}
+			Other += Count[Branch];
 		}
 	}
 	else
@@ -598,11 +696,17 @@ void Branch_Detect (const struct SARange Tag,BWT *fmi,int Start)
 		unsigned int ALIGN_16 Occ_Start[ALPHABET_SIZE], Occ_End[ALPHABET_SIZE];
 		fm_occ::Occ_All(fmi, Tag.Start, Occ_Start);
 		fm_occ::Occ_All(fmi, Tag.End + 1, Occ_End);
+		unsigned long Other = Tag.Other_Start + (fmi->inverseSa0 >= Tag.Start && fmi->inverseSa0 <= Tag.End);
 		for (int Branch=0;Branch<4;Branch++)
 		{
 				Branch_Ranges[Branch].Start = fmi->cumulativeFreq[Branch] + Occ_Start[Branch] + 1;
 				Branch_Ranges[Branch].End = fmi->cumulativeFreq[Branch] + Occ_End[Branch];
+				Branch_Ranges[Branch].Other_Start = Other;
 				if(!(Branch_Ranges[Branch].End<Branch_Ranges[Branch].Start)) Branch_Characters[Branch]=1;
+#ifdef BATMIS2_VERIFY
+				if (Branch_Characters[Branch]) Verify_Other(fmi, Branch_Ranges[Branch].Start, Branch_Ranges[Branch].End, Other);
+#endif
+				Other += Occ_End[Branch] - Occ_Start[Branch];
 		}
 
 	}
@@ -619,6 +723,7 @@ SARange Start_Range(std::string_view read) {
         const Range first = InitialBaseRange(revfmi, read[0]);
         range.Start = first.Start;
         range.End = first.End;
+        range.Other_Start = first.Other;
         for (int i = 1; i < length && range.Start; i++) Get_SARange(read[i], range, revfmi);
         range.Level = length + 1;
         return range;
@@ -627,6 +732,7 @@ SARange Start_Range(std::string_view read) {
     for (int i = 0; i < LOOKUPSIZE; i++) c |= read[i] << (2 * i);
     range.Start = Forward_Lookup[c].Start;
     range.End = Forward_Lookup[c].End;
+    range.Other_Start = Forward_Lookup[c].Other;
     range.Level = LOOKUPSIZE + 1;
     return range;
 }
@@ -643,6 +749,7 @@ SARange Segment_Start(std::string_view Seg, bool Right) {
         const Range Last = InitialBaseRange(fwfmi, Seg[Len - 1]);
         R.Start = Last.Start;
         R.End = Last.End;
+        R.Other_Start = Last.Other;
         for (int i = 1; i < Len && R.Start; i++) Get_SARange(Seg[Len - 1 - i], R, fwfmi);
         R.Level = Len + 1;
         return R;
@@ -651,6 +758,7 @@ SARange Segment_Start(std::string_view Seg, bool Right) {
     for (int i = 0; i < LOOKUPSIZE; i++) bc |= Seg[Len - 1 - i] << (2 * i);
     R.Start = Backward_Lookup[bc].Start;
     R.End = Backward_Lookup[bc].End;
+    R.Other_Start = Backward_Lookup[bc].Other;
     R.Level = LOOKUPSIZE + 1;
     return R;
 }
@@ -1152,6 +1260,7 @@ struct Mm_Lane {
     bool InTask, Done_Read;
     std::size_t Resume;   // OP_RESUME / OP_CROSS: next deferred range or seed
     bool Switching;       // the task is an index switch (Tag points into Patched)
+    bool Locate_Other;    // MM_LOCATE: from the other index's row (Both_Rows)
     int LH_Fail, RH_Fail; // the exact LH / RH searches' failure bounds (Window_Set)
     SARange Stored[2];    // OP_SEARCH_KEEP's kept ranges, if Stored_Valid
     bool Stored_Valid[2];
@@ -1170,6 +1279,8 @@ struct Mm_Lane {
     Mm_Sub Sub;
     Mm_Windows W;            // TASK_WINDOW
     unsigned long Width;     // TASK_SWITCH: the range's width, the same in both indexes
+    unsigned long Seed_Start;  // TASK_SWITCH: the seed's Start, the result's Other_Start
+    unsigned long Seed_Other;  // TASK_SWITCH: the seed's Other_Start, where the walk must end
     uint64_t Packed[MAXTAG / 32 + 1];
     char Patched[MAXTAG];    // TASK_SWITCH: the read with the seed's mismatch applied
     // Two-strand programs: the active strand (the fields above) and the other one.
@@ -1212,9 +1323,10 @@ inline void Mm_Search_Enter(Mm_Lane& L) {
         return;
     }
     L.Sub = MM_SINGLE;
-    if (T.Start % SAINTERVAL == 0 && !T.Skip) {
+    if (!T.Skip && (T.Start % SAINTERVAL == 0 || Other_Sampled(T))) {
         if (Use_Ref) {
             L.Done = T.Level - 1;
+            L.Locate_Other = T.Start % SAINTERVAL != 0;
             L.Sub = MM_LOCATE;
             return;
         }
@@ -1252,6 +1364,7 @@ inline bool Mm_Search_Step(Mm_Lane& L) {
             if (!T.Skip && T.Start % SAINTERVAL == 0) {
                 if (Use_Ref) {
                     L.Done = T.Level;
+                    L.Locate_Other = false;
                     L.Sub = MM_LOCATE;
                     return false;
                 }
@@ -1265,7 +1378,7 @@ inline bool Mm_Search_Step(Mm_Lane& L) {
             return false;
         }
         case MM_LOCATE:
-            if (!Locate(L.Fmi, T, L.Right, L.Offset, Len, L.Done)) {
+            if (!Locate(L.Fmi, T, L.Right, L.Offset, Len, L.Done, L.Locate_Other)) {
                 T.Level = Len;  // as Search_Located
                 return Mm_Search_End(L, false);
             }
@@ -1296,8 +1409,9 @@ inline bool Mm_Single_Enter(Mm_Lane& L) {
         return false;
     }
     L.Sub = MM_SINGLE;
-    if (T.Start % SAINTERVAL == 0 && !T.Skip) {
+    if (!T.Skip && (T.Start % SAINTERVAL == 0 || Other_Sampled(T))) {
         if (Use_Ref) {
+            L.Locate_Other = T.Start % SAINTERVAL != 0;
             L.Sub = MM_LOCATE;
             return false;
         }
@@ -1347,6 +1461,7 @@ inline bool Mm_Extend_Step(Mm_Lane& L) {
                 Temp.Forbidden_Base = NO_BASE;
                 Temp.Start = Branch_Ranges[Branch].Start;
                 Temp.End = Branch_Ranges[Branch].End;
+                Temp.Other_Start = Branch_Ranges[Branch].Other_Start;
                 if (Mm_Base(L, Temp.Level) != static_cast<unsigned>(Branch)) {
                     Temp.Mismatch_Char = Temp.Mismatch_Char | (Branch << Temp.Mismatches * 2);
                     Temp.Mismatch_Pos[Temp.Mismatches] = Mm_Read_Pos(L, Temp.Level);
@@ -1393,6 +1508,7 @@ inline bool Mm_Extend_Step(Mm_Lane& L) {
             }
             if (Use_Ref && T.Skip) {  // just reached a sampled row
                 T.Level++;
+                L.Locate_Other = false;
                 L.Sub = MM_LOCATE;
                 return false;
             }
@@ -1410,7 +1526,7 @@ inline bool Mm_Extend_Step(Mm_Lane& L) {
             return false;
         }
         case MM_LOCATE:
-            if (!Locate(L.Fmi, L.Cur, L.Right, L.Offset, Len, L.Cur.Level - 1)) return Mm_Single_Done(L);
+            if (!Locate(L.Fmi, L.Cur, L.Right, L.Offset, Len, L.Cur.Level - 1, L.Locate_Other)) return Mm_Single_Done(L);
             L.Sub = MM_LOCATED;
             return false;
         case MM_LOCATED:
@@ -1428,6 +1544,7 @@ inline void Mm_Start_Search(Mm_Lane& L, bool Right, std::string_view Tag, int Of
     L.Offset = Offset;
     L.Fmi = Fmi;
     L.Cur = R;
+    L.Cur.Anchor = Right ? Offset : Offset + static_cast<int>(Tag.size());  // the search's string starts (ends) with Tag
     L.Found = false;
     Mm_Search_Enter(L);
 }
@@ -1508,6 +1625,7 @@ inline bool Mm_Window_Step(Mm_Lane& L) {
                 SARange T = Range;
                 T.Start = Branch_Ranges[Branch].Start;
                 T.End = Branch_Ranges[Branch].End;
+                T.Other_Start = Branch_Ranges[Branch].Other_Start;
                 if (static_cast<unsigned>(Branch) != Expected) Mm_Record(T, Branch, x);
                 if (!Window_Keep(T, L.W, x, L.Right)) continue;
                 if (Mm_Window_Push(L, T)) return true;
@@ -1532,6 +1650,7 @@ inline bool Mm_Window_Step(Mm_Lane& L) {
             if (!Window_Keep(T, L.W, x, L.Right)) return Mm_Single_Done(L);
             if (Use_Ref && T.Skip) {  // just reached a sampled row
                 T.Level++;
+                L.Locate_Other = false;
                 L.Sub = MM_LOCATE;
                 return false;
             }
@@ -1545,7 +1664,7 @@ inline bool Mm_Window_Step(Mm_Lane& L) {
             return false;
         }
         case MM_LOCATE:
-            if (!Locate(L.Fmi, L.Cur, L.Right, L.Offset, Len, L.Cur.Level - 1)) return Mm_Single_Done(L);
+            if (!Locate(L.Fmi, L.Cur, L.Right, L.Offset, Len, L.Cur.Level - 1, L.Locate_Other)) return Mm_Single_Done(L);
             L.Sub = MM_LOCATED;
             return false;
         case MM_LOCATED: {
@@ -1584,13 +1703,33 @@ inline void Mm_Start_Switch(Mm_Lane& L, const SARange& Seed, unsigned Seg, bool 
     L.Tag = std::string_view(L.Patched + Offset, S.size());
     L.Offset = Offset;
     L.Width = Seed.Skip ? 1 : Seed.End - Seed.Start + 1;
+    L.Seed_Start = Seed.Start;
+    L.Seed_Other = Seed.Other_Start;
     L.Cur = Segment_Start(L.Tag, Right);
+    L.Cur.Anchor = Right ? Offset : Offset + static_cast<int>(S.size());
     L.Cur.Mismatches = Seed.Mismatches;
     L.Cur.Mismatch_Char = Seed.Mismatch_Char;
     std::memcpy(L.Cur.Mismatch_Pos, Seed.Mismatch_Pos, sizeof L.Cur.Mismatch_Pos);
     L.Switching = true;
     L.Found = false;
     L.Sub = MM_SWITCH;
+}
+
+// The range Mm_Start_Switch's walk ends at, at once: the seed's string in the other index
+// starts at the seed's Other_Start, with the seed's width, and its own Other_Start is the
+// seed's Start (bidirectional ranges, checked by -DBATMIS2_VERIFY against the walk).
+// Anchor: where the seed's string starts in the read (Right: the new range grows right)
+// or ends.
+inline SARange Switched_Range(const SARange& Seed, int Anchor) {
+    SARange R{};
+    R.Anchor = Anchor;
+    R.Start = Seed.Other_Start;
+    R.End = R.Start + (Seed.Skip ? 1 : Seed.End - Seed.Start + 1) - 1;
+    R.Other_Start = Seed.Start;
+    R.Mismatches = Seed.Mismatches;
+    R.Mismatch_Char = Seed.Mismatch_Char;
+    std::memcpy(R.Mismatch_Pos, Seed.Mismatch_Pos, sizeof R.Mismatch_Pos);
+    return R;
 }
 
 // One step of an index switch. Returns true when it has finished (Found, range in Cur).
@@ -1600,6 +1739,14 @@ inline bool Mm_Switch_Step(Mm_Lane& L) {
     if (!T.Start) return true;
     if (T.Level > Len) {
         T.End = T.Start + L.Width - 1;
+        T.Other_Start = L.Seed_Start;  // the same string, in the seed's index
+#ifdef BATMIS2_VERIFY
+        Verify_Other(L.Fmi, T.Start, T.End, T.Other_Start);
+        if (T.Start != L.Seed_Other) {
+            if (Other_Failed++ < 5) std::fprintf(stderr, "Verify_Other: switch walk ends at %lu, seed's Other_Start %lu\n", T.Start, L.Seed_Other);
+        }
+        Other_Checked++;
+#endif
         L.Found = true;
         return true;
     }
@@ -1690,7 +1837,8 @@ void Mm_Run(Mm_Lane& L, unsigned MaxHits) {
                     continue;
                 }
                 const std::string_view Seg = Mm_Segment(L, P.Seg, Offset);
-                const SARange R = Segment_Start(Seg, P.Right);
+                SARange R = Segment_Start(Seg, P.Right);
+                R.Anchor = P.Right ? Offset : Offset + static_cast<int>(Seg.size());  // also for a range taken whole
                 if (R.Level > static_cast<int>(Seg.size()) || !R.Start) {  // no longer than the key, or no match
                     L.Cur = R;
                     L.Found = R.Start != 0;
@@ -1720,7 +1868,8 @@ void Mm_Run(Mm_Lane& L, unsigned MaxHits) {
                     continue;
                 }
                 L.Stored_Valid[P.Stored - 1] = false;
-                const SARange R = Segment_Start(Seg, P.Right);
+                SARange R = Segment_Start(Seg, P.Right);
+                R.Anchor = P.Right ? Offset : Offset + static_cast<int>(Seg.size());  // also kept as is (Mm_Keep_Rest)
                 if (R.Level > static_cast<int>(Seg.size()) || !R.Start) {  // as OP_SEARCH
                     L.Cur = R;
                     L.Found = R.Start != 0;
@@ -1814,6 +1963,16 @@ void Mm_Run(Mm_Lane& L, unsigned MaxHits) {
                     }
                     const SARange& Seed = Seeds[L.Resume++];
                     if (P.Switch && !(Use_Ref && Seed.Skip)) {
+                        if (!Switch_Walk) {  // the switched range at once, then the crossing
+                            int Off;
+                            const std::string_view S2 = Read_Segment_Of(L.All, P.Seg2, Off);
+                            const int Anchor = P.Right ? Off : Off + static_cast<int>(S2.size());
+                            if (Mm_Cross_Extend(L, P, Switched_Range(Seed, Anchor), MaxHits)) {
+                                L.InTask = true;
+                                return;
+                            }
+                            continue;
+                        }
                         Mm_Start_Switch(L, Seed, P.Seg2, P.Right);
                         L.InTask = true;
                         return;
@@ -1864,7 +2023,8 @@ inline void Mm_Prefetch(const Mm_Lane& L) {
             Prefetch_Row(L.Fmi, T->Start);
             return;
         case MM_LOCATE:
-            __builtin_prefetch(L.Fmi->saValue + T->Start / SAINTERVAL);
+            if (L.Locate_Other) __builtin_prefetch((L.Right ? fwfmi : revfmi)->saValue + T->Other_Start / SAINTERVAL);
+            else __builtin_prefetch(L.Fmi->saValue + T->Start / SAINTERVAL);
             return;
         case MM_LOCATED:
             __builtin_prefetch(Pac.data() + (T->Pos + L.Offset) / 4);
@@ -2694,246 +2854,6 @@ std::size_t Sam_Requests(const std::vector<Sam_Candidate>& Candidates, unsigned 
     return Values;
 }
 
-// ---- Hit rows from the hit's range chain (Chain_Decode) ----
-//
-// A hit's range A_L is the SA range, in its index, of the hit string P' (the read on
-// its strand with the recorded mismatches), whatever route the search took. Exact
-// backward search of P' rebuilds the chain A_1 .. A_L (A_k: the first k characters the
-// index consumes; 2 lookups a step). LF keeps order: the t-th row of A_{k-1} whose BWT
-// character is the k-th consumed one maps to row s_k + t of A_k. So each hit row has an
-// exact ancestor in every A_k, a different row each time, with SA value (hit's) + L - k:
-// a sampled ancestor gives the hit row's value with no walk.
-//   - Where the width stays the same (a stretch), the ancestors are contiguous: a hit
-//     row keeps its offset o, and A_k samples it when (s_k + o) % saInterval == 0. A
-//     whole stretch is taken in one go: one k per class of s_k, each row looked up by
-//     its offset.
-//   - Where the width changes, one scan of A_{k-1}'s BWT characters, in order, finds
-//     the ancestors (select by counting).
-// Backtracking stops when every row is resolved, a scan would pass the budget
-// (A_{k-1} wider than CHAIN_SCAN_PER_ROW x the rows left + 4096), or a step after a
-// CHAIN_IDLE_SCANS scans in a row leave over 7/8 of the rows left (ancestors that stall,
-// as in a homopolymer run; independent ones resolve 1/8 a step); the rest go to
-// Sa_Decode. A hit is first tried on a sample of CHAIN_TRIAL rows. A hit that resolves less than 7/8 of its rows this way (e.g. a homopolymer
-// run, whose width changes every step, with no affordable scan) goes to Sa_Decode
-// whole: its spans beat walking the scattered rows left. Hits narrower than
-// CHAIN_MIN_ROWS skip this (the rebuild costs more than walking them).
-// Off unless built with SA_CHAIN: it measured no faster than Sa_Decode alone, whose spans
-// follow the copies of a repeat forward as cheaply as the chain follows them back (see
-// benchmark/sam_output.md, "Decoding SA rows").
-#ifndef CHAIN_MIN_ROWS
-#define CHAIN_MIN_ROWS 24
-#endif
-#ifndef CHAIN_SCAN_PER_ROW
-#define CHAIN_SCAN_PER_ROW 4
-#endif
-#ifndef CHAIN_IDLE_SCANS
-#define CHAIN_IDLE_SCANS 12
-#endif
-#ifndef CHAIN_TRIAL
-#define CHAIN_TRIAL 256
-#endif
-
-#ifdef BATMAN_BATCH_STATS
-struct Chain_Stats_Counts {  // per thread, as Batch_Stats
-    unsigned long Hits = 0, Failed = 0, Rows = 0, Resolved = 0, Used = 0, Stretch_Steps = 0, Scans = 0, Scanned = 0,
-                  Single_Ranks = 0;
-    void Add(const Chain_Stats_Counts& O) {
-        Hits += O.Hits;
-        Failed += O.Failed;
-        Rows += O.Rows;
-        Resolved += O.Resolved;
-        Used += O.Used;
-        Stretch_Steps += O.Stretch_Steps;
-        Scans += O.Scans;
-        Scanned += O.Scanned;
-        Single_Ranks += O.Single_Ranks;
-    }
-};
-thread_local Chain_Stats_Counts Chain_Stats;
-#endif
-
-// The BWT character of Row (not the $ row).
-inline unsigned Bwt_Char(const ActiveBWT* F, unsigned long Row) {
-    const unsigned long Index = Row - (Row > F->inverseSa0);
-    return F->bwtCode[Index / 16] << ((Index % 16) * 2) >> (BITS_IN_WORD - 2);
-}
-
-// Rows h.Start .. h.Start + Count - 1 of C's hit (Codes: the read): the ones resolved
-// from the chain get Values[j] (their SA value, as BWTSaValue) and Done[j] = 1. Returns
-// how many; 0 if the chain does not rebuild to the hit.
-std::size_t Chain_Decode(const Sam_Candidate& C, std::string_view Codes, unsigned long Count, unsigned* Values,
-                         unsigned char* Done) {
-    const SARange& h = *C.Hit;
-    ActiveBWT* F = C.Forward_Index ? fwfmi : revfmi;
-    const unsigned Interval = F->saInterval;
-    const int L = static_cast<int>(Codes.size());
-    if (Interval > 64 || L < 1) return 0;
-    static thread_local std::vector<unsigned char> P, Q;
-    static thread_local std::vector<unsigned long> S, E;
-    P.resize(L);
-    Q.assign(L + 1, 0);
-    S.assign(L + 1, 0);
-    E.assign(L + 1, 0);
-    for (int i = 0; i < L; i++) P[i] = C.Strand ? 3 - Codes[L - 1 - i] : Codes[i];
-    for (int i = 0; i < h.Mismatches && i < MAX_MISMATCHES_BOUND; i++) P[h.Mismatch_Pos[i]] = h.Mismatch_Char >> (2 * i) & 3;
-    for (int k = 1; k <= L; k++) Q[k] = C.Forward_Index ? P[L - k] : P[k - 1];  // fwfmi consumes P' from its end
-#ifdef BATMAN_BATCH_STATS
-    Chain_Stats.Hits++;
-    Chain_Stats.Rows += Count;
-#endif
-    // Widths never grow along the chain, so once one equals the hit's width the rest do
-    // too: those steps take one rank (the start) and the end is start + width - 1. The
-    // last step takes both, so the final check confirms the whole tail.
-    const unsigned long Hit_Width = h.End - h.Start + 1;
-    unsigned long s = F->cumulativeFreq[Q[1]] + 1, e = F->cumulativeFreq[Q[1] + 1];
-    S[1] = s;
-    E[1] = e;
-    for (int k = 2; k <= L && s && s <= e; k++) {
-        if (k < L && e - s + 1 == Hit_Width) {
-            s = F->cumulativeFreq[Q[k]] + fm_occ::Occ_One(F, static_cast<unsigned>(s), Q[k]) + 1;
-            e = s + Hit_Width - 1;
-#ifdef BATMAN_BATCH_STATS
-            Chain_Stats.Single_Ranks++;
-#endif
-        } else {
-            Get_SARange(Q[k], s, e, F);
-        }
-        S[k] = s;
-        E[k] = e;
-    }
-    if (!s || s != h.Start || e != h.End) {
-#ifdef BATMAN_BATCH_STATS
-        Chain_Stats.Failed++;
-#endif
-        return 0;
-    }
-    struct Row_Of {
-        unsigned long Row;  // the hit row's ancestor in the current range
-        unsigned long J;    // the hit row's offset
-    };
-    static thread_local std::vector<Row_Of> Rows;
-    int Class_K[64];
-    // Backtracks hit rows J0 .. J1 - 1; scan budgets count Scale rows per row left (a
-    // sample stands for the whole hit). Returns the rows resolved.
-    auto Backtrack = [&](unsigned long J0, unsigned long J1, unsigned long Scale) {
-        Rows.clear();
-        for (unsigned long j = J0; j < J1; j++) Rows.push_back({h.Start + j, j});
-        std::size_t Resolved = 0, Mark = Rows.size();
-        int Idle_Scans = 0;  // scans since the rows left last fell by 1/8
-        for (int k = L;;) {
-            // The stretch A_a .. A_k of equal width: one k per class of s_k.
-            const unsigned long Width = E[k] - S[k];
-            int a = k;
-            while (a > 1 && E[a - 1] - S[a - 1] == Width) a--;
-            std::fill(Class_K, Class_K + Interval, -1);
-            for (int k2 = k; k2 >= a; k2--)
-                if (Class_K[S[k2] % Interval] < 0) Class_K[S[k2] % Interval] = k2;
-            std::size_t Left = 0;
-            for (const Row_Of& R : Rows) {
-                const unsigned long o = R.Row - S[k];
-                const int k2 = Class_K[(Interval - o % Interval) % Interval];
-                if (k2 >= 0) {
-                    Values[R.J] = F->saValue[(S[k2] + o) / Interval] - static_cast<unsigned>(L - k2);
-                    Done[R.J] = 1;
-                    Resolved++;
-                } else {
-                    Rows[Left++] = {S[a] + o, R.J};
-                }
-            }
-            Rows.resize(Left);
-#ifdef BATMAN_BATCH_STATS
-            Chain_Stats.Stretch_Steps += k - a;
-#endif
-            if (8 * Left <= 7 * Mark) {
-                Mark = Left;
-                Idle_Scans = 0;
-            }
-            if (Rows.empty() || a == 1 || E[a - 1] - S[a - 1] + 1 > CHAIN_SCAN_PER_ROW * Scale * Rows.size() + 4096) break;
-            if (Idle_Scans++ >= CHAIN_IDLE_SCANS) break;  // ancestors stall (homopolymer)
-            // A_{a-1} -> A_a: the t-th row of A_{a-1} with character Q[a] is row S[a] + t.
-            // Scanned a BWT word (16 characters) at a time: a mask of the characters
-            // equal to Q[a], popcounted; only words holding a wanted occurrence are
-            // walked, and the scan stops after the last. Rows map to BWT positions
-            // skipping the $ row: Index = Row - (Row > inverseSa0).
-            const unsigned long Inv = F->inverseSa0;
-            const unsigned long Lo = S[a - 1] - (S[a - 1] > Inv), Hi = E[a - 1] - (E[a - 1] >= Inv);
-            const unsigned Pattern = Q[a] * 0x55555555u;
-            unsigned long t = 0, w = Lo / 16;
-            std::size_t i = 0;
-            for (; w <= Hi / 16 && i < Rows.size(); w++) {
-                const unsigned x = F->bwtCode[w] ^ Pattern;
-                unsigned m = ~(x | x >> 1) & 0x55555555u;  // low bit of each matching pair; pair p at bit 30 - 2p
-                if (w == Lo / 16) m &= (1u << (31 - 2 * (Lo % 16))) - 1;
-                if (w == Hi / 16) m &= ~((1u << (30 - 2 * (Hi % 16))) - 1);
-                const unsigned Count_W = __builtin_popcount(m);
-                if (S[a] + t + Count_W <= Rows[i].Row) {
-                    t += Count_W;
-                    continue;
-                }
-                for (; m && i < Rows.size(); t++) {
-                    const unsigned Bit = 31 - __builtin_clz(m);
-                    m &= ~(1u << Bit);
-                    if (S[a] + t == Rows[i].Row) {
-                        const unsigned long Index = w * 16 + (30 - Bit) / 2;
-                        Rows[i++].Row = Index + (Index >= Inv);
-                    }
-                }
-            }
-#ifdef BATMAN_BATCH_STATS
-            Chain_Stats.Scans++;
-            Chain_Stats.Scanned += 16 * (w - Lo / 16);
-#endif
-            k = a - 1;
-        }
-        return Resolved;
-    };
-    // A sample first (the first CHAIN_TRIAL rows: their ancestors come first in each
-    // scan, so it is cheap): the whole hit only if it resolves 7/8 of them.
-    const unsigned long Trial = std::min<unsigned long>(Count, CHAIN_TRIAL);
-    std::size_t Resolved = Backtrack(0, Trial, Count / Trial);
-    if (Resolved < Trial - Trial / 8) Resolved = 0;
-    else if (Trial < Count) Resolved += Backtrack(Trial, Count, 1);
-#ifdef BATMAN_BATCH_STATS
-    Chain_Stats.Resolved += Resolved;
-#endif
-    return Resolved;
-}
-
-// Requests[First ..] (Origins[i - First]: their candidates; Codes: the read): wide hits
-// are resolved from their chains first (Chain_Decode) and leave requests only for the
-// runs of rows left.
-void Chain_Requests(std::vector<Sa_Request>& Requests, std::size_t First, const std::vector<const Sam_Candidate*>& Origins,
-                    std::string_view Codes, std::vector<unsigned>& Values, std::vector<unsigned char>& Done) {
-    static thread_local std::vector<Sa_Request> Kept;
-    Kept.clear();
-    for (std::size_t i = First; i < Requests.size(); i++) {
-        const Sa_Request R = Requests[i];
-        const unsigned long Count = R.End - R.Start + 1;
-        const Sam_Candidate& C = *Origins[i - First];
-        if (Count < CHAIN_MIN_ROWS || C.Hit->Skip ||
-            Chain_Decode(C, Codes, Count, Values.data() + R.Out, Done.data() + R.Out) < Count - Count / 8) {
-            std::fill(Done.begin() + R.Out, Done.begin() + R.Out + Count, 0);
-            Kept.push_back(R);
-            continue;
-        }
-#ifdef BATMAN_BATCH_STATS
-        Chain_Stats.Used += std::count(Done.begin() + R.Out, Done.begin() + R.Out + Count, 1);
-#endif
-        for (unsigned long j = 0; j < Count;) {
-            if (Done[R.Out + j]) {
-                j++;
-                continue;
-            }
-            unsigned long k = j;
-            while (k < Count && !Done[R.Out + k]) k++;
-            Kept.push_back({R.Fmi, R.Start + j, R.Start + k - 1, R.Out + j});
-            j = k;
-        }
-    }
-    Requests.resize(First);
-    Requests.insert(Requests.end(), Kept.begin(), Kept.end());
-}
-
 // Builds one read's SAM/BAM records (into E) from its strands' lists (Res[1]: the reverse
 // complement's, or null): the hits in order of mismatches (forward strand first on a
 // tie), each location placed on its sequence (Genome_Map::Place; locations leaving a
@@ -3182,13 +3102,11 @@ bool Run_Batched(Read_File& in, std::ostream& out, unsigned B, unsigned Threads,
 #ifdef BATMAN_BATCH_STATS
     Batch_Stats_Counts* const mainBatch = &Batch_Stats;
     Decode_Stats_Counts* const mainDecode = &Decode_Stats;
-    Chain_Stats_Counts* const mainChain = &Chain_Stats;
     std::mutex statsMutex;
     auto atExit = [&] {
         std::lock_guard<std::mutex> Lock(statsMutex);
         mainBatch->Add(Batch_Stats);
         mainDecode->Add(Decode_Stats);
-        mainChain->Add(Chain_Stats);
     };
 #else
     auto atExit = [] {};
@@ -3210,18 +3128,12 @@ bool Run_Batched(Read_File& in, std::ostream& out, unsigned B, unsigned Threads,
         std::vector<Sa_Request> decodeRequests;
         std::vector<const Sam_Candidate*> origins;  // the current read's requests' candidates
         std::vector<unsigned> decoded;
-        std::vector<unsigned char> decodeDone;      // decoded by Chain_Requests already
         std::string lines;
         Sam_Encoder records;  // SAM/BAM: the part's records
         uint64_t hits = 0;
     };
     std::vector<Part> parts(Threads);
     std::vector<unsigned> partReads(Threads);  // searched reads in each part
-#ifdef SA_CHAIN
-    constexpr bool useChain = true;
-#else
-    constexpr bool useChain = false;
-#endif
     std::string reads;  // codes of the searched reads, back to back
     bool initialized = false;
     for (;;) {
@@ -3323,7 +3235,6 @@ bool Run_Batched(Read_File& in, std::ostream& out, unsigned B, unsigned Threads,
             pool.Run([&](unsigned t) {
                 Part& p = parts[t];
                 p.decodeRequests.clear();
-                p.decodeDone.clear();
                 std::size_t values = 0;
                 for (unsigned j = Part_Begin(t); j < Part_Begin(t + 1); j++) {
                     candidates[j].clear();
@@ -3340,16 +3251,10 @@ bool Run_Batched(Read_File& in, std::ostream& out, unsigned B, unsigned Threads,
                         }
                     }
                     decodeBegin[j] = values;
-                    const std::size_t first = p.decodeRequests.size();
                     p.origins.clear();
                     decodeCount[j] = Sam_Requests(candidates[j], maxHits, values, p.decodeRequests, p.origins);
                     values += decodeCount[j];
                     p.decoded.resize(values);
-                    p.decodeDone.resize(values, 0);
-                    if (useChain)
-                        Chain_Requests(p.decodeRequests, first, p.origins,
-                                       std::string_view(reads.data() + static_cast<std::size_t>(slot[j]) * STRINGLENGTH, STRINGLENGTH),
-                                       p.decoded, p.decodeDone);
                 }
                 p.decoded.resize(values);
                 Sa_Decode(p.decodeRequests, p.decoded);
@@ -3440,6 +3345,10 @@ void Usage(const char* prog) {
         "            sequences dropped. Needs the SA samples (.sa) even with --no-ref, which\n"
         "            then records positions at sampled rows of single-row paths\n"
         "  --forward-only  SAM/BAM: search the reads as given, not their reverse complements\n"
+        "  --switch-walk  index switches re-walk the seed in the other index (batmis1's\n"
+        "            way) instead of reading it off the bidirectional range\n"
+        "  --own-row  locate single rows from their own index's row only (batmis1's\n"
+        "            way), not from either index's\n"
         "  --lookup  depth k of the start-of-search tables, 3-14 (default 6): 8*4^k bytes\n"
         "            per index; deeper is faster once there are more than about 4^k/3 reads\n"
         "            (see benchmark/lookup_table.md)\n"
@@ -3515,6 +3424,10 @@ int main(int argc, char** argv) {
             }
         } else if (std::strcmp(argv[i], "--no-ref") == 0) {
             useRef = false;
+        } else if (std::strcmp(argv[i], "--switch-walk") == 0) {
+            Switch_Walk = true;
+        } else if (std::strcmp(argv[i], "--own-row") == 0) {
+            Both_Rows = false;
         } else if (std::strcmp(argv[i], "--sam") == 0) {
             samFormat = 1;
         } else if (std::strcmp(argv[i], "--bam") == 0) {
@@ -3584,7 +3497,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "Failed to load reverse index: %s / %s\n", revBwt.c_str(), revOcc.c_str());
         return 1;
     }
-    if (maxMismatches > 0) {
+    Need_Backward = maxMismatches > 0;
+    if (!useRef) Both_Rows = false;  // the other row is used to locate only
+    if (maxMismatches > 0 || Both_Rows) {
         fwfmi = BWTLoad(mmPool, fwBwt.c_str(), fwOcc.c_str(), loadSa ? fwSa.c_str() : nullptr, nullptr, nullptr, nullptr);
         if (!fwfmi) {
             std::fprintf(stderr, "Failed to load forward index: %s / %s\n", fwBwt.c_str(), fwOcc.c_str());
@@ -3609,7 +3524,7 @@ int main(int argc, char** argv) {
         std::string error, commandLine = argv[0];
         for (int i = 1; i < argc; i++) commandLine += std::string(" ") + argv[i];
         if (!sam.Map.Load(genomePrefix, error) ||
-            (!quiet && !sam.Writer.Open(outputFile.empty() ? "-" : outputFile, samFormat == 2, sam.Map, commandLine, error, threads))) {
+            (!quiet && (sam.Writer.Program = "batmis2", !sam.Writer.Open(outputFile.empty() ? "-" : outputFile, samFormat == 2, sam.Map, commandLine, error, threads)))) {
             std::fprintf(stderr, "%s\n", error.c_str());
             return 1;
         }
@@ -3655,7 +3570,7 @@ int main(int argc, char** argv) {
     if (timing) {
         const double totalSeconds = std::chrono::duration<double>(Clock::now() - totalStart).count();
         std::cerr << std::fixed << std::setprecision(6)
-                  << "batman_zero_min timing: index_load=" << indexLoadSeconds
+                  << "batmis2 timing: index_load=" << indexLoadSeconds
                   << "s table_build=" << tableBuildSeconds
                   << "s input_parse=" << inputParseSeconds
                   << "s input_read=" << inputReadSeconds
@@ -3683,17 +3598,12 @@ int main(int argc, char** argv) {
                 std::cerr << '\n';
             }
         }
-        if (Decode_Stats.Rows || Chain_Stats.Hits)
+        if (Decode_Stats.Rows)
             std::cerr << "decode: seconds=" << Decode_Stats.Seconds << " rows=" << Decode_Stats.Rows << " read_off=" << Decode_Stats.Direct
                       << " group_lookups=" << Decode_Stats.Range_Steps << " span_steps=" << Decode_Stats.Span_Steps
                       << " row_steps=" << Decode_Stats.Walk_Steps << " lookups_per_row="
                       << double(Decode_Stats.Range_Steps + 2 * Decode_Stats.Span_Steps + Decode_Stats.Walk_Steps) / Decode_Stats.Rows
                       << '\n';
-        if (Chain_Stats.Hits)
-            std::cerr << "chain: hits=" << Chain_Stats.Hits << " failed=" << Chain_Stats.Failed << " rows=" << Chain_Stats.Rows
-                      << " resolved=" << Chain_Stats.Resolved << " used=" << Chain_Stats.Used << " stretch_steps=" << Chain_Stats.Stretch_Steps
-                      << " scans=" << Chain_Stats.Scans << " scanned=" << Chain_Stats.Scanned
-                      << " single_ranks=" << Chain_Stats.Single_Ranks << '\n';
 #endif
     }
 

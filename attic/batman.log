@@ -1,0 +1,19 @@
+/home/chandana.tennakoon@pirbright.ac.uk/git/batmis/Original/BatMis-3.00/bin/batman -g /home/chandana.tennakoon@pirbright.ac.uk/git/batmis/batlib_port/benchmark/dataset_5m_100bp_n4/ref.fa -q /home/chandana.tennakoon@pirbright.ac.uk/git/batmis/batlib_port/benchmark/dataset_5m_100bp_n4/reads.fq -o /tmp/claude-1063864680/-home-chandana-tennakoon-pirbright-ac-uk-git-batmis-batmis-port-BatMis-3-00/efb8dfa7-5da9-4725-9d7e-63eb5d9ce11d/scratchpad/bench/runs/g200k_10M_n0_mall_r3.orig.bin -n 0 -c -mall 
+ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-
+Using the genome files
+ /home/chandana.tennakoon@pirbright.ac.uk/git/batmis/batlib_port/benchmark/dataset_5m_100bp_n4/ref.fa.bwt	 /home/chandana.tennakoon@pirbright.ac.uk/git/batmis/batlib_port/benchmark/dataset_5m_100bp_n4/ref.fa.fmv
+ /home/chandana.tennakoon@pirbright.ac.uk/git/batmis/batlib_port/benchmark/dataset_5m_100bp_n4/revref.fa.bwt	 /home/chandana.tennakoon@pirbright.ac.uk/git/batmis/batlib_port/benchmark/dataset_5m_100bp_n4/revref.fa.fmv
+Query File : /home/chandana.tennakoon@pirbright.ac.uk/git/batmis/batlib_port/benchmark/dataset_5m_100bp_n4/reads.fq 		 Output file: /tmp/claude-1063864680/-home-chandana-tennakoon-pirbright-ac-uk-git-batmis-batmis-port-BatMis-3-00/efb8dfa7-5da9-4725-9d7e-63eb5d9ce11d/scratchpad/bench/runs/g200k_10M_n0_mall_r3.orig.bin
+Length of Tags: 100	Mismatches allowed : 0
+FASTQ file..
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-
+Not using Quality info...
+Not scanning complement...
+Not scanning indels...
+^^Scanning in zigzag mode^^
+Output all hits..
+5%->10%->15%->20%->25%->30%->35%->40%->45%->50%->55%->60%->65%->70%->74%->79%->84%->89%->94%->100%
+Total Tags/Hits : 10000000/10000000	 Tags parsed : 10000000
+
+ Time Taken  - 19 Seconds ..
+ 

@@ -133,6 +133,9 @@ public:
     Sam_Writer& operator=(const Sam_Writer&) = delete;
     ~Sam_Writer() { Close(); }
 
+    // The @PG ID and name the header gives (each mapper sets its own).
+    std::string Program = "batmis";
+
     // Opens Path ("-": stdout) as BAM or SAM and writes the header. False with Error set
     // on failure. BAM is compressed by Threads threads (htslib's pool) if more than one.
     bool Open(const std::string& Path, bool Bam, const Genome_Map& Map, const std::string& Command_Line,
@@ -148,7 +151,7 @@ public:
             if (sam_hdr_add_line(Header, "SQ", "SN", Map.Name(I).c_str(), "LN", Length.c_str(), NULL) < 0)
                 return Fail(Error, "cannot add @SQ " + Map.Name(I));
         }
-        if (sam_hdr_add_line(Header, "PG", "ID", "batman_zero_min", "PN", "batman_zero_min", "CL", Command_Line.c_str(),
+        if (sam_hdr_add_line(Header, "PG", "ID", Program.c_str(), "PN", Program.c_str(), "CL", Command_Line.c_str(),
                              NULL) < 0)
             return Fail(Error, "cannot add @PG");
         if (sam_hdr_write(File, Header) < 0) return Fail(Error, "cannot write the SAM header");
