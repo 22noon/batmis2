@@ -1,0 +1,70 @@
+# Paper benchmark configuration (bench.py). Paths may use ${VAR} environment variables.
+# On the HPC node everything under work: should be node-local scratch.
+
+work: ${BENCH_WORK}                  # data, indexes, reads, runs (node-local scratch)
+tools: ${BENCH_WORK}/tools           # build_tools.sh PREFIX
+results: ${BENCH_RESULTS}            # merged TSVs and figures (kept; e.g. the repository's benchmark/paper/results)
+
+threads: [1, 16]                     # main tables
+scaling_threads: [1, 2, 4, 8, 16, 32]
+repeats: 3                           # timed repeats after one warm-up run
+time_limit_s: 21600                  # a run over this is recorded as TIMEOUT; larger K of the series are skipped
+index_time_limit_s: 86400
+single_repeat_above_s: 1800          # a warm-up longer than this: one timed repeat instead of `repeats`
+single_thread_reads: 1000000         # 1-thread runs on real data use the first this many reads
+keep_sam: false                      # SAM output is deleted after each run (correctness runs keep hits.tsv)
+k_exact: [0, 1, 2, 3, 4, 5]
+k_extra: [7]                         # only for tools that accept it (batmis1/2, columba, mrsfast)
+
+# Extra options per tool, applied to every mapping run. batmis's lookup table depth 11
+# suits 0.5-2M reads (benchmark/lookup_table.md); smaller read sets use the default 6.
+tool_options:
+  batmis1: {large: ["--lookup", "11"]}
+  batmis2: {large: ["--lookup", "11"]}
+large_reads: 500000                  # a read set with at least this many reads is "large"
+
+genomes:
+  sarscov2:
+    url: https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nuccore&id=NC_045512.2&rettype=fasta
+  ecoli:
+    url: https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nuccore&id=NC_000913.3&rettype=fasta
+  human:
+    url: https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/000/001/405/GCA_000001405.15_GRCh38/seqs_for_alignment_pipelines.ucsc_ids/GCA_000001405.15_GRCh38_no_alt_analysis_set.fna.gz
+  chr21:                             # pilot: the human pipeline on a brute-forceable genome
+    from: human
+    contigs: [chr21]
+
+# Real reads: R1 of a paired run, streamed from ENA; sample_fraction keeps reads by a hash
+# of their name (deterministic), then prepare trims them to each length.
+real:
+  sarscov2_artic:                    # COG-UK ARTIC amplicons, NextSeq 550, 2x~150 (PRJEB37886)
+    genome: sarscov2
+    url: https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR420/004/ERR4207974/ERR4207974_1.fastq.gz
+    sample_fraction: 1.0
+    lengths: [40, 100, 150]
+  hg002:                             # GIAB HG002, NovaSeq 6000, 2x151 (PRJNA752795)
+    genome: human
+    url: https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR153/056/SRR15395856/SRR15395856_1.fastq.gz
+    sample_fraction: 0.137           # about 10M of 73M reads
+    lengths: [40, 100, 150]
+
+# Simulated reads (simulate_reads.py), per genome and length.
+simulated:
+  genomes: [sarscov2, ecoli, human]
+  lengths: [40, 100, 150]
+  timing_reads: 1000000              # stratified set used for timing
+  correctness_reads: 100000          # stratified set checked against brute force / verified union
+  realistic_reads: 1000000           # position-dependent substitution profile (+ indels for the approximate group)
+  pilot_genomes: [chr21]             # correctness sets only, pilot_reads reads each
+  pilot_reads: 10000
+  max_k: 7
+  random_fraction: 0.1               # reads with no hit
+  seed: 20261117
+
+brute_force_genomes: [sarscov2, ecoli, chr21]   # truth by scanning; human uses the verified union
+
+# Thread scaling (kind=scaling): the threads of scaling_threads not already in threads.
+scaling:
+  datasets: [sim_human_100_timing, real_hg002_100]
+  tools: [batmis1, batmis2, bwa_aln, bowtie, columba, mrsfast]
+  k: [2, 4]
