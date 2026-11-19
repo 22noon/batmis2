@@ -241,9 +241,9 @@ def matrix(cfg):
     for dname, ds in datasets(cfg).items():
         kind = ds["kind"]
         if kind in ("timing", "realdata"):
-            for tool in T.EXACT + T.SUPPLEMENTARY:
+            for tool in T.EXACT + T.NOREF + T.SUPPLEMENTARY:
                 for k in ks + kx:
-                    if not T.accepts(tool, k) or (k in kx and tool not in ("batmis1", "batmis2", "columba", "mrsfast")):
+                    if not T.accepts(tool, k) or (k in kx and tool not in T.HIGH_K):
                         continue
                     if tool in T.SUPPLEMENTARY and (k not in (0, 2, 4) or kind != "timing"):
                         continue
@@ -261,9 +261,9 @@ def matrix(cfg):
                             runs.append(dict(kind=kind, dataset=dname, genome=ds["genome"], length=ds["length"],
                                              tool=tool, k=-1, mode=mode, threads=t, rep=rep))
         elif kind == "check":
-            for tool in T.EXACT:
+            for tool in T.EXACT + T.NOREF:
                 for k in ks + kx:
-                    if not T.accepts(tool, k) or (k in kx and tool not in ("batmis1", "batmis2", "columba", "mrsfast")):
+                    if not T.accepts(tool, k) or (k in kx and tool not in T.HIGH_K):
                         continue
                     for mode in ("first", "all"):
                         runs.append(dict(kind=kind, dataset=dname, genome=ds["genome"], length=ds["length"],
@@ -290,7 +290,7 @@ def matrix(cfg):
                                          tool=tool, k=k, mode=mode, threads=t, rep=1))
     # Index load: one read, per genome and tool.
     for g in {ds["genome"] for ds in datasets(cfg).values()}:
-        for tool in T.EXACT + T.APPROXIMATE:
+        for tool in T.EXACT + T.NOREF + T.APPROXIMATE:
             runs.append(dict(kind="load", dataset=f"one_{g}", genome=g, length=0, tool=tool,
                              k=0 if tool in T.APPROXIMATE else min(2, T.MAX_K.get(tool, 7)), mode="first", threads=1, rep=1))
     for r in runs:
@@ -362,7 +362,7 @@ def execute(cfg, r, dry_run=False):
     reads, L = reads_for(cfg, r)
     out = os.path.join(d, "out.sam")
     extra = []
-    opts = cfg.get("tool_options", {}).get(r["tool"], {})
+    opts = cfg.get("tool_options", {}).get(r["tool"].replace("_noref", ""), {})  # no-ref: batmis's options
     if "large" in opts and r["kind"] != "load" and os.path.exists(reads) and \
             os.path.getsize(reads) > cfg.get("large_reads", 500000) * (2 * L + 30):
         extra = opts["large"]

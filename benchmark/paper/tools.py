@@ -19,6 +19,12 @@ Exact tools (every hit within K mismatches, Hamming distance):
   mrsfast           -e K; first: --best; all: default (all mappings)
 bwa_aln_stock runs bwa_aln's commands with BWA built by its own Makefile flags.
 
+BatMis without the reference (NOREF, its own experiment; the cross-tool comparison uses
+the reference-loaded runs above):
+  batmis1_noref, batmis2_noref  the same with --no-ref: single-row paths walk the index to
+                    the end instead of being finished against the packed genome (.pac,
+                    not loaded). With --sam the SA samples (.sa) are still loaded.
+
 Approximate tools (heuristic, gapped; no K):
   bwa_mem           first: default; all: -a
   bowtie2           --end-to-end --very-sensitive; first: default; all: -k 100
@@ -27,13 +33,16 @@ import math, os
 
 EXACT = ["batmis1", "batmis2", "original", "bwa_aln", "bowtie", "columba", "mrsfast"]
 SUPPLEMENTARY = ["bwa_aln_stock"]
+NOREF = ["batmis1_noref", "batmis2_noref"]
+HIGH_K = {"batmis1", "batmis2", "batmis1_noref", "batmis2_noref", "columba", "mrsfast"}  # run at k_extra too
 APPROXIMATE = ["bwa_mem", "bowtie2"]
 
 MAX_K = {"bowtie": 3, "original": 5, "bwa_aln": 5, "bwa_aln_stock": 5}
 THREADED = {"original": False}
 
 # The index each tool reads, by directory under <index>/<genome>/.
-INDEX_OF = {"batmis1": "batmis", "batmis2": "batmis", "original": "batmis", "bwa_aln": "bwa",
+INDEX_OF = {"batmis1": "batmis", "batmis2": "batmis", "batmis1_noref": "batmis", "batmis2_noref": "batmis",
+            "original": "batmis", "bwa_aln": "bwa",
             "bwa_aln_stock": "bwa", "bwa_mem": "bwa", "bowtie": "bowtie",
             "bowtie2": "bowtie2", "columba": "columba", "mrsfast": "mrsfast"}
 INDEXES = ["batmis", "bwa", "bowtie", "bowtie2", "columba", "mrsfast"]
@@ -70,10 +79,11 @@ def map_reads(tool, tools, idx_dir, genome, reads, length, k, mode, threads, out
     p = os.path.join(idx_dir, genome)
     first = mode == "first"
     t = str(threads)
-    if tool in ("batmis1", "batmis2"):
-        return [("map", [b("batmis", tool), "-g", os.path.join(idx_dir, os.path.basename(genome_fasta_name(genome))),
+    if tool in ("batmis1", "batmis2", "batmis1_noref", "batmis2_noref"):
+        exe = tool.replace("_noref", "")
+        return [("map", [b("batmis", exe), "-g", os.path.join(idx_dir, os.path.basename(genome_fasta_name(genome))),
                          "-q", reads, "-n", str(k), "-m", "1" if first else "0", "--sam", "-t", t, "-o", out,
-                         "--timing", *extra], None)]
+                         "--timing", *(["--no-ref"] if tool.endswith("_noref") else []), *extra], None)]
     if tool == "original":
         g = os.path.join(idx_dir, os.path.basename(genome_fasta_name(genome)))
         return [("align", [b("original", "batman"), "-g", g, "-q", reads, "-n", str(k),

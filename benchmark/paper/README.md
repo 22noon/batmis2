@@ -103,6 +103,20 @@ Run behaviour:
 - Output SAM goes to node-local disk and is deleted after the run; correctness runs keep their
   hits, normalised (`normalize_hits.py`).
 
+## BatMis with and without the reference
+
+batmis1 and batmis2 normally load the packed genome (`.pac`) and finish a single-row search
+path against it ("reference loaded"). With `--no-ref` they walk the path through the index to
+its end instead: less memory, more index steps. Every cross-tool comparison uses the
+reference-loaded runs; `batmis1_noref` and `batmis2_noref` repeat batmis's whole timing
+matrix (every timing and real-data set, all K, both modes, both thread counts) and its
+correctness and load runs, with `--no-ref` added. Both write SAM, which needs the SA samples
+(`.sa`) either way, so the memory difference is the `.pac` file.
+
+`report.py` draws `batmis_ref_vs_noref_*` (time against K, reference loaded solid, without
+dashed) and tabulates wall time, batmis's own search and index-load times, and peak memory
+both ways, with the ratio.
+
 ## Analysing discrepancies
 
 `bench.py correct` counts each tool's missed and extra hits; `bench.py discrepancies` says why.

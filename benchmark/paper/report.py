@@ -37,9 +37,13 @@ STYLE = {
     "bwa_mem": ("#e34948", "*", "BWA-MEM"),
     "bowtie2": ("#7a7a7a", "h", "Bowtie 2"),
     "bwa_aln_stock": ("#eda100", "1", "BWA aln, stock build"),
+    "batmis2_noref": ("#2a78d6", "o", "BatMis2, no reference"),
+    "batmis1_noref": ("#eb6834", "s", "BatMis1, no reference"),
 }
 ORDER = list(STYLE)
-MAIN = [t for t in ORDER if not t.startswith("bwa_aln_")]  # the supplementary BWA builds get their own figure
+# The cross-tool figures: reference-loaded BatMis only; the supplementary BWA build and the
+# no-reference runs get figures of their own.
+MAIN = [t for t in ORDER if not t.startswith("bwa_aln_") and not t.endswith("_noref")]
 INK, MUTED, GRID = "#1f1f1f", "#5c5c5c", "#e4e4e4"
 
 plt.rcParams.update({
@@ -111,6 +115,33 @@ for (base, mode, threads), rs in sorted(groups.items()):
     fig.suptitle(f"{base}, {'first hit' if mode == 'first' else 'all hits'}, {threads} thread{'s' * (threads > 1)}",
                  y=1.18, color=INK)
     save(fig, f"time_vs_k_{base}_{mode}_t{threads}")
+
+# ---------------------------------------------------------------- BatMis: reference loaded or not
+# Same colour per version; reference loaded solid, without it dashed with hollow markers.
+for (base, mode, threads), rs in sorted(groups.items()):
+    if not any(r["tool"].endswith("_noref") for r in rs):
+        continue
+    lengths = sorted({r["length"] for r in rs})
+    fig, axes = plt.subplots(1, len(lengths), figsize=(2.6 * len(lengths), 2.6), squeeze=False)
+    for ax, L in zip(axes[0], lengths):
+        for tool in ("batmis2", "batmis2_noref", "batmis1", "batmis1_noref"):
+            pts = sorted((r["k"], num(r["wall_s_median"])) for r in rs if r["tool"] == tool and r["length"] == L)
+            if not pts:
+                continue
+            c, m, lab = STYLE[tool]
+            noref = tool.endswith("_noref")
+            ax.plot([p[0] for p in pts], [p[1] for p in pts], color=c, marker=m, label=lab,
+                    linestyle="--" if noref else "-", markerfacecolor="white" if noref else c)
+        ax.set_yscale("log")
+        plain_log(ax.yaxis)
+        ax.set_title(f"{L} bp", color=INK)
+        ax.set_xlabel("mismatches K")
+    axes[0][0].set_ylabel("wall time (s)")
+    h, l = axes[0][0].get_legend_handles_labels()
+    fig.legend(h, l, loc="upper center", ncol=2, bbox_to_anchor=(0.5, 1.14))
+    fig.suptitle(f"BatMis with and without the reference: {base}, {'first hit' if mode == 'first' else 'all hits'}, "
+                 f"{threads} thread{'s' * (threads > 1)}", y=1.2, color=INK)
+    save(fig, f"batmis_ref_vs_noref_{base}_{mode}_t{threads}")
 
 # ---------------------------------------------------------------- BWA builds (supplementary)
 bwa = defaultdict(list)
@@ -208,6 +239,32 @@ if cor:
         lines.append(f"| {r['dataset']} | {r['tool']} | {k} | {r['mode']} | {r['truth'] or r['truth_reads']} | "
                      f"{r['missed']} | {r['invalid']} | {r['missed_reads']} | {r['not_best']} | "
                      + (f"{100 * f / t:.2f}%" if t else "") + " |")
+    lines.append("")
+
+pairs = {}
+for r in timing:
+    if r["kind"] in ("timing", "realdata", "load") and r["tool"] in ("batmis1", "batmis2", "batmis1_noref", "batmis2_noref"):
+        pairs[(r["kind"], r["dataset"], r["tool"].replace("_noref", ""), r["k"], r["mode"], r["threads"],
+               r["tool"].endswith("_noref"))] = r
+if any(key[-1] for key in pairs):
+    lines += ["## BatMis: reference loaded or not", "",
+              "Median wall seconds and peak memory with the reference loaded (`.pac`, the default, used in every "
+              "cross-tool comparison) and with `--no-ref`; both write SAM, so both load the SA samples. "
+              "Search and index load are batmis's own `--timing` figures. Ratio = no-ref / ref.", "",
+              "| read set | tool | K | mode | threads | wall ref | wall no-ref | ratio | search ref | search no-ref | "
+              "load ref | load no-ref | memory ref (MB) | memory no-ref (MB) |",
+              "|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    f = lambda x, d=2: f"{x:.{d}f}" if x is not None else ""
+    for key in sorted(k for k in pairs if not k[-1]):
+        ref, nr = pairs[key], pairs.get(key[:-1] + (True,))
+        if not nr:
+            continue
+        w0, w1 = num(ref["wall_s_median"]), num(nr["wall_s_median"])
+        m0, m1 = num(ref["max_rss_kb_median"]), num(nr["max_rss_kb_median"])
+        lines.append(f"| {key[1]} | {key[2]} | {key[3]} | {key[4]} | {key[5]} | {f(w0)} | {f(w1)} | "
+                     + (f"{w1 / w0:.2f}" if w0 and w1 else "") + f" | {f(num(ref['tool_search_median']))} | "
+                     f"{f(num(nr['tool_search_median']))} | {f(num(ref['tool_index_load_median']))} | "
+                     f"{f(num(nr['tool_index_load_median']))} | {f(m0 and m0 / 1024, 0)} | {f(m1 and m1 / 1024, 0)} |")
     lines.append("")
 
 disc = sorted(glob.glob(os.path.join(OUT, "discrepancies", "*", "summary.tsv")))
