@@ -9,6 +9,7 @@
   bench.py [-c ...] run [filters] [--dry-run]     run the matrix's missing runs, in order
   bench.py [-c ...] truth [--datasets d,..]       brute-force hits of the correctness sets
   bench.py [-c ...] correct [filters]             score the correctness runs
+  bench.py [-c ...] discrepancies [filters] [--read NAME]   explain each missed or extra hit
   bench.py [-c ...] collect                       merge every result into <results>/*.tsv
 
 Filters select runs by field: --set kind=timing,genome=ecoli,tool=batmis2,k=2 (values may be
@@ -509,6 +510,32 @@ def cmd_correct(cfg, a):
         subprocess.run(args, check=True)
 
 
+def cmd_discrepancies(cfg, a):
+    """discrepancies.py per correctness set (check kind: the sets with all-hits runs), into
+    <results>/discrepancies/<set>/; with --read, one read of one set (--set dataset=...)."""
+    runs = [r for r in select(matrix(cfg), a) if r["kind"] == "check" and done(cfg, r)]
+    by_set = {}
+    for r in runs:
+        by_set.setdefault(r["dataset"], []).append(r)
+    if a.read and len(by_set) != 1:
+        sys.exit("--read needs --set dataset=<one read set>")
+    for name, rs in sorted(by_set.items()):
+        ds = datasets(cfg)[name]
+        truth = wpath(cfg, "truth", name + ".tsv")
+        args = [sys.executable, os.path.join(HERE, "discrepancies.py"), "--genome", genome_fa(cfg, ds["genome"]),
+                "--reads", ds["fq"]]
+        args += ["--read", a.read] if a.read else ["--out", os.path.join(cfg["results"], "discrepancies", name)]
+        if os.path.exists(truth):
+            args += ["--truth", truth]
+        for r in rs:
+            hits = os.path.join(run_dir(cfg, r), "hits.tsv")
+            if os.path.exists(hits):
+                args += ["--run", f"{r['tool']}:{r['k']}:{r['mode']}:{hits}"]
+        if not a.read:
+            print(f"discrepancies {name}", file=sys.stderr, flush=True)
+        subprocess.run(args, check=True)
+
+
 def cmd_collect(cfg, a):
     os.makedirs(cfg["results"], exist_ok=True)
     subprocess.run([sys.executable, os.path.join(HERE, "collect.py"), wpath(cfg, "runs"), cfg["results"],
@@ -523,10 +550,12 @@ def main():
     p = sub.add_parser("simulate"); p.add_argument("--genomes")
     p = sub.add_parser("prepare"); p.add_argument("--real")
     p = sub.add_parser("index"); p.add_argument("--genomes"); p.add_argument("--indexes")
-    for name in ("list", "run", "correct"):
+    for name in ("list", "run", "correct", "discrepancies"):
         p = sub.add_parser(name); p.add_argument("--set")
         if name == "run":
             p.add_argument("--dry-run", action="store_true")
+        if name == "discrepancies":
+            p.add_argument("--read", help="show one read of the one selected set")
     p = sub.add_parser("truth"); p.add_argument("--datasets")
     sub.add_parser("collect")
     a = ap.parse_args()

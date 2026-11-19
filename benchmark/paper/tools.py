@@ -17,7 +17,7 @@ Exact tools (every hit within K mismatches, Hamming distance):
   columba           -m hamming; all: -a all -e K; first: -a best -I <identity of K>
                     (Columba has no one-hit mode: best mode reports every best-stratum hit)
   mrsfast           -e K; first: --best; all: default (all mappings)
-bwa_aln_stock and bwa_aln_popcnt run bwa_aln's commands with the other two BWA builds.
+bwa_aln_stock runs bwa_aln's commands with BWA built by its own Makefile flags.
 
 Approximate tools (heuristic, gapped; no K):
   bwa_mem           first: default; all: -a
@@ -26,15 +26,15 @@ Approximate tools (heuristic, gapped; no K):
 import math, os
 
 EXACT = ["batmis1", "batmis2", "original", "bwa_aln", "bowtie", "columba", "mrsfast"]
-SUPPLEMENTARY = ["bwa_aln_stock", "bwa_aln_popcnt"]
+SUPPLEMENTARY = ["bwa_aln_stock"]
 APPROXIMATE = ["bwa_mem", "bowtie2"]
 
-MAX_K = {"bowtie": 3, "original": 5, "bwa_aln": 5, "bwa_aln_stock": 5, "bwa_aln_popcnt": 5}
+MAX_K = {"bowtie": 3, "original": 5, "bwa_aln": 5, "bwa_aln_stock": 5}
 THREADED = {"original": False}
 
 # The index each tool reads, by directory under <index>/<genome>/.
 INDEX_OF = {"batmis1": "batmis", "batmis2": "batmis", "original": "batmis", "bwa_aln": "bwa",
-            "bwa_aln_stock": "bwa", "bwa_aln_popcnt": "bwa", "bwa_mem": "bwa", "bowtie": "bowtie",
+            "bwa_aln_stock": "bwa", "bwa_mem": "bwa", "bowtie": "bowtie",
             "bowtie2": "bowtie2", "columba": "columba", "mrsfast": "mrsfast"}
 INDEXES = ["batmis", "bwa", "bowtie", "bowtie2", "columba", "mrsfast"]
 
@@ -80,7 +80,7 @@ def map_reads(tool, tools, idx_dir, genome, reads, length, k, mode, threads, out
                            *(["-m", "1"] if first else ["-mall"]), "-o", out + ".bin"], None),
                 ("decode", [b("original", "batdecode"), "-i", out + ".bin", "-g", g, "-o", out], None)]
     if tool.startswith("bwa_aln"):
-        build = {"bwa_aln": "bwa", "bwa_aln_stock": "bwa_stock", "bwa_aln_popcnt": "bwa_popcnt"}[tool]
+        build = {"bwa_aln": "bwa", "bwa_aln_stock": "bwa_stock"}[tool]
         aln = [b(build, "bwa"), "aln", "-t", t, "-n", str(k), "-o", "0", "-e", "0", "-l", "1000", "-k", str(k)]
         if not first:
             aln += ["-N", "-m", "20000000"]

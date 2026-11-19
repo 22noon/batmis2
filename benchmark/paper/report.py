@@ -13,7 +13,7 @@ timing summary with the align/decode split.
 Colours follow the tool, never its position: each tool keeps one colour and one marker in
 every figure (the reference categorical palette, fixed order; markers as a second cue).
 """
-import csv, json, os, sys
+import csv, glob, json, os, sys
 from collections import defaultdict
 
 import matplotlib
@@ -36,7 +36,6 @@ STYLE = {
     "mrsfast": ("#6250d6", "X", "mrsFAST-Ultra"),
     "bwa_mem": ("#e34948", "*", "BWA-MEM"),
     "bowtie2": ("#7a7a7a", "h", "Bowtie 2"),
-    "bwa_aln_popcnt": ("#eda100", "d", "BWA aln, popcount build"),
     "bwa_aln_stock": ("#eda100", "1", "BWA aln, stock build"),
 }
 ORDER = list(STYLE)
@@ -122,7 +121,7 @@ for (dataset, mode, threads), rs in sorted(bwa.items()):
     if len({r["tool"] for r in rs}) < 2:
         continue
     fig, ax = plt.subplots(figsize=(3.2, 2.4))
-    for tool, color, marker in (("bwa_aln_stock", "#7a7a7a", "s"), ("bwa_aln", "#eda100", "D"), ("bwa_aln_popcnt", "#2a78d6", "o")):
+    for tool, color, marker in (("bwa_aln_stock", "#7a7a7a", "s"), ("bwa_aln", "#eda100", "D")):
         pts = sorted((r["k"], num(r["wall_s_median"])) for r in rs if r["tool"] == tool)
         if pts:
             ax.plot([p[0] for p in pts], [p[1] for p in pts], color=color, marker=marker, label=STYLE[tool][2])
@@ -179,8 +178,8 @@ man = os.path.join(OUT, "manifest.json")
 if os.path.exists(man):
     m = json.load(open(man))
     lines += [f"Machine: {m['cpu']}, {m['cores']} CPUs, {m['memory']}; {m['compiler']}; flags `{m['opt_flags']}`.", "",
-              "| binary | popcnt | prefetch |", "|---|---:|---:|"]
-    lines += [f"| {k} | {v['popcnt']} | {v['prefetch']} |" for k, v in sorted(m["binaries"].items())
+              "| binary | flags | popcnt | prefetch |", "|---|---|---:|---:|"]
+    lines += [f"| {k} | `{v.get('flags', m['opt_flags'])}` | {v['popcnt']} | {v['prefetch']} |" for k, v in sorted(m["binaries"].items())
               if k.split("/")[1] in ("batmis1", "batmis2", "batman", "batdecode", "bwa", "bowtie-align-s", "bowtie2-align-s",
                                      "columba", "mrsfast")]
     lines.append("")
@@ -209,6 +208,18 @@ if cor:
         lines.append(f"| {r['dataset']} | {r['tool']} | {k} | {r['mode']} | {r['truth'] or r['truth_reads']} | "
                      f"{r['missed']} | {r['invalid']} | {r['missed_reads']} | {r['not_best']} | "
                      + (f"{100 * f / t:.2f}%" if t else "") + " |")
+    lines.append("")
+
+disc = sorted(glob.glob(os.path.join(OUT, "discrepancies", "*", "summary.tsv")))
+if disc:
+    lines += ["## Discrepancies", "",
+              "Every missed or extra hit of the exact tools, by cause (`discrepancies.py`; examples in "
+              "`discrepancies/<read set>/examples.txt`). Read sets without any are left out.", "",
+              "| read set | tool | K | mode | kind | cause | count |", "|---|---|---:|---|---|---|---:|"]
+    for p in disc:
+        name = os.path.basename(os.path.dirname(p))
+        for r in csv.DictReader(open(p), delimiter="\t"):
+            lines.append(f"| {name} | {r['tool']} | {r['k']} | {r['mode']} | {r['kind']} | {r['cause']} | {r['count']} |")
     lines.append("")
 
 if timing:

@@ -30,11 +30,13 @@ def main():
     binaries = {}
     for tool in sorted(os.listdir(os.path.join(prefix, "bin"))):
         d = os.path.join(prefix, "bin", tool)
+        flags_file = os.path.join(d, "BUILD_FLAGS")  # a tool built with other flags than OPT
+        flags = open(flags_file).read().strip() if os.path.exists(flags_file) else opt
         for f in sorted(os.listdir(d)):
             p = os.path.join(d, f)
             if os.path.isfile(p) and os.access(p, os.X_OK):
                 pop, pre = count_insns(p)
-                binaries[f"{tool}/{f}"] = {"bytes": os.path.getsize(p), "popcnt": pop, "prefetch": pre}
+                binaries[f"{tool}/{f}"] = {"bytes": os.path.getsize(p), "popcnt": pop, "prefetch": pre, "flags": flags}
     sources = {}
     src = os.path.join(prefix, "src")
     for d in sorted(os.listdir(src)) if os.path.isdir(src) else []:

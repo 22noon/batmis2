@@ -8,6 +8,7 @@
 source "${SLURM_SUBMIT_DIR:-$(dirname "$0")}/common.sh"
 stage_in
 bench correct
+bench discrepancies
 bench collect
 python3 "$PAPER/report.py" "$BENCH_RESULTS"
 stage_out runs

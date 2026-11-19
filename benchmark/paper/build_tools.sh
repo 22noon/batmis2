@@ -5,19 +5,16 @@
 #   PREFIX=/local/scratch/bench/tools ORIG_TARBALL=/path/BatMis-3.00.tar.gz \
 #       benchmark/paper/build_tools.sh [tool ...]
 #
-# Tools: batmis original bwa bwa_stock bwa_popcnt bowtie bowtie2 columba mrsfast
+# Tools: batmis original bwa bwa_stock bowtie bowtie2 columba mrsfast
 # (default: all). Each goes to $PREFIX/bin/<tool>/.
 #
 #   OPT       optimisation flags for every tool (default -O3 -march=native)
 #   JOBS      make -j (default: all CPUs)
 #
-# BWA is built three ways:
-#   bwa         the release with OPT;
-#   bwa_stock   the release with its own Makefile flags (-O3, no -march), for reference;
-#   bwa_popcnt  OPT, with __occ_aux's bit-trick count replaced by __builtin_popcountll.
-#     BWA counts bases with a SWAR bit trick and a byte table, never with a popcount
-#     instruction, so compiler flags alone do not give it one. Its results are identical;
-#     it shows what popcount would give BWA, and is reported as a supplementary line.
+# BWA is built from the unmodified release, two ways:
+#   bwa         OPT -mpopcnt (the flag stated explicitly);
+#   bwa_stock   its own Makefile flags (-O3, no -march), for reference.
+# The manifest records how many popcnt instructions each binary holds.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -35,7 +32,7 @@ BOWTIE2_TAG=v2.5.4
 COLUMBA_TAG=v2.0
 MRSFAST_TAG=v3.4.2
 
-TOOLS=${*:-batmis original bwa bwa_stock bwa_popcnt bowtie bowtie2 columba mrsfast}
+TOOLS=${*:-batmis original bwa bwa_stock bowtie bowtie2 columba mrsfast}
 
 log() { echo "[build_tools] $*" >&2; }
 
@@ -81,23 +78,13 @@ EOF
     cp "$SRC/original/scripts/"* "$BIN/original/" 2>/dev/null || true
 }
 
-build_bwa_variant() {  # build_bwa_variant <name> <CFLAGS or ""> <patch popcount: 0|1>
+build_bwa_variant() {  # build_bwa_variant <name> <CFLAGS or "" for the Makefile's own>
     log "$1"
     rm -rf "$SRC/$1" && cp -r "$SRC/bwa_release" "$SRC/$1"
-    if [ "$3" = 1 ]; then
-        # y already holds one bit per matching base; count it with the instruction.
-        python3 - "$SRC/$1/bwt.c" <<'EOF'
-import sys
-p = sys.argv[1]; s = open(p).read()
-old = """	y = (y & 0x3333333333333333ull) + (y >> 2 & 0x3333333333333333ull);
-	return ((y + (y >> 4)) & 0xf0f0f0f0f0f0f0full) * 0x101010101010101ull >> 56;"""
-assert s.count(old) == 1, "bwt.c: __occ_aux not as expected"
-open(p, "w").write(s.replace(old, "	return __builtin_popcountll(y);"))
-EOF
-    fi
     if [ -n "$2" ]; then make -C "$SRC/$1" -j"$JOBS" CFLAGS="-g -Wall -Wno-unused-function $2" >/dev/null
     else make -C "$SRC/$1" -j"$JOBS" >/dev/null; fi
     mkdir -p "$BIN/$1" && cp "$SRC/$1/bwa" "$BIN/$1/"
+    echo "${2:-$(sed -n 's/^CFLAGS=[[:space:]]*//p' "$SRC/$1/Makefile") (Makefile)}" > "$BIN/$1/BUILD_FLAGS"
 }
 
 build_bowtie() {
@@ -148,12 +135,11 @@ for t in $TOOLS; do
     case $t in
         batmis) build_batmis ;;
         original) build_original ;;
-        bwa|bwa_stock|bwa_popcnt)
+        bwa|bwa_stock)
             if [ ! -d "$SRC/bwa_release" ]; then clone lh3/bwa "$BWA_TAG" bwa_release; fi
             case $t in
-                bwa) build_bwa_variant bwa "$OPT" 0 ;;
-                bwa_stock) build_bwa_variant bwa_stock "" 0 ;;
-                bwa_popcnt) build_bwa_variant bwa_popcnt "$OPT" 1 ;;
+                bwa) build_bwa_variant bwa "$OPT -mpopcnt" ;;
+                bwa_stock) build_bwa_variant bwa_stock "" ;;
             esac ;;
         bowtie) build_bowtie ;;
         bowtie2) build_bowtie2 ;;

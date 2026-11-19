@@ -23,10 +23,10 @@ Notes for the methods section:
 - **BWA aln is made exhaustive.** Seeding is disabled (`-l` longer than the read), gaps are
   off (`-o 0 -e 0`) and `-N` turns off the iterative search, so it reports every hit within K.
   That is not how it is normally run; it is the only setting that makes it comparable.
-- **BWA has no popcount code.** Its base count (`__occ_aux`) is a SWAR bit trick plus a byte
-  table, so `-march=native` gives it no popcount instruction (0 in the manifest). Two extra
-  builds are timed at K = 0, 2, 4 as a supplement: `bwa_aln_stock` (its own Makefile flags)
-  and `bwa_aln_popcnt` (`-march=native`, with `__occ_aux` returning `__builtin_popcountll`).
+- **BWA is the unmodified release**, built with `-O3 -march=native -mpopcnt`. It counts bases
+  with a bit trick and a byte table rather than a popcount call, so the flag may add no
+  popcount instruction; the manifest shows the count. `bwa_aln_stock` (BWA's own Makefile
+  flags) is timed at K = 0, 2, 4 as a supplement.
 - **Columba has no one-hit mode.** Its best mode reports every hit of the best stratum,
   with a whole-number identity threshold.
 - **Original BatMis** is single-threaded. One guard is added to its `batdecode`
@@ -36,7 +36,7 @@ Notes for the methods section:
   no result.
 - **`bwa samse` is single-threaded**, which the align/decode split shows.
 - **Overlapping occurrences in tandem repeats:** on chr21 one 40 bp read has 992 hits at
-  K = 4, most of them overlapping (a period-14 repeat). Columba reported 529 and exhaustive
+  K = 4, most of them overlapping (a (TA)n microsatellite). Columba reported 529 and exhaustive
   BWA aln 991; batmis1/2, the original, Bowtie and mrsFAST all 992. Columba appears to report
   only some of a set of overlapping occurrences. Expect such "missed" hits in repeats, and
   name them as such in the paper.
@@ -103,6 +103,34 @@ Run behaviour:
 - Output SAM goes to node-local disk and is deleted after the run; correctness runs keep their
   hits, normalised (`normalize_hits.py`).
 
+## Analysing discrepancies
+
+`bench.py correct` counts each tool's missed and extra hits; `bench.py discrepancies` says why.
+For every correctness set it writes `<results>/discrepancies/<set>/`:
+
+- `summary.tsv`: the discrepancies of each tool, K and mode, by cause;
+- `pairwise.tsv`: for each K, the valid hits tool A found and tool B did not;
+- `<tool>_k<K>_<mode>.tsv`: every discrepancy, with its read and the read's truth-hit count;
+- `examples.txt`: up to 10 per cause, aligned against the genome.
+
+Causes (`discrepancies.py` has the exact rules):
+- extra: `over_n` (window over reference N), `clipped_or_gapped`, `off_contig`, `over_k`
+  (more than K mismatches), `not_in_truth`;
+- missed: `window_limit` (mrsFAST, L < (K+1)·12), `overlapping` (the tool reports a hit of the
+  read within L bases: tandem repeats), `many_hits_read` (> 100 truth hits, some reported),
+  `contig_edge`, `low_complexity`, `unexplained`;
+- first-hit runs: `missed_read` (with its best hit's cause) and `not_best`.
+
+`unexplained` rows are the ones to look into by hand. One read at a time:
+
+```sh
+bench.py discrepancies --set dataset=sim_chr21_40_check --read 'sim4579_k3_chr21_23204462_+'
+```
+
+This prints the read, its true origin, each run's hit count against the truth, and the truth
+hits aligned to the genome with the runs that miss each. In the pilot every discrepancy had a
+cause (none `unexplained`); `report.py` lists the non-zero causes in `report.md`.
+
 ## Before the main runs
 
 1. Check `tools/manifest.json`: popcnt and prefetch counts per binary (batmis1/2 must pass
@@ -124,5 +152,6 @@ Run behaviour:
 | `normalize_hits.py` | SAM (and BWA's XA) to one hit list |
 | `brute_force.cpp` | ground truth by scanning the genome |
 | `compare_hits.py` | correctness scores |
+| `discrepancies.py` | the cause of every missed or extra hit; one-read view |
 | `collect.py`, `report.py` | TSVs, report.md, figures |
 | `slurm/` | the jobs |
