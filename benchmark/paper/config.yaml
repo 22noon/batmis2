@@ -13,6 +13,10 @@ index_time_limit_s: 86400
 single_repeat_above_s: 1800          # a warm-up longer than this: one timed repeat instead of `repeats`
 single_thread_reads: 1000000         # 1-thread runs on real data use the first this many reads
 keep_sam: false                      # SAM output is deleted after each run (correctness runs keep hits.tsv)
+# SAM output (and BWA's .sai) goes to node-local disk, so that a shared filesystem's load does
+# not enter the timings. Leave empty to write into the run directory. Needs room for the largest
+# all-hits output (human, K = 7: possibly tens of GB).
+local_output: /tmp/${USER}/batmis_bench_out
 k_exact: [0, 1, 2, 3, 4, 5]
 k_extra: [7]                         # only for tools that accept it (batmis1/2, columba, mrsfast)
 

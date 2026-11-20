@@ -33,6 +33,9 @@ def load_config(path):
     for key in ("work", "tools", "results"):
         if "${" in str(cfg[key]):
             sys.exit(f"config: {key} uses an unset environment variable: {cfg[key]}")
+    if "${" in str(cfg.get("local_output") or ""):  # e.g. $USER unset in a batch job
+        import tempfile
+        cfg["local_output"] = os.path.join(tempfile.gettempdir(), f"batmis_bench_out_{os.getuid()}")
     return cfg
 
 
@@ -357,10 +360,20 @@ def reads_for(cfg, r):
     return fq, ds["length"]
 
 
+def output_dir(cfg, r):
+    """Where a run writes its SAM (and BWA's .sai, BatMis 3.00's .bin): local_output if set,
+    so that output goes to node-local disk, not the shared filesystem; else the run's directory."""
+    local = cfg.get("local_output")
+    if not local:
+        return run_dir(cfg, r)
+    return os.path.join(local, r["id"].replace("/", "_"))
+
+
 def execute(cfg, r, dry_run=False):
     d = run_dir(cfg, r)
     reads, L = reads_for(cfg, r)
-    out = os.path.join(d, "out.sam")
+    od = output_dir(cfg, r)
+    out = os.path.join(od, "out.sam")
     extra = []
     opts = cfg.get("tool_options", {}).get(r["tool"].replace("_noref", ""), {})  # no-ref: batmis's options
     if "large" in opts and r["kind"] != "load" and os.path.exists(reads) and \
@@ -374,6 +387,9 @@ def execute(cfg, r, dry_run=False):
         return
     shutil.rmtree(d, ignore_errors=True)
     os.makedirs(d)
+    if od != d:  # a stale local directory from an interrupted run
+        shutil.rmtree(od, ignore_errors=True)
+        os.makedirs(od)
     res = run_phases(phases, d, cfg["time_limit_s"])
     status = "ok" if all(p["status"] == "ok" for p in res) and len(res) == len(phases) else \
         ("timeout" if any(p["status"] == "timeout" for p in res) else "error")
@@ -394,9 +410,14 @@ def execute(cfg, r, dry_run=False):
     # Keep the hits of the correctness runs (normalised) and drop the SAM of everything else.
     if r["kind"] in ("check", "real", "indel") and status == "ok":
         subprocess.run([sys.executable, os.path.join(HERE, "normalize_hits.py"), out, os.path.join(d, "hits.tsv")], check=True)
+    if cfg.get("keep_sam") and od != d:
+        for f in glob.glob(os.path.join(od, "out.sam*")):
+            shutil.move(f, d)
     if not cfg.get("keep_sam"):
-        for f in glob.glob(os.path.join(d, "out.sam*")):
+        for f in glob.glob(os.path.join(od, "out.sam*")):
             os.remove(f)
+    if od != d:
+        shutil.rmtree(od, ignore_errors=True)
     json.dump(rec, open(os.path.join(d, "run.json.tmp"), "w"), indent=1)
     os.rename(os.path.join(d, "run.json.tmp"), os.path.join(d, "run.json"))
     print(f"{status:7s} {rec['wall_s']:9.2f}s {rec['max_rss_kb'] / 1024:8.0f}MB  {r['id']}", flush=True)

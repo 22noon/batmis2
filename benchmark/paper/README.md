@@ -80,6 +80,7 @@ export BENCH_WORK=/local/scratch/$USER/batmis_bench   # node-local disk
 export BENCH_STORE=/shared/$USER/batmis_bench         # optional: survives the node
 export ORIG_TARBALL=/path/to/BatMis-3.00.tar.gz
 sbatch 1_build.sbatch                                 # tools, built on the node, manifest
+sbatch 0_pilot.sbatch                                 # optional: the pilot on the small genomes (about 1 h)
 sbatch 2_data.sbatch                                  # genomes, reads, indexes, truth
 sbatch --export=ALL,SELECT='genome=sarscov2|ecoli' 3_runs.sbatch
 sbatch --export=ALL,SELECT='genome=human,kind=check|load' 3_runs.sbatch
@@ -100,8 +101,9 @@ Run behaviour:
 - A run over `time_limit_s` (6 h) is a timeout, and the larger K of that series are skipped.
 - Each phase runs under `/usr/bin/time -v` (wall, CPU, peak memory); batmis also reports its
   own phases (`--timing`).
-- Output SAM goes to node-local disk and is deleted after the run; correctness runs keep their
-  hits, normalised (`normalize_hits.py`).
+- Output SAM goes to node-local disk (`local_output`, default `/tmp/$USER/batmis_bench_out`) and
+  is deleted after the run; correctness runs keep their hits, normalised (`normalize_hits.py`),
+  in the run directory. Inputs, indexes and results can sit on a shared filesystem.
 
 ## BatMis with and without the reference
 
