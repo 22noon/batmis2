@@ -76,6 +76,12 @@ def plain_log(axis):
     axis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
 
 
+def fmt2(x):
+    """Two decimals, or empty for a missing value."""
+    v = num(x)
+    return f"{v:.2f}" if v is not None else ""
+
+
 def save(fig, name):
     for ext in ("pdf", "png"):
         fig.savefig(os.path.join(FIG, f"{name}.{ext}"))
@@ -290,8 +296,7 @@ if timing:
         w = num(r["wall_s_median"])
         lines.append(f"| {r['dataset']} | {r['tool']} | {r['k']} | {r['mode']} | {r['threads']} | "
                      + (f"{w:.2f} ({num(r['wall_s_min']):.2f}-{num(r['wall_s_max']):.2f})" if w is not None else "")
-                     + f" | {r['align_wall_s_median'] and f'{num(r['align_wall_s_median']):.2f}'} | "
-                     f"{r['decode_wall_s_median'] and f'{num(r['decode_wall_s_median']):.2f}'} | "
+                     + f" | {fmt2(r['align_wall_s_median'])} | {fmt2(r['decode_wall_s_median'])} | "
                      + (f"{num(r['max_rss_kb_median']) / 1024:,.0f}" if r['max_rss_kb_median'] else "") + f" | {r['status']} |")
 open(os.path.join(OUT, "report.md"), "w").write("\n".join(lines) + "\n")
 print(f"report: {OUT}/report.md, {len(os.listdir(FIG))} figure files", file=sys.stderr)
