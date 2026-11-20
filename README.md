@@ -55,6 +55,16 @@ it times 4, 8 and 16, and prints the times and how far 16 is from the fastest. I
 size is clearly better there, set it with `--batch` or the environment variable
 `BATMIS_BATCH` (`benchmark/prefetch_fix.md`).
 
+**SA sampling.** The index builder samples the suffix array as densely as 1 GB allows for
+both indexes: every row up to 134 Mb, every 8th (the old fixed setting) above 537 Mb
+(`--sa-budget`, `--sa-interval`; `index/README.md`). Denser sampling makes search 5–13%
+faster (`benchmark/columba_comparison.md`).
+
+**Loading.** The SA samples and the packed genome are mapped (`mmap`) rather than read, which
+cuts index loading by 70–90% and shares the pages between runs on one machine
+(`benchmark/mmap_loading.md`). `--no-mmap` reads them instead, e.g. on a filesystem that cannot
+map, or while an index is rebuilt in place.
+
 **Tests** (`make test`; `make test-batmis1` and `make test-batmis2` run them separately).
 Each mapper runs:
 - **`test_located_hits.sh`:** the batched lanes against one read at a time, field by field;

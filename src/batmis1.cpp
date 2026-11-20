@@ -36,6 +36,10 @@ extern "C" {
 #include "sam_writer.hpp"
 
 #include <zlib.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace {
 
@@ -178,7 +182,15 @@ bool Use_Ref = false;
 // path records its genome position in Pos at the first sampled row (Mark_Sampled).
 bool Track_Pos = false;
 constexpr unsigned long NO_POS = ~0UL;  // Pos unknown (Track_Pos: the read runs off the genome)
-std::vector<uint8_t> Pac;             // forward genome (.pac): 2 bits a base, first base in bits 7-6, 16 bytes of padding
+// The forward genome (.pac): 2 bits a base, first base in bits 7-6, followed by 16 bytes of
+// padding. Mapped (Use_Mmap) or read into Pac_Buffer (LoadPac).
+struct Reference {
+    const uint8_t* p = nullptr;
+    const uint8_t* data() const { return p; }
+    uint8_t operator[](std::size_t i) const { return p[i]; }
+};
+Reference Pac;
+std::vector<uint8_t> Pac_Buffer;  // --no-mmap
 unsigned long Text_Length = 0;
 uint64_t Read_Packed[MAXTAG / 32 + 1];  // current read: 32 bases a word, first base in bits 63-62
 
@@ -2413,13 +2425,89 @@ bool FileExists(const std::string& name) {
 }
 
 // Reads <genome>.pac, padded so that Genome_Mismatches can load 9 bytes anywhere.
+// Index files are mapped (mmap), read-only and prefaulted, instead of read into fresh
+// allocations: the page cache's pages are then shared rather than copied, which takes most of
+// the index loading time away (benchmark/mmap_loading.md). --no-mmap reads them as before.
+// The SA samples (.sa) and the reference (.pac) are mapped; the BWT and its occurrence
+// counts are still read by BWTLoad.
+bool Use_Mmap = true;
+
+// Maps file `name` read-only and prefaulted, followed by at least Pad readable zero bytes (an
+// anonymous region of the whole size with the file mapped over its start). Size: the file's.
+const uint8_t* Map_File(const std::string& name, std::size_t& Size, std::size_t Pad) {
+    const int fd = open(name.c_str(), O_RDONLY);
+    if (fd < 0) return nullptr;
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        return nullptr;
+    }
+    Size = static_cast<std::size_t>(st.st_size);
+    const std::size_t page = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+    const std::size_t total = std::max<std::size_t>((Size + Pad + page - 1) / page * page, page);
+    void* base = mmap(nullptr, total, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    const bool ok = base != MAP_FAILED &&
+                    (!Size || mmap(base, Size, PROT_READ, MAP_PRIVATE | MAP_FIXED | MAP_POPULATE, fd, 0) != MAP_FAILED);
+    close(fd);
+    return ok ? static_cast<const uint8_t*>(base) : nullptr;
+}
+
 bool LoadPac(const std::string& name) {
+    if (Use_Mmap) {
+        std::size_t size;
+        Pac.p = Map_File(name, size, 16);
+        return Pac.p != nullptr;
+    }
     std::ifstream in(name.c_str(), std::ios::binary | std::ios::ate);
     if (!in) return false;
     const std::streamsize size = in.tellg();
     in.seekg(0);
-    Pac.assign(static_cast<std::size_t>(size) + 16, 0);
-    return static_cast<bool>(in.read(reinterpret_cast<char*>(Pac.data()), size));
+    Pac_Buffer.assign(static_cast<std::size_t>(size) + 16, 0);
+    Pac.p = Pac_Buffer.data();
+    return static_cast<bool>(in.read(reinterpret_cast<char*>(Pac_Buffer.data()), size));
+}
+
+// Gives index fmi (loaded without its SA samples) the samples of .sa file `name`, mapped
+// rather than read. The file holds inverseSa0, the 4 cumulative counts and the interval,
+// then the samples from saValue[0]; the library expects saValue[0] to be -1, so the page
+// holding it is remapped writable (a private copy of that one page). Checks the header
+// against the index, as BWTLoad does.
+bool Map_Sa(MMPool* pool, ActiveBWT* fmi, const std::string& name) {
+    std::size_t size;
+    const uint8_t* m = Map_File(name, size, 0);
+    if (!m || size < 28) return false;
+    const unsigned* h = reinterpret_cast<const unsigned*>(m);
+    if (h[0] != fmi->inverseSa0) return false;
+    for (int i = 1; i <= 4; i++)
+        if (h[i] != fmi->cumulativeFreq[i]) return false;
+    const unsigned interval = h[5];
+    if (!interval) return false;
+    const std::size_t words = (static_cast<std::size_t>(fmi->textLength) + interval) / interval;
+    if (24 + 4 * words > size) return false;
+    const std::size_t page = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+    const int fd = open(name.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+    void* first = mmap(const_cast<uint8_t*>(m), page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, fd, 0);
+    close(fd);
+    if (first == MAP_FAILED) return false;
+    fmi->saInterval = interval;
+    fmi->saValueSizeInWord = static_cast<unsigned>(words);
+    fmi->saValue = reinterpret_cast<unsigned*>(const_cast<uint8_t*>(m) + 24);
+    fmi->saValue[0] = static_cast<unsigned>(-1);  // as BWTLoad
+    BWTGenerateSaValueOnBoundary(pool, fmi);      // as BWTLoad
+    return true;
+}
+
+// Loads an index, with its SA samples from saFile unless that is null: mapped (Use_Mmap) or
+// read by BWTLoad. Null if either fails.
+ActiveBWT* Load_Index(const std::string& bwtFile, const std::string& occFile, const char* saFile) {
+    ActiveBWT* f = BWTLoad(mmPool, bwtFile.c_str(), occFile.c_str(), saFile && !Use_Mmap ? saFile : nullptr, nullptr,
+                           nullptr, nullptr);
+    if (f && saFile && Use_Mmap && !Map_Sa(mmPool, f, saFile)) {
+        std::fprintf(stderr, "Cannot map %s\n", saFile);
+        return nullptr;
+    }
+    return f;
 }
 
 // The output lines of one -n 1 to 3 read (main and the batched runner), from its lists
@@ -3252,6 +3340,8 @@ void Usage(const char* prog) {
         "  -m  maximum hits per read (default 1, 0 = all)\n"
         "  --no-ref  do not load the SA samples (.sa) and packed genome (.pac); single-row\n"
         "            paths then walk the index to the end (less memory, slower)\n"
+        "  --no-mmap  read the SA samples and packed genome into memory instead of mapping\n"
+        "            them (mapping shares the page cache and loads faster)\n"
         "  --sam, --bam  write SAM / BAM (htslib; also chosen by an -o ending .sam / .bam;\n"
         "            stdout without -o): both strands, NM/MD/NH tags, hits on N runs or across\n"
         "            sequences dropped. Needs the SA samples (.sa) even with --no-ref, which\n"
@@ -3338,6 +3428,8 @@ int main(int argc, char** argv) {
             }
         } else if (std::strcmp(argv[i], "--no-ref") == 0) {
             useRef = false;
+        } else if (std::strcmp(argv[i], "--no-mmap") == 0) {
+            Use_Mmap = false;
         } else if (std::strcmp(argv[i], "--sam") == 0) {
             samFormat = 1;
         } else if (std::strcmp(argv[i], "--bam") == 0) {
@@ -3402,13 +3494,18 @@ int main(int argc, char** argv) {
     }
 
     const auto loadStart = Clock::now();
-    revfmi = initFMI(revBwt.c_str(), revOcc.c_str(), loadSa ? revSa.c_str() : nullptr);
+    {
+        const int poolSize = 524288;
+        MMMasterInitialize(3, 0, FALSE, nullptr);
+        mmPool = MMPoolCreate(poolSize);
+    }
+    revfmi = Load_Index(revBwt, revOcc, loadSa ? revSa.c_str() : nullptr);
     if (!revfmi) {
         std::fprintf(stderr, "Failed to load reverse index: %s / %s\n", revBwt.c_str(), revOcc.c_str());
         return 1;
     }
     if (maxMismatches > 0) {
-        fwfmi = BWTLoad(mmPool, fwBwt.c_str(), fwOcc.c_str(), loadSa ? fwSa.c_str() : nullptr, nullptr, nullptr, nullptr);
+        fwfmi = Load_Index(fwBwt, fwOcc, loadSa ? fwSa.c_str() : nullptr);
         if (!fwfmi) {
             std::fprintf(stderr, "Failed to load forward index: %s / %s\n", fwBwt.c_str(), fwOcc.c_str());
             return 1;

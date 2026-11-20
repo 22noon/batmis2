@@ -208,5 +208,8 @@ modes, 1 and 16 threads): search −4% to −14%, except 32 bp K = 2 all hits, �
 - **Memory:** the SA samples grow by 8n/s − n bytes (500 Mb: +477 MB; chr21: +312 MB).
 
 So the budget buys about a tenth of the search time for small and mid-sized genomes, where
-runs are short anyway; human (interval 8) is unchanged. Loading the samples with `mmap`
-instead of `fread` into a fresh allocation would remove most of the extra load time.
+runs are short anyway; human (interval 8) is unchanged.
+
+**Update:** the mappers now map the SA samples instead of reading them (`mmap_loading.md`). The
+500 Mb index then loads in 0.12–0.13 s at every 4th row and at every 8th, so the denser
+sampling no longer costs load time, and every run is 0.1–0.5 s shorter.
