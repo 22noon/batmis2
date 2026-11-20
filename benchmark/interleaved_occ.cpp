@@ -12,6 +12,11 @@
 //        counted with the popcount code the interleaved layouts use
 //   B    64-byte blocks: 4 x 32-bit counts + 192 bases
 //   C    64-byte blocks: 4 x 16-bit counts + 224 bases, and a major table
+//   R9   Columba's layout (bitvec.h, BitvecIntl, rank9): per 64 rows, 4 words side by side,
+//        word j marking the rows whose base is >= j (j = 1..3; word 0 unused, as Columba's
+//        $ vector), so occ(c) = rank_c - rank_c+1 with one popcount each; counts in a
+//        separate array, per 512 rows and vector a 64-bit total and 7 x 9-bit sub-totals.
+//        4 bits per base plus counts; two cache lines per Occ, like LIB.
 //
 // SEP against B and C is the layout comparison; LIB shows where the mappers are now.
 //
@@ -158,6 +163,36 @@ struct LayC {
     }
 };
 
+struct LayR9 {
+    const u64* BV;   // [64-row word][4]
+    const u64* CNT;  // [512-row block][4][2]: L1, packed L2
+    unsigned inv;
+    // Rows < i (adjusted) whose base is >= j, j = 1..3.
+    inline unsigned rank(unsigned i, unsigned j) const {
+        const unsigned w = i / 64, blk = i / 512, sub = w % 8;
+        const u64* q = CNT + (blk * 4ul + j) * 2;
+        unsigned r = static_cast<unsigned>(q[0]);
+        if (sub) r += (q[1] >> (9 * (sub - 1))) & 511;
+        const unsigned b = i % 64;
+        if (b) r += __builtin_popcountll(BV[w * 4ul + j] << (64 - b));
+        return r;
+    }
+    unsigned ch(unsigned row) const {
+        const unsigned i = row - (row > inv), w = i / 64, b = i % 64;
+        return ((BV[w * 4ul + 1] >> b) & 1) + ((BV[w * 4ul + 2] >> b) & 1) + ((BV[w * 4ul + 3] >> b) & 1);
+    }
+    unsigned occ(unsigned row, unsigned c) const {
+        const unsigned i = row - (row > inv);
+        const unsigned ge = c ? rank(i, c) : i;
+        return c == 3 ? ge : ge - rank(i, c + 1);
+    }
+    PF void prefetch(unsigned row) const {
+        const unsigned i = row - (row > inv);
+        __builtin_prefetch(BV + (i / 64) * 4ul);
+        __builtin_prefetch(CNT + (i / 512) * 8ul);
+    }
+};
+
 static inline u64 Mix(u64& s) {
     u64 z = (s += 0x9E3779B97F4A7C15ULL);
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
@@ -255,6 +290,9 @@ int main(int argc, char** argv) {
     unsigned* majS = static_cast<unsigned*>(Alloc(nMajS * 16, thp));
     u64* QB = static_cast<u64*>(Alloc(nB * 64, thp));
     u64* QC = static_cast<u64*>(Alloc(nC * 64, thp));
+    const size_t nW = n / 64 + 16, nBlk = n / 512 + 4;
+    u64* BV = static_cast<u64*>(Alloc(nW * 32, thp));
+    u64* CNT = static_cast<u64*>(Alloc(nBlk * 64, thp));
     unsigned* majC = static_cast<unsigned*>(Alloc(nMajC * 16, thp));
     unsigned cnt[4] = {0, 0, 0, 0};
     for (unsigned long i = 0; i < n + 600ul; i++) {
@@ -275,6 +313,27 @@ int main(int argc, char** argv) {
         QB[i / 192 * 8 + 2 + o / 32] |= c << (2 * (o % 32));
         o = i % 224;
         QC[i / 224 * 8 + o / 32 + (o / 32 >= 3)] |= c << (2 * (o % 32));
+        for (u64 j = 1; j <= c; j++) BV[(i / 64) * 4 + j] |= 1ULL << (i % 64);
+    }
+    // R9 counts: per 512-row block and vector j, the rank at the block start (L1) and at each
+    // of its 7 later 64-row words, relative to the block (L2, 9 bits each).
+    for (size_t blk = 0; blk < nBlk; blk++) {
+        for (unsigned j = 1; j <= 3; j++) {
+            u64 l1 = blk ? CNT[((blk - 1) * 4 + j) * 2] : 0;
+            if (blk) {  // previous block's total
+                u64 t = 0;
+                for (unsigned w = 0; w < 8; w++) t += __builtin_popcountll(BV[((blk - 1) * 8 + w) * 4 + j]);
+                l1 += t;
+            }
+            u64 l2 = 0, run = 0;
+            for (unsigned w = 0; w < 7; w++) {
+                const size_t ww = blk * 8 + w;
+                run += ww < nW ? __builtin_popcountll(BV[ww * 4 + j]) : 0;
+                l2 |= run << (9 * w);
+            }
+            CNT[(blk * 4 + j) * 2] = l1;
+            CNT[(blk * 4 + j) * 2 + 1] = l2;
+        }
     }
     std::printf("bytes: bwt %lu + minor %lu + major %lu | B %lu | C %lu + major %lu\n", n / 4ul, (n / 256ul + 1) * 8,
                 (n / 65536ul + 1) * 16, (n / 192ul + 1) * 64, (n / 224ul + 1) * 64, (n / (224ul * 256) + 1) * 16);
@@ -283,6 +342,7 @@ int main(int argc, char** argv) {
     const Sep sep{W, minor, majS, inv};
     const LayB lb{QB, inv};
     const LayC lc{QC, majC, inv};
+    const LayR9 r9{BV, CNT, inv};
 
     // Occ and characters against the library: random rows, and the rows around $, the
     // ends and every kind of block edge.
@@ -303,13 +363,14 @@ int main(int argc, char** argv) {
                 bad += sep.occ(r, c) != want;
                 bad += lb.occ(r, c) != want;
                 bad += lc.occ(r, c) != want;
+                bad += r9.occ(r, c) != want;
             }
             if (r != inv && r >= 1 && r <= n) {
                 const unsigned want = lib.ch(r);
-                bad += (sep.ch(r) != want) + (lb.ch(r) != want) + (lc.ch(r) != want);
+                bad += (sep.ch(r) != want) + (lb.ch(r) != want) + (lc.ch(r) != want) + (r9.ch(r) != want);
             }
         }
-        std::printf("check: %zu rows x 4 bases x 3 layouts, %lu differences\n", rows.size(), bad);
+        std::printf("check: %zu rows x 4 bases x 4 layouts, %lu differences\n", rows.size(), bad);
         if (bad) return 1;
     }
 
@@ -327,6 +388,7 @@ int main(int argc, char** argv) {
             Time("SEP", sep, C, n, ch, t, steps);
             Time("B", lb, C, n, ch, t, steps);
             Time("C", lc, C, n, ch, t, steps);
+            Time("R9", r9, C, n, ch, t, steps);
         }
     }
     return 0;
