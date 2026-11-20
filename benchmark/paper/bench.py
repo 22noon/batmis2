@@ -5,6 +5,9 @@
   bench.py [-c ...] simulate [--genomes g,..]     simulated read sets into <work>/reads
   bench.py [-c ...] prepare [--real name,..]      real read sets into <work>/reads
   bench.py [-c ...] index [--genomes g,..] [--indexes i,..]   build and time every index
+  bench.py [-c ...] calibrate                     time 5,000 reads per tool (K = 0 and 5) on the
+                                                  calibrated genomes, and size their timing runs
+  bench.py [-c ...] estimate                      node time of the sized runs still to do
   bench.py [-c ...] list [filters]                the runs of the matrix, and which are done
   bench.py [-c ...] run [filters] [--dry-run]     run the matrix's missing runs, in order
   bench.py [-c ...] truth [--datasets d,..]       brute-force hits of the correctness sets
@@ -52,11 +55,67 @@ def index_dir(cfg, g, index):
 
 
 def count_reads(fq):
+    """Reads in a FASTQ file; cached beside it (<fq>.nreads), since sets reach 10M reads."""
+    cache = fq + ".nreads"
+    if os.path.exists(cache) and os.path.getmtime(cache) >= os.path.getmtime(fq):
+        return int(open(cache).read())
     n = 0
     with open(fq, "rb") as f:
-        for i, _ in enumerate(f):
-            n = i
-    return (n + 1) // 4
+        for n, _ in enumerate(f, 1):
+            pass
+    try:
+        open(cache, "w").write(str(n // 4))
+    except OSError:
+        pass
+    return n // 4
+
+
+def subset_reads(fq, n):
+    """A set of n reads drawn from fq at random (fixed seed, file order kept), so that it keeps
+    the set's mix. Not a stride: the simulator cycles k = 0..max_k read by read, and every
+    10th read of an 8-cycle is only odd k. Written once as <fq without .fq>.n<n>.fq; fq itself
+    when n covers it."""
+    import numpy as np
+    import zlib
+    total = count_reads(fq)
+    if n >= total:
+        return fq
+    out = f"{fq[:-3]}.n{n}.fq"
+    if os.path.exists(out):
+        return out
+    seed = zlib.crc32(f"{os.path.basename(fq)}:{n}".encode())
+    keep = np.zeros(total, dtype=bool)
+    keep[np.random.default_rng(seed).choice(total, size=n, replace=False)] = True
+    with open(fq, "rb") as f, open(out + ".tmp", "wb") as o:
+        for i in range(total):
+            rec = [f.readline() for _ in range(4)]
+            if keep[i]:
+                o.writelines(rec)
+    os.rename(out + ".tmp", out)
+    return out
+
+
+def calibration(cfg):
+    return cfg.get("calibration") or {}
+
+
+def calibrated(cfg, genome):
+    return genome in calibration(cfg).get("genomes", [])
+
+
+def correctness_reads(cfg, genome):
+    s = cfg["simulated"]
+    return s.get("correctness_reads_by_genome", {}).get(genome, s["correctness_reads"])
+
+
+def correctness_fq(cfg, ds):
+    """The reads of a correctness set (check, real, indel) as every run and score uses them:
+    check sets at the configured size, cut by stride from a larger existing file; the realistic
+    sets cut to correctness_reads_by_genome where a genome has one (human), else whole."""
+    if ds["kind"] == "check":
+        return subset_reads(ds["fq"], correctness_reads(cfg, ds["genome"]))
+    by = cfg["simulated"].get("correctness_reads_by_genome", {})
+    return subset_reads(ds["fq"], by[ds["genome"]]) if ds["genome"] in by else ds["fq"]
 
 
 # ---------------------------------------------------------------- fetch, simulate, prepare
@@ -99,7 +158,7 @@ def sim_sets(cfg):
     for g in s["genomes"]:
         for L in s["lengths"]:
             out.append((f"sim_{g}_{L}_timing", g, L, "stratified", s["timing_reads"], []))
-            out.append((f"sim_{g}_{L}_check", g, L, "stratified", s["correctness_reads"], []))
+            out.append((f"sim_{g}_{L}_check", g, L, "stratified", correctness_reads(cfg, g), []))
             out.append((f"sim_{g}_{L}_real", g, L, "realistic", s["realistic_reads"], []))
             out.append((f"sim_{g}_{L}_indel", g, L, "realistic", s["realistic_reads"], ["--indel-rate", "0.001"]))
     for g in s.get("pilot_genomes", []):
@@ -291,9 +350,21 @@ def matrix(cfg):
                             continue
                         runs.append(dict(kind="scaling", dataset=dname, genome=ds["genome"], length=ds["length"],
                                          tool=tool, k=k, mode=mode, threads=t, rep=1))
+    # Calibration (kind calib): 5,000 reads, one thread, at the calibration's two K, for every
+    # timing and real-data set of a calibrated genome (bench.py calibrate runs these).
+    cal = calibration(cfg)
+    for dname, ds in datasets(cfg).items():
+        if ds["kind"] not in ("timing", "realdata") or not calibrated(cfg, ds["genome"]):
+            continue
+        for tool in T.EXACT + T.NOREF + T.SUPPLEMENTARY + T.APPROXIMATE:
+            kk = [-1] if tool in T.APPROXIMATE else sorted({min(k, T.MAX_K.get(tool, 7)) for k in cal.get("k", [0, 5])})
+            for k in kk:
+                for mode in ("first", "all"):
+                    runs.append(dict(kind="calib", dataset=dname, genome=ds["genome"], length=ds["length"],
+                                     tool=tool, k=k, mode=mode, threads=1, rep=1))
     # Index load: one read, per genome and tool.
     for g in {ds["genome"] for ds in datasets(cfg).values()}:
-        for tool in T.EXACT + T.NOREF + T.APPROXIMATE:
+        for tool in T.EXACT + T.NOREF + T.SUPPLEMENTARY + T.APPROXIMATE:
             runs.append(dict(kind="load", dataset=f"one_{g}", genome=g, length=0, tool=tool,
                              k=0 if tool in T.APPROXIMATE else min(2, T.MAX_K.get(tool, 7)), mode="first", threads=1, rep=1))
     for r in runs:
@@ -356,8 +427,146 @@ def reads_for(cfg, r):
             open(p, "wb").write(b"@one\n" + seq + b"\n+\n" + b"I" * 100 + b"\n")
         return p, 100
     ds = datasets(cfg)[r["dataset"]]
+    if r["kind"] == "calib":
+        return subset_reads(ds["fq"], calibration(cfg).get("reads", 5000)), ds["length"]
+    if r["kind"] in ("check", "real", "indel"):
+        return correctness_fq(cfg, ds), ds["length"]
+    if calibrated(cfg, ds["genome"]) and r["kind"] in ("timing", "realdata", "scaling"):
+        n = planned_reads(cfg, r)
+        return (subset_reads(ds["fq"], n), ds["length"]) if n else (None, ds["length"])
     fq = ds.get("fq_t1", ds["fq"]) if r["threads"] == 1 else ds["fq"]
     return fq, ds["length"]
+
+
+# ---------------------------------------------------------------- calibration
+
+
+def calib_plan_path(cfg):
+    return wpath(cfg, "runs", "calib", "plan.json")
+
+
+_PLAN = {}
+
+
+def load_plan(cfg):
+    p = calib_plan_path(cfg)
+    if p not in _PLAN:
+        _PLAN[p] = json.load(open(p)) if os.path.exists(p) else None
+    return _PLAN[p]
+
+
+def per_read_seconds(cfg, r):
+    """The calibrated one-thread time per read of r's tool, set and mode at r's K: log-linear in
+    K between (and beyond) the two calibration points. None if not calibrated."""
+    plan = load_plan(cfg)
+    if not plan:
+        return None
+    e = plan["fits"].get(f"{r['dataset']}|{r['tool']}|{r['mode']}")
+    if not e:
+        return None
+    pts = sorted((int(k), t) for k, t in e["per_read_s"].items())
+    if len(pts) == 1 or r["k"] < 0:
+        return pts[0][1]
+    (k0, t0), (k1, t1) = pts[0], pts[-1]
+    return t0 * (t1 / t0) ** ((r["k"] - k0) / (k1 - k0))
+
+
+def planned_reads(cfg, r):
+    """Reads for a calibrated run: as many as fit the target time on its threads (linear in
+    reads and threads), on the ladder, at least `reads`, at most the whole set. None before
+    calibration."""
+    t = per_read_seconds(cfg, r)
+    if t is None:
+        return None
+    cal = calibration(cfg)
+    speed = r["threads"] if T.THREADED.get(r["tool"], True) else 1
+    want = cal.get("target_s", 600) * speed / t
+    fq = datasets(cfg)[r["dataset"]]["fq"]
+    if not os.path.exists(fq):
+        return None
+    total = count_reads(fq)
+    n = cal.get("reads", 5000)
+    for step in cal.get("ladder", []):
+        if step <= want:
+            n = max(n, step)
+    return total if want >= total else min(n, total)
+
+
+def startup_seconds(cfg, genome, tool):
+    """A tool's start-up on a genome: the wall time of its one-read load run (0 if missing)."""
+    for p in glob.glob(wpath(cfg, "runs", "load", f"one_{genome}", tool, "*", "*", "*", "*", "run.json")):
+        rec = json.load(open(p))
+        if rec.get("status") == "ok":
+            return rec["wall_s"]
+    return 0.0
+
+
+def estimate_matrix(cfg, gens):
+    """Prints the estimated node time of the calibrated genomes' runs still to do (one node,
+    runs one after another), by kind and mode, so that target_s or repeats can be adjusted
+    before the runs start. Runs over the time limit count with the limit."""
+    total, parts, n = 0.0, {}, 0
+    for r in matrix(cfg):
+        if r["genome"] not in gens or r["kind"] not in ("timing", "realdata", "scaling") or done(cfg, r):
+            continue
+        t, reads = per_read_seconds(cfg, r), planned_reads(cfg, r)
+        if t is None or reads is None:
+            continue
+        speed = r["threads"] if T.THREADED.get(r["tool"], True) else 1
+        est = min(cfg["time_limit_s"], startup_seconds(cfg, r["genome"], r["tool"]) + t * reads / speed)
+        total += est
+        n += 1
+        key = f"{r['kind']} {r['mode']} t{r['threads']}"
+        parts[key] = parts.get(key, 0.0) + est
+    print(f"estimated time of the {n} sized runs still to do: {total / 3600:.1f} node-hours "
+          f"({total / 86400:.1f} node-days); target_s {calibration(cfg).get('target_s')}, repeats {cfg['repeats']} + warm-up",
+          file=sys.stderr)
+    for key, v in sorted(parts.items()):
+        print(f"  {key:24s} {v / 3600:8.1f} h", file=sys.stderr)
+
+
+def cmd_estimate(cfg, a):
+    estimate_matrix(cfg, calibration(cfg).get("genomes", []))
+
+
+def cmd_calibrate(cfg, a):
+    """Runs the load and calibration runs of the calibrated genomes, then fits each (set, tool,
+    mode): per-read seconds at each calibration K, (wall - start-up) / reads. A calibration run
+    over the time limit counts with the limit (a lower bound)."""
+    gens = calibration(cfg).get("genomes", [])
+    if not gens:
+        sys.exit("config has no calibration genomes")
+    runs = [r for r in matrix(cfg) if r["kind"] in ("load", "calib") and r["genome"] in gens]
+    for r in runs:
+        if not done(cfg, r):
+            execute(cfg, r)
+    fits = {}
+    n = calibration(cfg).get("reads", 5000)
+    for r in runs:
+        if r["kind"] != "calib":
+            continue
+        rec = json.load(open(os.path.join(run_dir(cfg, r), "run.json")))
+        if rec.get("status") not in ("ok", "timeout"):
+            print(f"calibration failed ({rec.get('status')}): {r['id']}", file=sys.stderr)
+            continue
+        reads = rec.get("reads_n") or n
+        t = max(1e-6, (rec["wall_s"] - startup_seconds(cfg, r["genome"], r["tool"])) / reads)
+        key = f"{r['dataset']}|{r['tool']}|{r['mode']}"
+        fits.setdefault(key, {"per_read_s": {}, "status": {}})
+        fits[key]["per_read_s"][str(r["k"])] = t
+        fits[key]["status"][str(r["k"])] = rec["status"]
+    os.makedirs(os.path.dirname(calib_plan_path(cfg)), exist_ok=True)
+    json.dump({"target_s": calibration(cfg).get("target_s", 600), "reads": n, "fits": fits},
+              open(calib_plan_path(cfg), "w"), indent=1)
+    _PLAN.clear()
+    print(f"calibration: {len(fits)} fits -> {calib_plan_path(cfg)}", file=sys.stderr)
+    estimate_matrix(cfg, gens)
+    for r in matrix(cfg):
+        if r["kind"] in ("timing", "realdata") and r["genome"] in gens and r["rep"] == 1 and r["threads"] == 1:
+            t = per_read_seconds(cfg, r)
+            if t is not None:
+                print(f"  {r['dataset']:22s} {r['tool']:14s} K={r['k']:2d} {r['mode']:5s} {t * 1e6:10.1f} us/read "
+                      f"-> {planned_reads(cfg, r):>9d} reads on 1 thread", file=sys.stderr)
 
 
 def output_dir(cfg, r):
@@ -372,6 +581,9 @@ def output_dir(cfg, r):
 def execute(cfg, r, dry_run=False):
     d = run_dir(cfg, r)
     reads, L = reads_for(cfg, r)
+    if reads is None:
+        print(f"not calibrated yet (bench.py calibrate): {r['id']}", flush=True)
+        return
     od = output_dir(cfg, r)
     out = os.path.join(od, "out.sam")
     extra = []
@@ -398,7 +610,17 @@ def execute(cfg, r, dry_run=False):
                user_s=sum(p.get("user_s", 0) for p in res), sys_s=sum(p.get("sys_s", 0) for p in res),
                max_rss_kb=max((p.get("max_rss_kb", 0) for p in res), default=0),
                output_bytes=os.path.getsize(out) if os.path.exists(out) else 0,
+               reads_n=count_reads(reads), startup_s=startup_seconds(cfg, r["genome"], r["tool"]),
                finished=time.strftime("%Y-%m-%dT%H:%M:%S"))
+    t = per_read_seconds(cfg, r) if calibrated(cfg, r["genome"]) and r["kind"] in ("timing", "realdata", "scaling") else None
+    if t is not None:  # the calibration's estimate, and how far the run is from it
+        speed = r["threads"] if T.THREADED.get(r["tool"], True) else 1
+        rec["estimated_s"] = rec["startup_s"] + t * rec["reads_n"] / speed
+        # Flag a real miss only: short runs are dominated by fixed costs the one-read load run
+        # does not see (threads starting, a lookup table built for large read sets).
+        if rec["wall_s"] > 3 * rec["estimated_s"] and rec["wall_s"] - rec["estimated_s"] > 10:
+            print(f"  note: {rec['wall_s']:.1f} s against an estimate of {rec['estimated_s']:.1f} s "
+                  f"(not linear here): {r['id']}", flush=True)
     for p in res:  # tool-reported phase times (batmis --timing)
         for k, v in p.items():
             if k.startswith("tool_"):
@@ -427,12 +649,23 @@ def cmd_list(cfg, a):
     runs = select(matrix(cfg), a)
     n_done = sum(done(cfg, r) for r in runs)
     for r in runs:
-        print(("done " if done(cfg, r) else "     ") + r["id"])
+        n = ""
+        if calibrated(cfg, r["genome"]) and r["kind"] in ("timing", "realdata", "scaling"):
+            p = planned_reads(cfg, r)
+            n = f"  [{p} reads]" if p else "  [not calibrated]"
+        print(("done " if done(cfg, r) else "     ") + r["id"] + n)
     print(f"{len(runs)} runs, {n_done} done", file=sys.stderr)
 
 
 def cmd_run(cfg, a):
-    runs = [r for r in select(matrix(cfg), a) if not done(cfg, r)]
+    # Calibration runs belong to `calibrate`, which fits the plan after them.
+    runs = [r for r in select(matrix(cfg), a) if not done(cfg, r) and r["kind"] != "calib"]
+    waiting = [r for r in runs if calibrated(cfg, r["genome"]) and r["kind"] in ("timing", "realdata", "scaling")
+               and planned_reads(cfg, r) is None]
+    if waiting:
+        print(f"{len(waiting)} runs wait for `bench.py calibrate` (genomes {', '.join(calibration(cfg)['genomes'])}); "
+              "the others run now", file=sys.stderr)
+        runs = [r for r in runs if r not in waiting]
     # Small genomes first, so that the pilot's results come early.
     order = {g: i for i, g in enumerate(["sarscov2", "ecoli", "chr21", "human"])}
     runs.sort(key=lambda r: (order.get(r["genome"], 9), r["dataset"], r["tool"], r["mode"], r["threads"], r["k"], r["rep"]))
@@ -511,7 +744,8 @@ def cmd_truth(cfg, a):
         print(f"truth {name} (K <= {kmax})", file=sys.stderr, flush=True)
         t0 = time.time()
         with open(out + ".tmp", "wb") as o:
-            p1 = subprocess.Popen([bf, genome_fa(cfg, ds["genome"]), ds["fq"], str(kmax)], stdout=subprocess.PIPE)
+            p1 = subprocess.Popen([bf, genome_fa(cfg, ds["genome"]), correctness_fq(cfg, ds), str(kmax)],
+                                  stdout=subprocess.PIPE)
             subprocess.run(["sort", "-u", "-S", "25%"], stdin=p1.stdout, stdout=o, check=True, env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"})
             p1.wait()
         os.rename(out + ".tmp", out)
@@ -527,7 +761,8 @@ def cmd_correct(cfg, a):
         ds = datasets(cfg)[name]
         truth = wpath(cfg, "truth", name + ".tsv")
         args = [sys.executable, os.path.join(HERE, "compare_hits.py"), "--genome", genome_fa(cfg, ds["genome"]),
-                "--reads", ds["fq"], "--out", wpath(cfg, "runs", "correct", name + ".json")]
+                "--reads", correctness_fq(cfg, ds),
+                "--out", wpath(cfg, "runs", "correct", name + ".json")]
         if os.path.exists(truth):
             args += ["--truth", truth]
         for r in rs:
@@ -553,7 +788,7 @@ def cmd_discrepancies(cfg, a):
         ds = datasets(cfg)[name]
         truth = wpath(cfg, "truth", name + ".tsv")
         args = [sys.executable, os.path.join(HERE, "discrepancies.py"), "--genome", genome_fa(cfg, ds["genome"]),
-                "--reads", ds["fq"]]
+                "--reads", correctness_fq(cfg, ds)]
         args += ["--read", a.read] if a.read else ["--out", os.path.join(cfg["results"], "discrepancies", name)]
         if os.path.exists(truth):
             args += ["--truth", truth]
@@ -568,6 +803,10 @@ def cmd_discrepancies(cfg, a):
 
 def cmd_collect(cfg, a):
     os.makedirs(cfg["results"], exist_ok=True)
+    # The calibration, for the report (which genomes' runs compare per read).
+    plan = load_plan(cfg) or {}
+    json.dump(dict(plan, genomes=calibration(cfg).get("genomes", [])),
+              open(os.path.join(cfg["results"], "calibration.json"), "w"), indent=1)
     subprocess.run([sys.executable, os.path.join(HERE, "collect.py"), wpath(cfg, "runs"), cfg["results"],
                     os.path.join(cfg["tools"], "manifest.json")], check=True)
 
@@ -580,6 +819,8 @@ def main():
     p = sub.add_parser("simulate"); p.add_argument("--genomes")
     p = sub.add_parser("prepare"); p.add_argument("--real")
     p = sub.add_parser("index"); p.add_argument("--genomes"); p.add_argument("--indexes")
+    sub.add_parser("calibrate")
+    sub.add_parser("estimate")
     for name in ("list", "run", "correct", "discrepancies"):
         p = sub.add_parser(name); p.add_argument("--set")
         if name == "run":

@@ -58,12 +58,26 @@ simulated:
   lengths: [40, 100, 150]
   timing_reads: 1000000              # stratified set used for timing
   correctness_reads: 100000          # stratified set checked against brute force / verified union
+  correctness_reads_by_genome: {human: 5000}   # human: also its realistic sets (true origin)
   realistic_reads: 1000000           # position-dependent substitution profile (+ indels for the approximate group)
   pilot_genomes: [chr21]             # correctness sets only, pilot_reads reads each
   pilot_reads: 10000
   max_k: 7
   random_fraction: 0.1               # reads with no hit
   seed: 20261117
+
+
+# Calibrated genomes (bench.py calibrate): each tool is timed on `reads` reads at the two K
+# below, one thread; every timing, real-data and scaling run on these genomes then gets as
+# many reads as fit target_s, assuming time linear in reads and threads (log-linear in K
+# between and beyond the two points), rounded down to the ladder, at least `reads`, at most
+# the whole set. Results are compared per read (s_per_million in timing.tsv).
+calibration:
+  genomes: [human]
+  reads: 5000
+  k: [0, 5]
+  target_s: 600
+  ladder: [5000, 10000, 20000, 50000, 100000, 200000, 500000, 1000000, 2000000, 5000000, 10000000]
 
 brute_force_genomes: [sarscov2, ecoli, chr21]   # truth by scanning; human uses the verified union
 

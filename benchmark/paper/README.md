@@ -81,7 +81,7 @@ export BENCH_STORE=/shared/$USER/batmis_bench         # optional: survives the n
 export ORIG_TARBALL=/path/to/BatMis-3.00.tar.gz
 sbatch 1_build.sbatch                                 # tools, built on the node, manifest
 sbatch 0_pilot.sbatch                                 # optional: the pilot on the small genomes (about 1 h)
-sbatch 2_data.sbatch                                  # genomes, reads, indexes, truth
+sbatch 2_data.sbatch                                  # genomes, reads, indexes, truth, calibration
 sbatch --export=ALL,SELECT='genome=sarscov2|ecoli' 3_runs.sbatch
 sbatch --export=ALL,SELECT='genome=human,kind=check|load' 3_runs.sbatch
 sbatch --export=ALL,SELECT='genome=human,kind=timing|realdata' 3_runs.sbatch
@@ -118,6 +118,37 @@ correctness and load runs, with `--no-ref` added. Both write SAM, which needs th
 `report.py` draws `batmis_ref_vs_noref_*` (time against K, reference loaded solid, without
 dashed) and tabulates wall time, batmis's own search and index-load times, and peak memory
 both ways, with the ratio.
+
+## Human runs: sized by calibration
+
+Human runs with many hits per read or high K take hours at the full read sets (1M simulated,
+about 10M HG002 reads), so their read counts are set from a calibration (`calibration:` in
+`config.yaml`):
+
+1. **Calibrate** (`bench.py calibrate`, run by `2_data.sbatch`): every tool, both modes, every
+   human timing and real-data set, timed on 5,000 reads (a fixed-seed random sample that keeps
+   the set's k mix) on one thread, at K = 0 and K = 5 (Bowtie: 3). Start-up is taken from the
+   one-read load runs and subtracted; the result is seconds per read at each K, written to
+   `runs/calib/plan.json`.
+2. **Size each run:** per-read time at its K (log-linear between and beyond the two points),
+   divided by its threads (assumed linear), gives the reads that fit 10 minutes; rounded down
+   to 5k, 10k, 20k, 50k, ... 10M, at least 5,000, at most the whole set. `bench.py list` shows
+   each run's count; `bench.py run` holds human timing runs back until the calibration exists.
+   `bench.py calibrate` (and `bench.py estimate` any time later) prints the estimated node time
+   of the sized runs still to do, by kind, mode and threads: lower `target_s` or `repeats` in
+   `config.yaml` if it is too much, then run `estimate` again (no recalibration needed).
+3. **Compare per read:** every run records `reads_n` and its start-up, and `timing.tsv` gives
+   `us_per_read` and `s_per_million` (seconds per million reads, start-up included); the report
+   plots human results in seconds per million reads. A run more than 3x (and 10 s) over its
+   estimate is noted in the run log.
+
+The human correctness sets (and the realistic sets for true-origin recovery) are 5,000 reads
+(`correctness_reads_by_genome`), the same reads for every tool, so the verified union of hits
+still applies. Existing larger sets are sampled down; nothing is simulated again.
+
+In the pilot (E. coli calibrated, with a tiny target to force small read counts) runs took a
+median 1.1x their estimate; BatMis runs under a second on 4 threads took up to 15x, from fixed
+costs that only matter at that scale.
 
 ## Analysing discrepancies
 

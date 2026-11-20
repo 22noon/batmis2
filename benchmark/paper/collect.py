@@ -16,12 +16,37 @@ os.makedirs(out_dir, exist_ok=True)
 RUN_COLS = ["kind", "dataset", "genome", "length", "tool", "k", "mode", "threads", "rep", "status", "reason",
             "wall_s", "user_s", "sys_s", "max_rss_kb", "output_bytes", "align_wall_s", "decode_wall_s",
             "align_max_rss_kb", "decode_max_rss_kb", "tool_index_load", "tool_search", "tool_output_format",
-            "tool_total", "finished"]
+            "tool_total", "reads_n", "startup_s", "estimated_s", "us_per_read", "s_per_million", "finished"]
+# Start-up per (genome, tool): the one-read load runs.
+startup = {}
+for p in glob.glob(os.path.join(runs_dir, "load", "*", "*", "*", "*", "*", "*", "run.json")):
+    r = json.load(open(p))
+    if r.get("status") == "ok":
+        startup[(r["genome"], r["tool"])] = r["wall_s"]
 recs = []
 for p in glob.glob(os.path.join(runs_dir, "*", "**", "run.json"), recursive=True):
     r = json.load(open(p))
     if r.get("kind") == "index":
         continue
+    # Runs from before read counts were recorded: count their read file (cached beside it).
+    if not r.get("reads_n") and r.get("reads_file") and os.path.exists(r["reads_file"]) and r.get("kind") != "index":
+        cache = r["reads_file"] + ".nreads"
+        if os.path.exists(cache):
+            r["reads_n"] = int(open(cache).read())
+        else:
+            with open(r["reads_file"], "rb") as f:
+                r["reads_n"] = sum(1 for _ in f) // 4
+            try:
+                open(cache, "w").write(str(r["reads_n"]))
+            except OSError:
+                pass
+        r.setdefault("startup_s", startup.get((r["genome"], r["tool"]), 0.0))
+    # Per-read figures, comparable between runs of different read counts (calibrated genomes):
+    # microseconds per read after start-up, and the time a million reads would take.
+    if r.get("reads_n") and r.get("status") == "ok":
+        per = max(0.0, r["wall_s"] - r.get("startup_s", 0.0)) / r["reads_n"]
+        r["us_per_read"] = per * 1e6
+        r["s_per_million"] = per * 1e6 + r.get("startup_s", 0.0)
     recs.append(r)
 recs.sort(key=lambda r: (r["kind"], r["dataset"], r["tool"], r["k"], r["mode"], r["threads"], r["rep"]))
 with open(os.path.join(out_dir, "runs.tsv"), "w", newline="") as f:
@@ -36,7 +61,8 @@ for r in recs:
     series.setdefault(key, []).append(r)
 with open(os.path.join(out_dir, "timing.tsv"), "w", newline="") as f:
     w = csv.writer(f, delimiter="\t")
-    metrics = ["wall_s", "max_rss_kb", "align_wall_s", "decode_wall_s", "tool_index_load", "tool_search", "tool_output_format"]
+    metrics = ["wall_s", "max_rss_kb", "align_wall_s", "decode_wall_s", "tool_index_load", "tool_search", "tool_output_format",
+               "reads_n", "us_per_read", "s_per_million"]
     w.writerow(["kind", "dataset", "genome", "length", "tool", "k", "mode", "threads", "status", "n"] +
                [f"{m}_{s}" for m in metrics for s in ("median", "min", "max")])
     for key, rs in sorted(series.items(), key=lambda kv: tuple(map(str, kv[0]))):

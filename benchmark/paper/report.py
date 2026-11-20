@@ -89,6 +89,22 @@ def save(fig, name):
 
 
 timing = read_tsv("timing.tsv")
+# Genomes whose runs were sized by calibration (bench.py collect writes calibration.json):
+# their runs used different read counts, so they are compared in seconds per million reads.
+_cal = os.path.join(OUT, "calibration.json")
+CALIBRATED = set(json.load(open(_cal)).get("genomes", [])) if os.path.exists(_cal) else set()
+
+
+def time_of(r, stat="median"):
+    """The figure a timing row is compared by: seconds per million reads on calibrated
+    genomes, wall seconds elsewhere."""
+    key = "s_per_million" if r["genome"] in CALIBRATED else "wall_s"
+    return num(r.get(f"{key}_{stat}"))
+
+
+def time_label(genome):
+    return "s per million reads" if genome in CALIBRATED else "wall time (s)"
+
 for r in timing:
     r["k"] = int(r["k"]); r["threads"] = int(r["threads"]); r["length"] = int(r["length"])
 
@@ -103,7 +119,7 @@ for (base, mode, threads), rs in sorted(groups.items()):
     fig, axes = plt.subplots(1, len(lengths), figsize=(2.6 * len(lengths), 2.6), sharey=False, squeeze=False)
     for ax, L in zip(axes[0], lengths):
         for tool in MAIN:
-            pts = sorted((r["k"], num(r["wall_s_median"]), num(r["wall_s_min"]), num(r["wall_s_max"]))
+            pts = sorted((r["k"], time_of(r), time_of(r, "min"), time_of(r, "max"))
                          for r in rs if r["tool"] == tool and r["length"] == L)
             if not pts:
                 continue
@@ -115,7 +131,7 @@ for (base, mode, threads), rs in sorted(groups.items()):
         plain_log(ax.yaxis)
         ax.set_title(f"{L} bp", color=INK)
         ax.set_xlabel("mismatches K")
-    axes[0][0].set_ylabel("wall time (s)")
+    axes[0][0].set_ylabel(time_label(rs[0]["genome"]))
     h, l = axes[0][0].get_legend_handles_labels()
     fig.legend(h, l, loc="upper center", ncol=4, bbox_to_anchor=(0.5, 1.12))
     fig.suptitle(f"{base}, {'first hit' if mode == 'first' else 'all hits'}, {threads} thread{'s' * (threads > 1)}",
@@ -131,7 +147,7 @@ for (base, mode, threads), rs in sorted(groups.items()):
     fig, axes = plt.subplots(1, len(lengths), figsize=(2.6 * len(lengths), 2.6), squeeze=False)
     for ax, L in zip(axes[0], lengths):
         for tool in ("batmis2", "batmis2_noref", "batmis1", "batmis1_noref"):
-            pts = sorted((r["k"], num(r["wall_s_median"])) for r in rs if r["tool"] == tool and r["length"] == L)
+            pts = sorted((r["k"], time_of(r)) for r in rs if r["tool"] == tool and r["length"] == L)
             if not pts:
                 continue
             c, m, lab = STYLE[tool]
@@ -142,7 +158,7 @@ for (base, mode, threads), rs in sorted(groups.items()):
         plain_log(ax.yaxis)
         ax.set_title(f"{L} bp", color=INK)
         ax.set_xlabel("mismatches K")
-    axes[0][0].set_ylabel("wall time (s)")
+    axes[0][0].set_ylabel(time_label(rs[0]["genome"]))
     h, l = axes[0][0].get_legend_handles_labels()
     fig.legend(h, l, loc="upper center", ncol=2, bbox_to_anchor=(0.5, 1.14))
     fig.suptitle(f"BatMis with and without the reference: {base}, {'first hit' if mode == 'first' else 'all hits'}, "
@@ -159,11 +175,11 @@ for (dataset, mode, threads), rs in sorted(bwa.items()):
         continue
     fig, ax = plt.subplots(figsize=(3.2, 2.4))
     for tool, color, marker in (("bwa_aln_stock", "#7a7a7a", "s"), ("bwa_aln", "#eda100", "D")):
-        pts = sorted((r["k"], num(r["wall_s_median"])) for r in rs if r["tool"] == tool)
+        pts = sorted((r["k"], time_of(r)) for r in rs if r["tool"] == tool)
         if pts:
             ax.plot([p[0] for p in pts], [p[1] for p in pts], color=color, marker=marker, label=STYLE[tool][2])
     ax.set_yscale("log"); plain_log(ax.yaxis)
-    ax.set_xlabel("mismatches K"); ax.set_ylabel("wall time (s)")
+    ax.set_xlabel("mismatches K"); ax.set_ylabel(time_label(rs[0]["genome"]))
     ax.set_title(f"{dataset}, {'first hit' if mode == 'first' else 'all hits'}, {threads} thread{'s' * (threads > 1)}",
                  color=INK, fontsize=8)
     ax.legend(fontsize=6)
@@ -197,14 +213,14 @@ for (dataset, k, mode), rs in sorted(scal.items()):
         continue
     fig, ax = plt.subplots(figsize=(3.2, 2.6))
     for tool in MAIN:
-        pts = sorted((r["threads"], num(r["wall_s_median"])) for r in rs if r["tool"] == tool)
+        pts = sorted((r["threads"], time_of(r)) for r in rs if r["tool"] == tool)
         if len(pts) < 2:
             continue
         c, m, lab = STYLE[tool]
         ax.plot([p[0] for p in pts], [p[1] for p in pts], color=c, marker=m, label=lab)
     ax.set_xscale("log", base=2); ax.set_yscale("log")
     plain_log(ax.yaxis)
-    ax.set_xlabel("threads"); ax.set_ylabel("wall time (s)")
+    ax.set_xlabel("threads"); ax.set_ylabel(time_label(rs[0]["genome"]))
     ax.set_title(f"{dataset}, K = {k}, {'first hit' if mode == 'first' else 'all hits'}", color=INK)
     ax.legend(fontsize=6, loc="upper right")
     save(fig, f"scaling_{dataset}_k{k}_{mode}")
@@ -289,15 +305,26 @@ if disc:
 
 if timing:
     lines += ["## Timing", "", "Median wall seconds over the timed repeats (min-max); align / decode where the tool "
-              "separates them; peak memory.", "",
-              "| read set | tool | K | mode | threads | wall (s) | align (s) | decode (s) | memory (MB) | status |",
-              "|---|---|---:|---|---:|---:|---:|---:|---:|---|"]
+              "separates them; peak memory; reads used, and seconds per million reads (time per read after "
+              "start-up, times a million, plus start-up)."]
+    if CALIBRATED:
+        lines += ["", f"Runs on {', '.join(sorted(CALIBRATED))} were sized by calibration: each tool was first timed on "
+                  "5,000 reads at K = 0 and K = 5 on one thread, and each run was then given as many reads as fit "
+                  "the target time (`calibration.json`), assuming time linear in reads and threads and log-linear "
+                  "in K. Their figures compare seconds per million reads."]
+    lines += ["",
+              "| read set | tool | K | mode | threads | reads | wall (s) | s per 1M reads | align (s) | decode (s) | memory (MB) | status |",
+              "|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---|"]
     for r in sorted(timing, key=lambda r: (r["kind"], r["dataset"], r["mode"], r["threads"], r["k"], ORDER.index(r["tool"]) if r["tool"] in ORDER else 99)):
         if r["kind"] not in ("timing", "realdata", "load"):
             continue
         w = num(r["wall_s_median"])
+        n = num(r.get("reads_n_median"))
+        spm = num(r.get("s_per_million_median"))
         lines.append(f"| {r['dataset']} | {r['tool']} | {r['k']} | {r['mode']} | {r['threads']} | "
+                     + (f"{n:,.0f}" if n else "") + " | "
                      + (f"{w:.2f} ({num(r['wall_s_min']):.2f}-{num(r['wall_s_max']):.2f})" if w is not None else "")
+                     + " | " + (f"{spm:,.1f}" if spm is not None and r["kind"] != "load" else "")
                      + f" | {fmt2(r['align_wall_s_median'])} | {fmt2(r['decode_wall_s_median'])} | "
                      + (f"{num(r['max_rss_kb_median']) / 1024:,.0f}" if r['max_rss_kb_median'] else "") + f" | {r['status']} |")
 open(os.path.join(OUT, "report.md"), "w").write("\n".join(lines) + "\n")
