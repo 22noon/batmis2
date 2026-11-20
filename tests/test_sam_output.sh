@@ -13,6 +13,9 @@ set -euo pipefail
 
 BUILD_DIR=${1:?usage: test_sam_output.sh BUILD_DIR BWT_BUILD_INDEX GENOME_MAP_TEST [TEST_VIEW [SA_DECODE_TEST]]}
 INDEX_BUILDER=${2:?}
+# SA_INTERVAL=N builds the test indexes with SA samples every N rows (bwt_build_index
+# --sa-interval); unset, the builder's memory budget decides (every row, for these sizes).
+SA_OPT=${SA_INTERVAL:+--sa-interval $SA_INTERVAL}
 MAP_TEST=${3:?}
 TEST_VIEW=${4:-}
 SA_TEST=${5:-}
@@ -60,7 +63,7 @@ for L in (32, 50, 75):
             f.write(f"@q{i} planted\n{r}\n+\n{q}\n")
 PY
 
-"$INDEX_BUILDER" "$TMP_DIR/ref.fa" > /dev/null
+"$INDEX_BUILDER" $SA_OPT "$TMP_DIR/ref.fa" > /dev/null
 "$MAP_TEST" "$TMP_DIR/ref.fa" "$TMP_DIR/ref.fa"
 
 if [ -n "$SA_TEST" ]; then
@@ -77,7 +80,7 @@ for i in range(40):
 with open(sys.argv[1], "w") as f:
     f.write(">homo\n" + "".join(parts) + "\n")
 PY
-    "$INDEX_BUILDER" "$TMP_DIR/homo.fa" > /dev/null
+    "$INDEX_BUILDER" $SA_OPT "$TMP_DIR/homo.fa" > /dev/null
     for G in ref homo; do
         Result=$("$SA_TEST" "$TMP_DIR/$G.fa")
         echo "Sa_Decode, $G: $Result"

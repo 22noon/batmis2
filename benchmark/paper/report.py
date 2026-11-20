@@ -223,10 +223,12 @@ if os.path.exists(man):
 
 idx = read_tsv("index.tsv")
 if idx:
-    lines += ["## Index build", "", "| genome | index | wall (s) | peak memory (MB) | size (MB) |", "|---|---|---:|---:|---:|"]
+    lines += ["## Index build", "", "BatMis's SA sampling interval is chosen by its builder's 1 GB budget for the SA "
+              "samples (every row up to 134 Mb, every 8th above 537 Mb).", "",
+              "| genome | index | wall (s) | peak memory (MB) | size (MB) | SA interval |", "|---|---|---:|---:|---:|---:|"]
     for r in idx:
         lines.append(f"| {r['genome']} | {r['index']} | {num(r['wall_s']):.1f} | {num(r['max_rss_kb']) / 1024:,.0f} | "
-                     f"{num(r['index_bytes']) / 2**20:,.0f} |")
+                     f"{num(r['index_bytes']) / 2**20:,.0f} | {r.get('sa_interval', '')} |")
     lines.append("")
 
 cor = read_tsv("correctness.tsv")

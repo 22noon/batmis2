@@ -45,7 +45,33 @@ const unsigned int kPoolSize = 2097152;
 const float kTargetNBit = 2.5f;
 const unsigned int kInitialMaxBuildSize = 10000000;
 const unsigned int kIncMaxBuildSize = 10000000;
-const unsigned int kSaValueFreq = 8;
+// SA sampling: every s-th row, s the smallest of 1, 2, 4, 8 whose samples (4 bytes each, in
+// both the forward and the reverse index: 8n/s bytes) fit the budget; never sparser than 8.
+// Denser sampling shortens every locate (about s - 1 LF steps) and lets single-row search
+// paths stop sooner (benchmark/columba_comparison.md).
+const unsigned int kMaxSaInterval = 8;
+const unsigned long long kDefaultSaBudget = 1ULL << 30;  // 1 GB
+
+unsigned int SaIntervalFor(unsigned long long textLength, unsigned long long budget) {
+    for (unsigned int s = 1; s < kMaxSaInterval; s *= 2)
+        if (8ULL * (textLength / s + 1) <= budget) return s;
+    return kMaxSaInterval;
+}
+
+// "1G", "512M", "300000K" or plain bytes.
+bool ParseBytes(const char* text, unsigned long long& out) {
+    char* end = nullptr;
+    const double v = strtod(text, &end);
+    if (end == text || v < 0) return false;
+    unsigned long long unit = 1;
+    if (*end == 'K' || *end == 'k') unit = 1ULL << 10;
+    else if (*end == 'M' || *end == 'm') unit = 1ULL << 20;
+    else if (*end == 'G' || *end == 'g') unit = 1ULL << 30;
+    else if (*end) return false;
+    if (*end && end[1]) return false;
+    out = static_cast<unsigned long long>(v * unit);
+    return true;
+}
 
 // References shorter than this are padded with a dummy sequence.
 const unsigned int kMinTextLength = 16;
@@ -293,7 +319,7 @@ float EffectiveTargetNBit(unsigned int n) {
 }
 
 // Same sequence of steps as bwtformatdb, minus FASTA parsing and the cached SA index.
-void BuildFmIndex(MMPool* mmPool, PackedText& packed, const std::string& prefix, bool keepPac) {
+void BuildFmIndex(MMPool* mmPool, PackedText& packed, const std::string& prefix, bool keepPac, unsigned int saInterval) {
     std::string pac = prefix + ".pac";
     std::string bwtName = prefix + ".bwt";
     std::string fmvName = prefix + ".fmv";
@@ -314,7 +340,7 @@ void BuildFmIndex(MMPool* mmPool, PackedText& packed, const std::string& prefix,
 
     Log("Building SA values..");
     BWT* bwt = BWTLoad(mmPool, bwtName.c_str(), fmvName.c_str(), NULL, NULL, NULL, NULL);
-    BWTGenerateSaValue(bwt, kSaValueFreq, ShowProgress ? bwt->textLength / kSaValueFreq / 10 : 0);
+    BWTGenerateSaValue(bwt, saInterval, ShowProgress ? bwt->textLength / saInterval / 10 : 0);
     BWTSaveSaValue(bwt, saName.c_str());
     BWTFree(mmPool, bwt);
 
@@ -330,6 +356,10 @@ void Usage(const char* prog) {
             "  -r, --reverse-only   build only the reverse index\n"
             "  -o, --outdir DIR     write index files to DIR\n"
             "  -p, --progress       show BWT construction progress\n"
+            "  -b, --sa-budget SIZE memory for the SA samples of both indexes (default 1G;\n"
+            "                       K, M, G suffixes): every row sampled while it fits, then every\n"
+            "                       2nd or 4th, every 8th above (8n/s bytes for n bases)\n"
+            "  -s, --sa-interval N  sample every N-th SA row (1, 2, 4 or 8), overriding the budget\n"
             "  -h, --help           show this help\n",
             prog);
 }
@@ -340,21 +370,38 @@ int main(int argc, char** argv) {
     bool forward = true, reverse = true;
     bool forwardOnly = false, reverseOnly = false;
     std::string outDir;
+    unsigned long long saBudget = kDefaultSaBudget;
+    unsigned int saInterval = 0;  // 0: from the budget
 
     static const option longOptions[] = {
         {"forward-only", no_argument, NULL, 'f'},
         {"reverse-only", no_argument, NULL, 'r'},
         {"outdir", required_argument, NULL, 'o'},
         {"progress", no_argument, NULL, 'p'},
+        {"sa-budget", required_argument, NULL, 'b'},
+        {"sa-interval", required_argument, NULL, 's'},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0}};
     int opt;
-    while ((opt = getopt_long(argc, argv, "fro:ph", longOptions, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "fro:pb:s:h", longOptions, NULL)) != -1) {
         switch (opt) {
             case 'f': forwardOnly = true; break;
             case 'r': reverseOnly = true; break;
             case 'o': outDir = optarg; break;
             case 'p': ShowProgress = true; break;
+            case 'b':
+                if (!ParseBytes(optarg, saBudget)) {
+                    fprintf(stderr, "--sa-budget: not a size: %s\n", optarg);
+                    return 1;
+                }
+                break;
+            case 's':
+                saInterval = static_cast<unsigned int>(atoi(optarg));
+                if (saInterval != 1 && saInterval != 2 && saInterval != 4 && saInterval != 8) {
+                    fprintf(stderr, "--sa-interval must be 1, 2, 4 or 8\n");
+                    return 1;
+                }
+                break;
             case 'h': Usage(argv[0]); return 0;
             default: Usage(argv[0]); return 1;
         }
@@ -408,9 +455,13 @@ int main(int argc, char** argv) {
         FilterFasta(fasta, prefix, packed, seqs);
         WriteLocation(prefix, seqs);
         fprintf(stdout, "%zu sequences, %llu bases.\n", seqs.size(), packed.length);
+        // One interval for both indexes, from the text length (the mappers need them equal).
+        if (!saInterval) saInterval = SaIntervalFor(packed.length, saBudget);
+        fprintf(stdout, "SA sampled every %u rows: %.1f MB of samples per index.\n", saInterval,
+                4.0 * (packed.length / saInterval + 1) / (1 << 20));
         // The forward .pac is the 2-bit reference and is always kept.
         if (forward) {
-            BuildFmIndex(mmPool, packed, prefix, true);
+            BuildFmIndex(mmPool, packed, prefix, true, saInterval);
         } else {
             SaveBytePacked((prefix + ".pac").c_str(), packed.bytes.data(), (unsigned int)packed.length, ALPHABET_SIZE);
         }
@@ -418,7 +469,7 @@ int main(int argc, char** argv) {
     if (reverse) {
         PackedText packed;
         PackReverse(prefix + ".bin", packed);
-        BuildFmIndex(mmPool, packed, revPrefix, false);
+        BuildFmIndex(mmPool, packed, revPrefix, false, saInterval);
     }
 
     MMPoolFree(mmPool);

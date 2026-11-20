@@ -214,8 +214,8 @@ int main(int argc, char** argv) {
     }
     revfmi = initFMI(revBwt.c_str(), revOcc.c_str(), revSa.c_str());
     fwfmi = BWTLoad(mmPool, fwBwt.c_str(), fwOcc.c_str(), fwSa.c_str(), nullptr, nullptr, nullptr);
-    if (revfmi->saInterval != SAINTERVAL || fwfmi->saInterval != SAINTERVAL || !LoadPac(prefix + ".pac")) {
-        std::fprintf(stderr, "needs %s.pac and SA samples every %d rows\n", prefix.c_str(), SAINTERVAL);
+    if (!Set_Sampling(revfmi, fwfmi) || !LoadPac(prefix + ".pac")) {
+        std::fprintf(stderr, "needs %s.pac and SA samples at one power-of-two interval in both indexes\n", prefix.c_str());
         return 2;
     }
     Text_Length = revfmi->textLength;

@@ -54,7 +54,6 @@ namespace {
 constexpr int MAXTAG = 4096;
 constexpr int MAX_MISMATCHES_BOUND = 16;
 constexpr int MAX_MISMATCH_SEARCH = 7;  // -n up to this (Mm_Builder)
-constexpr int SAINTERVAL = 8;
 // Ranges with End-Start below this count their BWT characters directly (Count_Range)
 // instead of a second stored-count lookup. Counting is faster up to ~256 rows (cold) and
 // ~400 rows (cached), and much slower beyond; see benchmark/branch_threshold.md.
@@ -149,6 +148,25 @@ inline void End_Stage(ForwardResults* Res, std::size_t& Tagged, int Stage, unsig
 
 MMPool* mmPool = nullptr;
 using ActiveBWT = BWT;
+
+// SA sampling of the loaded indexes: the SA value of every SA_Interval-th row is stored
+// (saValue[row >> SA_Shift]). 8 for large genomes; index/bwt_build_index samples smaller ones
+// more densely within a memory budget (--sa-budget). Set at load by Set_Sampling.
+unsigned SA_Interval = 8, SA_Shift = 3;
+unsigned long SA_Mask = 7;
+inline bool Sampled(unsigned long Row) { return (Row & SA_Mask) == 0; }
+inline unsigned long Sample_Index(unsigned long Row) { return Row >> SA_Shift; }
+
+// Takes the interval of the loaded SA samples: false unless it is one power of two, at most
+// 64 (Sa_Decode's spans), in both indexes (fw may be absent).
+bool Set_Sampling(const ActiveBWT* rev, const ActiveBWT* fw) {
+    const unsigned s = rev->saInterval;
+    if (!s || s > 64 || (s & (s - 1)) || (fw && fw->saInterval != s)) return false;
+    SA_Interval = s;
+    SA_Mask = s - 1;
+    SA_Shift = static_cast<unsigned>(__builtin_ctz(s));
+    return true;
+}
 ActiveBWT* revfmi = nullptr;
 ActiveBWT* fwfmi = nullptr;  // loaded only for -n 1
 
@@ -283,7 +301,7 @@ void Record_Mismatches(SARange& Tag, bool Right, int A, int B, const uint64_t* P
     }
 }
 
-// A singleton path at a sampled row (Start % SAINTERVAL == 0) can stop walking: the
+// A singleton path at a sampled row (Sampled(Start)) can stop walking: the
 // stored SA value gives the read's genome position, and the rest of the read is
 // compared with the packed genome. Done bases of the segment read[Offset..Offset+Len)
 // are matched. Right: revfmi, which indexes the reversed genome; the row stands for
@@ -300,7 +318,7 @@ bool Locate(const ActiveBWT* fmi, SARange& Tag, bool Right, int Offset, int Len,
     long S;
     if (Other) {
         const ActiveBWT* O = Right ? fwfmi : revfmi;
-        const long P = O->saValue[Tag.Other_Start / SAINTERVAL];
+        const long P = O->saValue[Sample_Index(Tag.Other_Start)];
         S = Right ? P - Tag.Anchor : static_cast<long>(Text_Length) - P - Tag.Anchor;
 #ifdef BATMIS2_VERIFY
         // Against the own row's walk (BWTSaValue).
@@ -312,7 +330,7 @@ bool Locate(const ActiveBWT* fmi, SARange& Tag, bool Right, int Offset, int Len,
                          S, Own, Right, Offset, Len, Done, Tag.Anchor, Tag.Mismatches);
 #endif
     } else {
-        const long P = fmi->saValue[Tag.Start / SAINTERVAL];
+        const long P = fmi->saValue[Sample_Index(Tag.Start)];
         S = Right ? static_cast<long>(Text_Length) - (Offset + Done) - P : P - (Offset + Len - Done);
     }
     Tag.Skip = 1;
@@ -324,7 +342,7 @@ bool Locate(const ActiveBWT* fmi, SARange& Tag, bool Right, int Offset, int Len,
 
 // Whether a single row's other-index row is sampled, to locate from (Both_Rows).
 inline bool Other_Sampled(const SARange& T) {
-    return Use_Ref && Both_Rows && T.Other_Start && T.Other_Start % SAINTERVAL == 0;
+    return Use_Ref && Both_Rows && T.Other_Start && Sampled(T.Other_Start);
 }
 
 // A single-row path without the reference reaching a sampled row: from now on Skip (a
@@ -594,7 +612,7 @@ __attribute__((noinline)) bool Search_Right_Singleton(std::string_view currentTa
     unsigned long index;
     unsigned int now;
 
-    if (tag.Start % SAINTERVAL == 0 && !tag.Skip) {
+    if (Sampled(tag.Start) && !tag.Skip) {
         if (Use_Ref) {
             if (!Search_Located(fmi, tag, true, offset, stringLength, tag.Level - 1)) return false;
             tag.Level = stringLength;
@@ -614,7 +632,7 @@ __attribute__((noinline)) bool Search_Right_Singleton(std::string_view currentTa
         const unsigned base = Read_Base(expected);
         if (expected == now) {
             tag.Start = fmi->cumulativeFreq[base] + fm_occ::Occ_One(fmi, tag.Start, base) + 1;
-            if (!tag.Skip && tag.Start % SAINTERVAL == 0) {
+            if (!tag.Skip && Sampled(tag.Start)) {
                 if (Use_Ref) {
                     if (!Search_Located(fmi, tag, true, offset, stringLength, tag.Level)) return false;
                     tag.Level = stringLength;
@@ -1323,10 +1341,10 @@ inline void Mm_Search_Enter(Mm_Lane& L) {
         return;
     }
     L.Sub = MM_SINGLE;
-    if (!T.Skip && (T.Start % SAINTERVAL == 0 || Other_Sampled(T))) {
+    if (!T.Skip && (Sampled(T.Start) || Other_Sampled(T))) {
         if (Use_Ref) {
             L.Done = T.Level - 1;
-            L.Locate_Other = T.Start % SAINTERVAL != 0;
+            L.Locate_Other = !Sampled(T.Start);
             L.Sub = MM_LOCATE;
             return;
         }
@@ -1361,7 +1379,7 @@ inline bool Mm_Search_Step(Mm_Lane& L) {
             const unsigned Base = Read_Base(Expected);
             if (Expected != Now) return Mm_Search_End(L, false);
             T.Start = L.Fmi->cumulativeFreq[Base] + fm_occ::Occ_One(L.Fmi, T.Start, Base) + 1;
-            if (!T.Skip && T.Start % SAINTERVAL == 0) {
+            if (!T.Skip && Sampled(T.Start)) {
                 if (Use_Ref) {
                     L.Done = T.Level;
                     L.Locate_Other = false;
@@ -1409,9 +1427,9 @@ inline bool Mm_Single_Enter(Mm_Lane& L) {
         return false;
     }
     L.Sub = MM_SINGLE;
-    if (!T.Skip && (T.Start % SAINTERVAL == 0 || Other_Sampled(T))) {
+    if (!T.Skip && (Sampled(T.Start) || Other_Sampled(T))) {
         if (Use_Ref) {
-            L.Locate_Other = T.Start % SAINTERVAL != 0;
+            L.Locate_Other = !Sampled(T.Start);
             L.Sub = MM_LOCATE;
             return false;
         }
@@ -1498,7 +1516,7 @@ inline bool Mm_Extend_Step(Mm_Lane& L) {
             T.Forbidden_Base = NO_BASE;
             if (Now == Expected) T.Start = L.Fmi->cumulativeFreq[Base] + fm_occ::Occ_One(L.Fmi, T.Start, Base) + 1;
             else T.Start = L.Fmi->cumulativeFreq[Now] + fm_occ::Occ_One(L.Fmi, T.Start, Now) + 1;
-            if (!T.Skip && T.Start % SAINTERVAL == 0) {
+            if (!T.Skip && Sampled(T.Start)) {
                 Mark_Sampled(L.Fmi, T, L.Right, L.Offset, Len, T.Level);
             }
             if (Expected != Now) {
@@ -1643,7 +1661,7 @@ inline bool Mm_Window_Step(Mm_Lane& L) {
             if (Now != Expected && !Window_Can_Change(T, L.W, x)) return Mm_Single_Done(L);
             if (Now == Expected) T.Start = L.Fmi->cumulativeFreq[Base] + fm_occ::Occ_One(L.Fmi, T.Start, Base) + 1;
             else T.Start = L.Fmi->cumulativeFreq[Now] + fm_occ::Occ_One(L.Fmi, T.Start, Now) + 1;
-            if (!T.Skip && T.Start % SAINTERVAL == 0) {
+            if (!T.Skip && Sampled(T.Start)) {
                 Mark_Sampled(L.Fmi, T, L.Right, L.Offset, Len, T.Level);
             }
             if (Now != Expected) Mm_Record(T, Now, x);
@@ -2023,8 +2041,8 @@ PREFETCH_ONLY void Mm_Prefetch(const Mm_Lane& L) {
             Prefetch_Row(L.Fmi, T->Start);
             return;
         case MM_LOCATE:
-            if (L.Locate_Other) __builtin_prefetch((L.Right ? fwfmi : revfmi)->saValue + T->Other_Start / SAINTERVAL);
-            else __builtin_prefetch(L.Fmi->saValue + T->Start / SAINTERVAL);
+            if (L.Locate_Other) __builtin_prefetch((L.Right ? fwfmi : revfmi)->saValue + Sample_Index(T->Other_Start));
+            else __builtin_prefetch(L.Fmi->saValue + Sample_Index(T->Start));
             return;
         case MM_LOCATED:
             __builtin_prefetch(Pac.data() + (T->Pos + L.Offset) / 4);
@@ -3576,9 +3594,13 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    // The SA samples' interval (loaded with SAM output or the reference): one power of two
+    // for both indexes, at most 64 (Sa_Decode's spans).
+    const bool samplingOk = loadSa && Set_Sampling(revfmi, fwfmi);
     if (useRef) {
-        if (revfmi->saInterval != SAINTERVAL || (fwfmi && fwfmi->saInterval != SAINTERVAL)) {
-            std::fprintf(stderr, "Warning: SA sample interval is not %d; walking single-row paths instead\n", SAINTERVAL);
+        if (!samplingOk) {
+            std::fprintf(stderr, "Warning: SA samples not one power-of-two interval (at most 64) in both indexes; "
+                                 "walking single-row paths instead\n");
             useRef = false;
         } else if (!LoadPac(pacName)) {
             std::fprintf(stderr, "Warning: cannot read %s; walking single-row paths instead\n", pacName.c_str());
@@ -3586,7 +3608,7 @@ int main(int argc, char** argv) {
         }
     }
     Use_Ref = useRef;
-    Track_Pos = samFormat && !useRef && revfmi->saInterval == SAINTERVAL && (!fwfmi || fwfmi->saInterval == SAINTERVAL);
+    Track_Pos = samFormat && !useRef && samplingOk;
     Text_Length = revfmi->textLength;
 
     Sam_Output sam;

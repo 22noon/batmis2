@@ -7,6 +7,9 @@ set -euo pipefail
 
 BUILD_DIR=${1:?usage: test_located_hits.sh BUILD_DIR [BWT_BUILD_INDEX] [LOCATED_TEST]}
 INDEX_BUILDER=${2:-$BUILD_DIR/bwt_build_index}
+# SA_INTERVAL=N builds the test indexes with SA samples every N rows (bwt_build_index
+# --sa-interval); unset, the builder's memory budget decides (every row, for these sizes).
+SA_OPT=${SA_INTERVAL:+--sa-interval $SA_INTERVAL}
 LOCATED_TEST=${3:-$BUILD_DIR/test_located_hits}
 MAPPER=${MAPPER:-batmis1}
 TMP_DIR=$(mktemp -d)
@@ -68,7 +71,7 @@ for L in (12, 20, 36, 75):
             put(mutate(genome[len(genome) - k:] + rand_seq(L - k), [rng.randrange(L)]))
 PY
 
-"$INDEX_BUILDER" -o "$TMP_DIR" "$TMP_DIR/ref.fa" >"$TMP_DIR/index.log" 2>&1
+"$INDEX_BUILDER" $SA_OPT -o "$TMP_DIR" "$TMP_DIR/ref.fa" >"$TMP_DIR/index.log" 2>&1
 
 for length in 12 20 36 75; do
     reads="$TMP_DIR/reads${length}.fa"

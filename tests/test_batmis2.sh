@@ -12,6 +12,9 @@
 set -euo pipefail
 BUILD_DIR=${1:?usage: test_batmis2.sh BUILD_DIR BWT_BUILD_INDEX}
 INDEX_BUILDER=${2:?}
+# SA_INTERVAL=N builds the test indexes with SA samples every N rows (bwt_build_index
+# --sa-interval); unset, the builder's memory budget decides (every row, for these sizes).
+SA_OPT=${SA_INTERVAL:+--sa-interval $SA_INTERVAL}
 B1=$BUILD_DIR/batmis1
 B2=$BUILD_DIR/batmis2
 V2=$BUILD_DIR/batmis2_verify
@@ -50,7 +53,7 @@ for L in (32, 50, 75):
             if k % 50 == 7: s = rand_seq(L)
             f.write(f"@r{L}_{k}\n{s}\n+\n{'I' * L}\n")
 PY
-"$INDEX_BUILDER" "$TMP_DIR/ref.fa" >"$TMP_DIR/index.log" 2>&1
+"$INDEX_BUILDER" $SA_OPT "$TMP_DIR/ref.fa" >"$TMP_DIR/index.log" 2>&1
 
 failed=0
 body() { grep -v '^@PG' "$1"; }

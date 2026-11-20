@@ -34,8 +34,28 @@ bwt_build_index [options] <genome.fa> [outdir]
   -r, --reverse-only   build only the reverse index
   -o, --outdir DIR     write index files to DIR
   -p, --progress       show BWT construction progress
+  -b, --sa-budget SIZE memory for the SA samples of both indexes (default 1G;
+                       K, M, G suffixes): every row sampled while it fits, then every
+                       2nd or 4th, every 8th above (8n/s bytes for n bases)
+  -s, --sa-interval N  sample every N-th SA row (1, 2, 4 or 8), overriding the budget
   -h, --help           show this help
 ```
+
+**SA sampling.** The `.sa` files hold the suffix-array value of every s-th row. Denser
+sampling makes locating a row cheaper (about s - 1 LF steps on average, each a cache miss on
+a large genome) and lets the mappers finish single-row search paths sooner, at 8n/s bytes for
+both indexes. The builder picks the densest s of 1, 2, 4, 8 within the budget (1 GB by
+default) and never goes sparser than 8:
+
+| bases | interval | samples, both indexes |
+|---|---:|---:|
+| up to 134 M (viruses, bacteria, one human chromosome) | 1 | up to 1 GB |
+| up to 268 M | 2 | up to 1 GB |
+| up to 537 M | 4 | up to 1 GB |
+| more (human: 3.1 G) | 8 | 8n/8 = 3.1 GB for human |
+
+Both indexes always get the same interval, which is stored in each `.sa`; batmis1 and
+batmis2 read it from there. `--sa-interval 8` reproduces the earlier files byte for byte.
 
 By default both the forward and the reverse index are built. The output
 directory can be given with `-o` or as the second argument, but not both; it
@@ -64,7 +84,7 @@ For an input `<genome.fa>`, with `G = <outdir>/<genome.fa>` and
 | `G.bin` | always | The concatenated sequences as plain text, lower-case `a/c/g/t`, no headers or newlines |
 | `G.ann.location` | always | `0`, then one name line and one length line per sequence (name = header up to the first whitespace) |
 | `G.pac` | always | The forward text packed 2 bits per base (see below) |
-| `G.bwt`, `G.fmv`, `G.sa` | forward | Forward FM index: BWT, occurrence values, SA sampled every 8 positions |
+| `G.bwt`, `G.fmv`, `G.sa` | forward | Forward FM index: BWT, occurrence values, SA sampled every s rows (s by the memory budget, above) |
 | `R.bwt`, `R.fmv`, `R.sa` | reverse | The same for the reversed text |
 
 With `--reverse-only`, the forward index files are not built, but `G.pac` and
@@ -120,14 +140,14 @@ read back by `BWTIncConstructFromPacked()`.
 
 ## Build parameters
 
-These are the `bwtformatdb` defaults and are fixed in the source:
+These are the `bwtformatdb` defaults; all but the SA sampling are fixed in the source:
 
 | Parameter | Value |
 |---|---|
 | Memory pool size | 2097152 |
 | `targetNBit` | 2.5 (raised for small references) |
 | Initial / incremental build size | 10000000 / 10000000 |
-| SA sampling frequency | 8 |
+| SA sampling interval | 1, 2, 4 or 8, by the memory budget (`--sa-budget`, `--sa-interval`) |
 
 The `COLOR`, `CTOT`, `GTOA` and random-base options of the old tools are not
 supported.

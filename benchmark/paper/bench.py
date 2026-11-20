@@ -452,6 +452,13 @@ def cmd_run(cfg, a):
 # ---------------------------------------------------------------- indexes
 
 
+def sa_interval(sa_file):
+    """The sampling interval stored in a BatMis .sa file (after inverseSa0 and 4 counts)."""
+    import struct
+    with open(sa_file, "rb") as f:
+        return struct.unpack("<6I", f.read(24))[5]
+
+
 def cmd_index(cfg, a):
     gs = a.genomes.split(",") if a.genomes else sorted({ds["genome"] for ds in datasets(cfg).values()})
     idxs = a.indexes.split(",") if a.indexes else T.INDEXES
@@ -477,6 +484,8 @@ def cmd_index(cfg, a):
             rec = dict(kind="index", genome=g, index=i, status=status, phases=res,
                        wall_s=sum(p.get("wall_s", 0) for p in res), max_rss_kb=max(p.get("max_rss_kb", 0) for p in res),
                        index_bytes=size, threads=threads)
+            if i == "batmis" and status == "ok":  # the SA sampling the builder's budget chose
+                rec["sa_interval"] = sa_interval(os.path.join(d, f"{g}.fa.sa"))
             json.dump(rec, open(os.path.join(rd, "run.json"), "w"), indent=1)
             print(f"index {g}/{i}: {status} {rec['wall_s']:.1f}s {rec['max_rss_kb'] / 1024:.0f}MB {size / 2**20:.0f}MB", flush=True)
 

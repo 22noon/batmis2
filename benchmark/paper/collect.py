@@ -51,10 +51,11 @@ with open(os.path.join(out_dir, "timing.tsv"), "w", newline="") as f:
 
 with open(os.path.join(out_dir, "index.tsv"), "w", newline="") as f:
     w = csv.writer(f, delimiter="\t")
-    w.writerow(["genome", "index", "status", "threads", "wall_s", "max_rss_kb", "index_bytes"])
+    w.writerow(["genome", "index", "status", "threads", "wall_s", "max_rss_kb", "index_bytes", "sa_interval"])
     for p in sorted(glob.glob(os.path.join(runs_dir, "index", "*", "*", "run.json"))):
         r = json.load(open(p))
-        w.writerow([r["genome"], r["index"], r["status"], r["threads"], r["wall_s"], r["max_rss_kb"], r["index_bytes"]])
+        w.writerow([r["genome"], r["index"], r["status"], r["threads"], r["wall_s"], r["max_rss_kb"], r["index_bytes"],
+                    r.get("sa_interval", "")])
 
 COR_COLS = ["dataset", "tool", "k", "mode", "truth_source", "reported", "valid", "invalid", "over_k", "over_n", "truth", "missed",
             "extra_not_in_truth", "truth_reads", "reported_reads", "missed_reads", "not_best", "reads_invalid_only", "reads_over_k_only",

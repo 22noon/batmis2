@@ -76,16 +76,26 @@ $(TEST_VIEW): FORCE
 
 # Each mapper's suite: located hits (lanes, walked against located, brute force for
 # -n 1 to 7) and SAM/BAM output (brute force on both strands, Sa_Decode).
+# Each suite runs twice: on indexes sampled as the builder's memory budget decides (every SA
+# row, for test-sized genomes), and on indexes sampled every 8th row (as large genomes are).
+SA_INTERVALS ?= budget 8
+
 test-batmis1: batmis1 batmis1_chunk16 test_located_hits_batmis1 test_sa_decode_batmis1 test_genome_map $(INDEX_BUILDER) $(TEST_VIEW)
-	MAPPER=batmis1 $(TESTS)/test_located_hits.sh . $(INDEX_BUILDER) ./test_located_hits_batmis1
-	MAPPER=batmis1 $(TESTS)/test_sam_output.sh . $(INDEX_BUILDER) ./test_genome_map $(TEST_VIEW) ./test_sa_decode_batmis1
+	for s in $(SA_INTERVALS); do \
+	  echo "== SA samples: $$s"; e=$$( [ $$s = budget ] || echo SA_INTERVAL=$$s ); \
+	  env $$e MAPPER=batmis1 $(TESTS)/test_located_hits.sh . $(INDEX_BUILDER) ./test_located_hits_batmis1 && \
+	  env $$e MAPPER=batmis1 $(TESTS)/test_sam_output.sh . $(INDEX_BUILDER) ./test_genome_map $(TEST_VIEW) ./test_sa_decode_batmis1 || exit 1; \
+	done
 
 # batmis2's also compares it with batmis1 and runs batmis2_verify (test_batmis2.sh).
 test-batmis2: batmis1 batmis2 batmis2_chunk16 batmis2_verify test_located_hits_batmis2 test_sa_decode_batmis2 test_genome_map \
               $(INDEX_BUILDER) $(TEST_VIEW)
-	MAPPER=batmis2 $(TESTS)/test_located_hits.sh . $(INDEX_BUILDER) ./test_located_hits_batmis2
-	MAPPER=batmis2 $(TESTS)/test_sam_output.sh . $(INDEX_BUILDER) ./test_genome_map $(TEST_VIEW) ./test_sa_decode_batmis2
-	$(TESTS)/test_batmis2.sh . $(INDEX_BUILDER)
+	for s in $(SA_INTERVALS); do \
+	  echo "== SA samples: $$s"; e=$$( [ $$s = budget ] || echo SA_INTERVAL=$$s ); \
+	  env $$e MAPPER=batmis2 $(TESTS)/test_located_hits.sh . $(INDEX_BUILDER) ./test_located_hits_batmis2 && \
+	  env $$e MAPPER=batmis2 $(TESTS)/test_sam_output.sh . $(INDEX_BUILDER) ./test_genome_map $(TEST_VIEW) ./test_sa_decode_batmis2 && \
+	  env $$e $(TESTS)/test_batmis2.sh . $(INDEX_BUILDER) || exit 1; \
+	done
 
 test: check-prefetch test-batmis1 test-batmis2
 
