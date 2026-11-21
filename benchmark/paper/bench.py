@@ -559,7 +559,9 @@ def cmd_calibrate(cfg, a):
         sys.exit("config has no calibration genomes")
     runs = [r for r in matrix(cfg) if r["kind"] in ("load", "calib") and r["genome"] in gens]
     for r in runs:
-        if not done(cfg, r):
+        rp = os.path.join(run_dir(cfg, r), "run.json")
+        # Failed runs are run again (e.g. after an index is rebuilt); timeouts are kept.
+        if not done(cfg, r) or json.load(open(rp)).get("status") == "error":
             execute(cfg, r)
     fits = {}
     n = calibration(cfg).get("reads", 5000)
@@ -713,6 +715,19 @@ def sa_interval(sa_file):
         return struct.unpack("<6I", f.read(24))[5]
 
 
+def index_complete(cfg, g, i):
+    """A finished, successful build of index i of genome g: its record says ok and, for BatMis,
+    every file the mappers load is there (a job killed mid-build leaves some out)."""
+    rp = wpath(cfg, "runs", "index", g, i, "run.json")
+    if not os.path.exists(rp) or json.load(open(rp)).get("status") != "ok":
+        return False
+    if i == "batmis":
+        d = index_dir(cfg, g, i)
+        need = [f"{p}{g}.fa.{x}" for p in ("", "rev") for x in ("bwt", "fmv", "sa")] + [f"{g}.fa.pac"]
+        return all(os.path.exists(os.path.join(d, f)) for f in need)
+    return True
+
+
 def cmd_index(cfg, a):
     gs = a.genomes.split(",") if a.genomes else sorted({ds["genome"] for ds in datasets(cfg).values()})
     idxs = a.indexes.split(",") if a.indexes else T.INDEXES
@@ -721,8 +736,10 @@ def cmd_index(cfg, a):
         for i in idxs:
             d = index_dir(cfg, g, i)
             rd = wpath(cfg, "runs", "index", g, i)
-            if os.path.exists(os.path.join(rd, "run.json")):
+            if index_complete(cfg, g, i):
                 continue
+            if os.path.exists(os.path.join(rd, "run.json")):
+                print(f"index {g}/{i}: previous build failed or is incomplete; rebuilding", flush=True)
             shutil.rmtree(d, ignore_errors=True)
             shutil.rmtree(rd, ignore_errors=True)
             os.makedirs(d)
