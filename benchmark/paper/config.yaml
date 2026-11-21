@@ -50,12 +50,13 @@ real:
     genome: human
     url: https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR153/056/SRR15395856/SRR15395856_1.fastq.gz
     sample_fraction: 0.137           # about 10M of 73M reads
-    lengths: [40, 100, 150]
+    lengths: [100]                   # human: 100 bp only (the expensive part of the matrix)
 
 # Simulated reads (simulate_reads.py), per genome and length.
 simulated:
   genomes: [sarscov2, ecoli, human]
   lengths: [40, 100, 150]
+  lengths_by_genome: {human: [100]}  # human: 100 bp only (the expensive part of the matrix)
   timing_reads: 1000000              # stratified set used for timing
   correctness_reads: 100000          # stratified set checked against brute force / verified union
   correctness_reads_by_genome: {human: 5000}   # human: also its realistic sets (true origin)

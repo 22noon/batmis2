@@ -156,7 +156,7 @@ def sim_sets(cfg):
     s = cfg["simulated"]
     out = []
     for g in s["genomes"]:
-        for L in s["lengths"]:
+        for L in s.get("lengths_by_genome", {}).get(g, s["lengths"]):
             out.append((f"sim_{g}_{L}_timing", g, L, "stratified", s["timing_reads"], []))
             out.append((f"sim_{g}_{L}_check", g, L, "stratified", correctness_reads(cfg, g), []))
             out.append((f"sim_{g}_{L}_real", g, L, "realistic", s["realistic_reads"], []))
@@ -505,6 +505,10 @@ def estimate_matrix(cfg, gens):
     """Prints the estimated node time of the calibrated genomes' runs still to do (one node,
     runs one after another), by kind and mode, so that target_s or repeats can be adjusted
     before the runs start. Runs over the time limit count with the limit."""
+    if not load_plan(cfg):
+        print(f"no calibration yet ({calib_plan_path(cfg)} missing): run `bench.py calibrate` first",
+              file=sys.stderr)
+        return
     total, parts, n = 0.0, {}, 0
     for r in matrix(cfg):
         if r["genome"] not in gens or r["kind"] not in ("timing", "realdata", "scaling") or done(cfg, r):
@@ -807,8 +811,13 @@ def cmd_collect(cfg, a):
     plan = load_plan(cfg) or {}
     json.dump(dict(plan, genomes=calibration(cfg).get("genomes", [])),
               open(os.path.join(cfg["results"], "calibration.json"), "w"), indent=1)
+    # The runs of the current matrix: collect leaves out records of runs no longer in it (e.g.
+    # human 40/150 bp runs made before human was restricted to 100 bp).
+    ids = os.path.join(cfg["results"], "matrix_ids.txt")
+    with open(ids, "w") as f:
+        f.writelines(r["id"] + "\n" for r in matrix(cfg))
     subprocess.run([sys.executable, os.path.join(HERE, "collect.py"), wpath(cfg, "runs"), cfg["results"],
-                    os.path.join(cfg["tools"], "manifest.json")], check=True)
+                    os.path.join(cfg["tools"], "manifest.json"), ids], check=True)
 
 
 def main():

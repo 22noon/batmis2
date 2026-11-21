@@ -49,7 +49,10 @@ Notes for the methods section:
 
 - **Genomes:** SARS-CoV-2 (NC_045512.2), E. coli K-12 MG1655 (NC_000913.3), human GRCh38
   no-alt analysis set; chr21 for the human pipeline's pilot.
-- **Simulated** (`simulate_reads.py`): 40, 100 and 150 bp, both strands.
+- **Read lengths:** 40, 100 and 150 bp for SARS-CoV-2 and E. coli; **100 bp only for human**
+  (every human set: timing, real data, correctness, realistic), which keeps the human part of
+  the matrix, by far the most expensive, to a third (`lengths_by_genome`, `real.hg002.lengths`).
+- **Simulated** (`simulate_reads.py`), both strands.
   - `timing`: 1M stratified reads, exactly k = 0..7 substitutions in equal shares, plus 10%
     random reads;
   - `check`: 100k of the same kind, scored against brute force (small genomes) or the verified

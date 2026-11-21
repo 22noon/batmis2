@@ -11,6 +11,9 @@
 import csv, glob, json, os, shutil, statistics, sys
 
 runs_dir, out_dir, manifest = sys.argv[1], sys.argv[2], sys.argv[3]
+# Optional: the ids of the current matrix; run records outside it are left out (and counted).
+in_matrix = set(open(sys.argv[4]).read().split()) if len(sys.argv) > 4 else None
+outside = 0
 os.makedirs(out_dir, exist_ok=True)
 
 RUN_COLS = ["kind", "dataset", "genome", "length", "tool", "k", "mode", "threads", "rep", "status", "reason",
@@ -27,6 +30,9 @@ recs = []
 for p in glob.glob(os.path.join(runs_dir, "*", "**", "run.json"), recursive=True):
     r = json.load(open(p))
     if r.get("kind") == "index":
+        continue
+    if in_matrix is not None and r.get("id") and r["id"] not in in_matrix:
+        outside += 1
         continue
     # Runs from before read counts were recorded: count their read file (cached beside it).
     if not r.get("reads_n") and r.get("reads_file") and os.path.exists(r["reads_file"]) and r.get("kind") != "index":
@@ -91,6 +97,8 @@ with open(os.path.join(out_dir, "correctness.tsv"), "w", newline="") as f:
     w.writerow(COR_COLS)
     for p in sorted(glob.glob(os.path.join(runs_dir, "correct", "*.json"))):
         d = os.path.basename(p)[:-5]
+        if in_matrix is not None and not any(i.split("/")[1] == d for i in in_matrix):
+            continue  # a read set no longer in the matrix
         for s in json.load(open(p))["scores"]:
             s["dataset"] = d
             s["origin_found_by_k"] = json.dumps(s.get("origin_found_by_k", ""))
@@ -98,4 +106,5 @@ with open(os.path.join(out_dir, "correctness.tsv"), "w", newline="") as f:
 
 if os.path.exists(manifest):
     shutil.copy(manifest, os.path.join(out_dir, "manifest.json"))
-print(f"collect: {len(recs)} runs, {len(series)} series -> {out_dir}", file=sys.stderr)
+print(f"collect: {len(recs)} runs, {len(series)} series -> {out_dir}"
+      + (f"; {outside} runs outside the current matrix left out" if outside else ""), file=sys.stderr)
