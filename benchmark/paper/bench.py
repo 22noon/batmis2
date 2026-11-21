@@ -33,6 +33,8 @@ def load_config(path):
     text = open(path).read()
     text = re.sub(r"\$\{(\w+)\}", lambda m: os.environ.get(m.group(1), m.group(0)), text)
     cfg = yaml.safe_load(text)
+    if "${" in str(cfg["results"]):  # BENCH_RESULTS unset: the default of the job scripts
+        cfg["results"] = os.path.join(HERE, "results")
     for key in ("work", "tools", "results"):
         if "${" in str(cfg[key]):
             sys.exit(f"config: {key} uses an unset environment variable: {cfg[key]}")
@@ -505,10 +507,25 @@ def estimate_matrix(cfg, gens):
     """Prints the estimated node time of the calibrated genomes' runs still to do (one node,
     runs one after another), by kind and mode, so that target_s or repeats can be adjusted
     before the runs start. Runs over the time limit count with the limit."""
-    if not load_plan(cfg):
+    plan = load_plan(cfg)
+    if not plan:
         print(f"no calibration yet ({calib_plan_path(cfg)} missing): run `bench.py calibrate` first",
               file=sys.stderr)
         return
+    # Calibration runs that did not give a fit, so that their runs cannot be sized.
+    failed = []
+    for r in matrix(cfg):
+        if r["kind"] == "calib" and r["genome"] in gens:
+            rp = os.path.join(run_dir(cfg, r), "run.json")
+            st = json.load(open(rp)).get("status") if os.path.exists(rp) else "not run"
+            if st not in ("ok", "timeout"):
+                failed.append((r["id"], st))
+    print(f"calibration: {len(plan.get('fits', {}))} fits ({calib_plan_path(cfg)}); "
+          f"{len(failed)} calibration runs failed or missing", file=sys.stderr)
+    for rid, st in failed[:10]:
+        print(f"  {st:8s} {rid}  (see its *.stderr / *.time)", file=sys.stderr)
+    if len(failed) > 10:
+        print(f"  ... {len(failed) - 10} more", file=sys.stderr)
     total, parts, n = 0.0, {}, 0
     for r in matrix(cfg):
         if r["genome"] not in gens or r["kind"] not in ("timing", "realdata", "scaling") or done(cfg, r):

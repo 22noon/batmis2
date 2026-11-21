@@ -92,7 +92,8 @@ sbatch --export=ALL,SELECT='kind=scaling' 3_runs.sbatch
 sbatch 4_report.sbatch                                # scores, TSVs, report.md, figures
 ```
 
-The same steps by hand: `bench.py fetch | simulate | prepare | index | truth | run | correct |
+Run by hand, `bench.py` needs `BENCH_WORK` set as for the jobs; `BENCH_RESULTS` defaults to
+`benchmark/paper/results`. The same steps by hand: `bench.py fetch | simulate | prepare | index | truth | run | correct |
 collect`, then `report.py <results>`. `bench.py list --set ...` shows the matrix and what is
 done; `bench.py run --set ... --dry-run` prints the commands.
 
