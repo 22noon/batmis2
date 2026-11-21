@@ -850,6 +850,8 @@ struct Mm_Step {
                               // segment, or OP_SEARCH_KEEP's kept segment
     unsigned char Stored;     // OP_SEARCH / OP_SEARCH_KEEP: 1 + the slot of the kept range (0: none)
     unsigned char Strand;     // two-strand programs (Zig_Zag): 0 the read, 1 its reverse complement
+    unsigned char Walk_Make = 0;  // OP_SEARCH(_KEEP) walks: its Walk_Table entry, the later searches it serves (0: none)
+    unsigned char Walk_Use = 0;   // OP_SEARCH: 1 + the shared-walk slot it is served from (Share_Walks)
 };
 constexpr unsigned MM_PROGRAM_MAX = 320;  // longest program (-n 7 zig-zag: 307 steps), for the stats
 constexpr unsigned MM_LISTS = RL_LISTS;  // each read's lists (Result_List)
@@ -869,6 +871,23 @@ struct Mm_Program {
     std::vector<Mm_Step> Steps;
     std::vector<Hit_Stage> Stages;
 };
+
+// Shared seed walks (Mm_Builder::Share_Walks, benchmark/shared_walks.md). An exact
+// search whose string an earlier walk of the program also matches, from the same origin in
+// the same direction, is served from that walk instead of searched again: the walk saves,
+// at each depth a later search needs, the state that search would end in (its range, its
+// single row or its located tag), and a failure, or the genome compare of a located walk,
+// settles the later searches' outcome too. A point the walk cannot settle (the walk was
+// skipped or served itself, the lookup table covered that depth, or the geometry does not
+// hold at this read length) is unknown, and its search runs as before. Walk_Table[w]: the
+// points of walk w (its consumers' segments and slots); entry 0 is none.
+struct Walk_Point {
+    unsigned char Seg, Slot;
+};
+constexpr unsigned WALK_SLOTS = 16;   // slots a program may use, per strand
+constexpr unsigned WALK_POINTS = 8;   // points one walk may save
+std::vector<std::vector<Walk_Point>> Walk_Table(1);
+enum Walk_State : unsigned char { WALK_UNKNOWN, WALK_PENDING, WALK_FOUND, WALK_FAILED };
 
 class Mm_Builder {
   public:
@@ -891,6 +910,7 @@ class Mm_Builder {
             }
         }
         Add({OP_END});
+        Share_Walks();
         return P;
     }
 
@@ -908,6 +928,65 @@ class Mm_Builder {
     void End_Stage(bool Right, int Mismatches, unsigned Keep) {
         Add({OP_END_STAGE, false, 0, U(P.Stages.size()), U(Keep)});
         P.Stages.push_back({Right ? "F" : "B", Mismatches});
+    }
+
+    // Whether walk W matches search S's string on its way: the same direction and origin, S
+    // no longer (its prefix in search order, or the same segment), at every read length of
+    // 16-300 (Walk_Arm checks the read's own length again).
+    static bool Covers(const Mm_Step& W, const Mm_Step& S) {
+        if (W.Right != S.Right) return false;
+        for (int L = 16; L <= 300; L++) {
+            int A, B, C, D;
+            Segment_Bounds(W.Seg, L, A, B);
+            Segment_Bounds(S.Seg, L, C, D);
+            if (W.Right ? (A != C || D > B) : (B != D || C < A)) return false;
+        }
+        return true;
+    }
+
+    // Shared seed walks (Walk_Table): each OP_SEARCH of a segment other than the read or a
+    // half (whose failure depths bound the windows) that an earlier walk covers is served
+    // from it, preferring a walk that always runs (no window, no kept range); the rest are
+    // walks. A walk saves each segment it serves once, in a slot of its own.
+    void Share_Walks() {
+        std::vector<std::size_t> Walkers;
+        std::vector<std::vector<Walk_Point>> Points;  // per walker
+        unsigned Slots = 0;
+        for (std::size_t i = 0; i < P.Steps.size(); i++) {
+            Mm_Step& S = P.Steps[i];
+            if (S.Op != OP_SEARCH && S.Op != OP_SEARCH_KEEP) continue;
+            if (S.Op == OP_SEARCH && S.Seg != SEG_ALL && S.Seg != SEG_LH && S.Seg != SEG_RH) {
+                std::size_t Best = Walkers.size();
+                auto Sure = [&](std::size_t w) { return !P.Steps[Walkers[w]].Win && !P.Steps[Walkers[w]].Stored; };
+                for (std::size_t w = 0; w < Walkers.size(); w++)
+                    if (Covers(P.Steps[Walkers[w]], S) && (Best == Walkers.size() || (Sure(w) && !Sure(Best)))) Best = w;
+                if (Best < Walkers.size()) {
+                    std::vector<Walk_Point>& Pts = Points[Best];
+                    std::size_t k = 0;
+                    while (k < Pts.size() && Pts[k].Seg != S.Seg) k++;
+                    if (k == Pts.size()) {
+                        if (Slots == WALK_SLOTS || Pts.size() == WALK_POINTS) {
+                            std::fprintf(stderr, "-n %d needs more shared-walk slots than WALK_SLOTS / WALK_POINTS allow\n", K);
+                            std::exit(1);
+                        }
+                        Pts.push_back({S.Seg, U(Slots++)});
+                    }
+                    S.Walk_Use = U(Pts[k].Slot + 1);
+                    continue;
+                }
+            }
+            Walkers.push_back(i);
+            Points.emplace_back();
+        }
+        for (std::size_t w = 0; w < Walkers.size(); w++) {
+            if (Points[w].empty()) continue;
+            if (Walk_Table.size() > 255) {
+                std::fprintf(stderr, "too many shared walks for Walk_Make\n");
+                std::exit(1);
+            }
+            Walk_Table.push_back(Points[w]);
+            P.Steps[Walkers[w]].Walk_Make = U(Walk_Table.size() - 1);
+        }
     }
 
     static unsigned char Segment(Mm_Part Part, Mm_Fraction Lo, Mm_Fraction Hi) {
@@ -1176,6 +1255,12 @@ struct Mm_Lane {
     SARange Stored[2];    // OP_SEARCH_KEEP's kept ranges, if Stored_Valid
     bool Stored_Valid[2];
     bool Keeping;         // OP_SEARCH_KEEP is searching its kept segment (else the rest)
+    // Shared walks: the running walk's points still pending, by depth from Ck_I (Ck_Next:
+    // the next one's depth, 0 none), and each strand's saved states (Walk_St: Walk_State).
+    unsigned char Ck_N, Ck_I, Ck_Slot[WALK_POINTS];
+    int Ck_Depth[WALK_POINTS], Ck_Next;
+    SARange Walk_Saved[2][WALK_SLOTS];
+    unsigned char Walk_St[2][WALK_SLOTS];
     std::size_t Tagged;   // hits of Res[RL_HITS] tagged with their stage (End_Stage)
     // The current task.
     Mm_Task Task;
@@ -1224,6 +1309,78 @@ inline int Mm_Read_Pos(const Mm_Lane& L, int Level) {
     return L.Right ? L.Offset + Level - 1 : L.Offset + static_cast<int>(L.Tag.size()) - Level;
 }
 
+// Shared walks (Mm_Builder::Share_Walks). Point I of the running walk: state St, and T
+// the state its search would end in.
+inline void Walk_Set(Mm_Lane& L, unsigned I, const SARange* T, unsigned char St) {
+    L.Walk_St[L.Strand][L.Ck_Slot[I]] = St;
+    if (T) L.Walk_Saved[L.Strand][L.Ck_Slot[I]] = *T;
+}
+inline void Walk_Next(Mm_Lane& L) { L.Ck_Next = L.Ck_I < L.Ck_N ? L.Ck_Depth[L.Ck_I] : 0; }
+
+// A search step starts: no walk running; P's own points (if it is a walk) unknown.
+inline void Walk_Reset(Mm_Lane& L, const Mm_Step& P) {
+    L.Ck_N = L.Ck_I = 0;
+    L.Ck_Next = 0;
+    if (P.Walk_Make)
+        for (const Walk_Point& W : Walk_Table[P.Walk_Make]) L.Walk_St[L.Strand][W.Slot] = WALK_UNKNOWN;
+}
+
+// Walk P starts, its steps matching from base First (the lookup table covered the ones
+// before): its points that lie on it at this read length, and that a step will reach, pending.
+inline void Walk_Arm(Mm_Lane& L, const Mm_Step& P, int First) {
+    if (!P.Walk_Make) return;
+    const int Len = static_cast<int>(L.All.size());
+    int A, B;
+    Segment_Bounds(P.Seg, Len, A, B);
+    for (const Walk_Point& W : Walk_Table[P.Walk_Make]) {
+        int a, b;
+        Segment_Bounds(W.Seg, Len, a, b);
+        const int D = b - a;
+        if (D < First || (P.Right ? (a != A || b > B) : (b != B || a < A))) continue;  // unknown: searched itself
+        unsigned i = L.Ck_N++;
+        for (; i && L.Ck_Depth[i - 1] > D; i--) {
+            L.Ck_Depth[i] = L.Ck_Depth[i - 1];
+            L.Ck_Slot[i] = L.Ck_Slot[i - 1];
+        }
+        L.Ck_Depth[i] = D;
+        L.Ck_Slot[i] = W.Slot;
+        L.Walk_St[L.Strand][W.Slot] = WALK_PENDING;
+    }
+    Walk_Next(L);
+}
+
+// The walk has matched T.Level bases, T being as a search of that length would end.
+inline void Walk_Capture(Mm_Lane& L, const SARange& T) {
+    while (L.Ck_I < L.Ck_N && L.Ck_Depth[L.Ck_I] == T.Level) Walk_Set(L, L.Ck_I++, &T, WALK_FOUND);
+    Walk_Next(L);
+}
+
+// A located walk's genome compare over its Len bases: the first Fail - 1 match (Fail is
+// Len + 1 if all do). Points within them are found at located tag T; the rest fail, or,
+// if all matched, stay pending (beyond Len: an OP_SEARCH_KEEP's kept part).
+inline void Walk_Settle(Mm_Lane& L, const SARange& T, int Len, int Fail) {
+    for (; L.Ck_I < L.Ck_N; L.Ck_I++) {
+        const int D = L.Ck_Depth[L.Ck_I];
+        if (D < Fail && D <= Len) Walk_Set(L, L.Ck_I, &T, WALK_FOUND);
+        else if (Fail <= Len) Walk_Set(L, L.Ck_I, nullptr, WALK_FAILED);
+        else break;
+    }
+    Walk_Next(L);
+}
+
+// The walk failed: every pending point lies past the failure.
+inline void Walk_Fail(Mm_Lane& L) {
+    for (; L.Ck_I < L.Ck_N; L.Ck_I++) Walk_Set(L, L.Ck_I, nullptr, WALK_FAILED);
+    Walk_Next(L);
+}
+
+// The walk's step has finished: anything still pending is unknown.
+inline void Walk_Done(Mm_Lane& L) {
+    for (; L.Ck_I < L.Ck_N; L.Ck_I++) Walk_Set(L, L.Ck_I, nullptr, WALK_UNKNOWN);
+    L.Ck_N = L.Ck_I = 0;
+    L.Ck_Next = 0;
+}
+
 // The top of an exact search's loop: a wide range steps both ends, a single row walks.
 inline void Mm_Search_Enter(Mm_Lane& L) {
     SARange& T = L.Cur;
@@ -1245,6 +1402,7 @@ inline void Mm_Search_Enter(Mm_Lane& L) {
 // Ends a search task: Found, and (left searches) a zero Start on failure.
 inline bool Mm_Search_End(Mm_Lane& L, bool Found) {
     L.Found = Found;
+    if (!Found && L.Ck_I < L.Ck_N) Walk_Fail(L);
     if (!Found && !L.Right) L.Cur.Start = 0;
     return true;
 }
@@ -1257,6 +1415,7 @@ inline bool Mm_Search_Step(Mm_Lane& L) {
         case MM_WIDE:
             Get_SARange(Mm_Base(L, T.Level), T, L.Fmi);
             if (!T.Start) return Mm_Search_End(L, false);
+            if (T.Level == L.Ck_Next) Walk_Capture(L, T);
             if (T.Level == Len) return Mm_Search_End(L, true);
             T.Level++;
             Mm_Search_Enter(L);
@@ -1277,6 +1436,11 @@ inline bool Mm_Search_Step(Mm_Lane& L) {
                 }
                 Mark_Sampled(L.Fmi, T, L.Right, L.Offset, Len, T.Level);
             }
+            if (T.Level == L.Ck_Next) {  // a shared walk's point: as a search of this length ends
+                SARange C = T;
+                if (L.Right || !C.Skip) C.End = C.Start;
+                Walk_Capture(L, C);
+            }
             if (T.Level == Len) {
                 if (L.Right || !T.Skip) T.End = T.Start;  // a left walk keeps a marked End
                 return Mm_Search_End(L, true);
@@ -1292,7 +1456,11 @@ inline bool Mm_Search_Step(Mm_Lane& L) {
             L.Sub = MM_LOCATED;
             return false;
         case MM_LOCATED:
-            if (!Located_Matches(T, L.Right, L.Offset, Len, L.Done, L.Packed)) return Mm_Search_End(L, false);
+            if (!Located_Matches(T, L.Right, L.Offset, Len, L.Done, L.Packed)) {
+                if (L.Ck_I < L.Ck_N) Walk_Settle(L, T, Len, T.Level);
+                return Mm_Search_End(L, false);
+            }
+            if (L.Ck_I < L.Ck_N) Walk_Settle(L, T, Len, Len + 1);
             if (L.Right) T.Level = Len;
             return Mm_Search_End(L, true);
         default:
@@ -1692,9 +1860,11 @@ void Mm_Run(Mm_Lane& L, unsigned MaxHits) {
                 if (L.InTask) {  // the search has finished; Level is the failure depth if it failed
                     L.InTask = false;
                     if (!L.Found) Mm_Search_Failed(L, P, L.Cur.Level);
+                    Walk_Done(L);
                     L.PC++;
                     continue;
                 }
+                Walk_Reset(L, P);
                 if (P.Win && !Windows_Possible(Window_Set(P.Win, static_cast<int>(L.All.size()), L.LH_Fail, L.RH_Fail))) {
 #ifdef BATMAN_BATCH_STATS
                     Batch_Stats.Skipped[L.PC]++;
@@ -1709,6 +1879,17 @@ void Mm_Run(Mm_Lane& L, unsigned MaxHits) {
                     L.PC++;
                     continue;
                 }
+                if (P.Walk_Use) {  // served from a shared walk, if it settled this search
+                    const unsigned Slot = P.Walk_Use - 1;
+                    const unsigned char St = L.Walk_St[L.Strand][Slot];
+                    if (St == WALK_FOUND || St == WALK_FAILED) {
+                        L.Found = St == WALK_FOUND;
+                        if (L.Found) L.Cur = L.Walk_Saved[L.Strand][Slot];
+                        else L.Cur.Start = 0;
+                        L.PC++;
+                        continue;
+                    }
+                }
                 const std::string_view Seg = Mm_Segment(L, P.Seg, Offset);
                 const SARange R = Segment_Start(Seg, P.Right);
                 if (R.Level > static_cast<int>(Seg.size()) || !R.Start) {  // no longer than the key, or no match
@@ -1719,6 +1900,7 @@ void Mm_Run(Mm_Lane& L, unsigned MaxHits) {
                     continue;
                 }
                 Mm_Start_Search(L, P.Right, Seg, Offset, R, P.Right ? revfmi : fwfmi);
+                Walk_Arm(L, P, R.Level);
                 L.InTask = true;
                 return;
             }
@@ -1736,10 +1918,12 @@ void Mm_Run(Mm_Lane& L, unsigned MaxHits) {
                         return;
                     }
                     if (!L.Found) Mm_Search_Failed(L, P, L.Cur.Level);
+                    Walk_Done(L);
                     L.PC++;
                     continue;
                 }
                 L.Stored_Valid[P.Stored - 1] = false;
+                Walk_Reset(L, P);
                 const SARange R = Segment_Start(Seg, P.Right);
                 if (R.Level > static_cast<int>(Seg.size()) || !R.Start) {  // as OP_SEARCH
                     L.Cur = R;
@@ -1749,6 +1933,7 @@ void Mm_Run(Mm_Lane& L, unsigned MaxHits) {
                     continue;
                 }
                 L.InTask = true;
+                Walk_Arm(L, P, R.Level);
                 if (R.Level - 1 > Stop) {  // the lookup table covers the kept segment: a plain search
                     L.Keeping = false;
                     Mm_Start_Search(L, P.Right, Seg, Offset, R, Fmi);
@@ -1976,6 +2161,9 @@ void Batch_Search(const char* Reads, unsigned Count, int Len, unsigned B, unsign
             L.Resume = 0;
             L.Switching = false;
             L.Found = false;
+            L.Ck_N = L.Ck_I = 0;
+            L.Ck_Next = 0;
+            std::memset(L.Walk_St, 0, sizeof L.Walk_St);
             Mm_Run(L, MaxHits);
             if (!L.Done_Read) return true;
             Finish(L);
