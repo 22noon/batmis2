@@ -210,6 +210,48 @@ Search + output time, new / the half rule alone (e07b661), default-built indexes
     the 3% that repeated runs of one binary vary, so it is code layout, not work.
 - **At 100 bp, no gain:** the 12-base eighths rarely become as rare as their quarter.
 
+## The exact read as the super-seed (RH's k|0 cases)
+
+- **The idea:** R = LH|RH matches exactly. If RH is as rare as something that already
+  pins it to R, then extending RH leftward over LH can only lead back to the exact hit,
+  so the cases that keep RH exact can be dropped.
+- **The target must be |SA(R)|, not |SA(LH)|.**
+  - Let S_k = LH[k..] + RH be RH's leftward extension, so RH ⊂ S_k ⊂ R.
+  - |S_k| = |R| puts every exact S_k inside an exact R. Any alignment with S_k exact is
+    then the exact hit, and every case needs a mismatch somewhere.
+  - S_k does not contain LH, so |S_k| = |LH| says nothing on its own. For example, take LH
+    3 times, R once and RH 3 times: S_k can keep count 3, and 2 of those loci can be real
+    k|0 hits.
+  - The two targets agree when |LH| = |R|, e.g. both unique.
+- **When |R| is known:** at `OP_COUNT_EXACT`, after the 0|0 extension and before RH's
+  search, per strand (`Mm_Lane::Exact_Count`).
+
+What it prunes:
+
+| seed exact | cases | new? |
+|---|---|---|
+| RH, when \|RH\| = \|R\| at the end of its search | the 1\|0 extension over LH and its whole chain, 2\|0 … K\|0 | yes |
+| T2, the -n 2 middle third, which spans both halves | case (c) | yes, `-n 2` |
+| any seed X inside a half H, quarters included | H's seed cases | no: \|X\| ≥ \|H\| ≥ \|R\|, so X meets \|H\| first and the half rule drops it |
+| LH | 0\|k | can't: it runs before \|R\| is known, and it finds R |
+
+**What it saved:**
+- **Firing rate:** RH's k|0 cases are dropped about once per exact read (exact_rh 1.01 on
+  E. coli, 1.03 on chr21), on the strand that has the hit.
+- **Cycles (`perf stat`), new / 1421df9, E. coli 150 bp:**
+  - **Exact reads:** at `-n 7` batmis1 0.97, batmis2 0.98; at `-n 2` batmis1 0.89,
+    batmis2 0.91.
+  - **Random reads:** 1.00–1.02 at +0.2% instructions, which is code layout as above.
+- **Search and output time, exact reads:**
+  - **`-n 7`:** E. coli 150 bp 0.97–0.98, chr21 150 bp 0.98–0.99, chr21 100 bp 1.00.
+  - **Every other layout:** within ±2%.
+- **The rest of the idea, not built:**
+  - **Stopping RH's own search at |R|:** this would also save its locate and genome
+    compare, but the kept quarter and the shared walks need the search to reach the
+    quarter's depth.
+  - **Testing the exact branch inside the 1|0 extension** (RH repeated, so S_k reaches |R|
+    inside LH): this is the branch test below, which saved under 1%.
+
 ## Pruning extension branches by the same rule (not adopted)
 
 - **The rule is valid in extensions too.** Take a branch of a seed case's windowed
