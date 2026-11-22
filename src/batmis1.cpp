@@ -1266,8 +1266,10 @@ struct Batch_Stats_Counts {
     unsigned long Same_Served = 0, Same_Stopped = 0, Same_Depth = 0;  // Same_Count
     unsigned long Quarter_Served = 0, Quarter_Stopped = 0;           // ... of those, by a quarter alone
     unsigned long Exact_RH = 0;                                      // 1|0 extensions dropped (Mm_Exact_Only)
+    unsigned long Exact_Seed = 0;                                    // seeds in neither half dropped by |R|
     void Add(const Batch_Stats_Counts& O) {
         Exact_RH += O.Exact_RH;
+        Exact_Seed += O.Exact_Seed;
         Same_Served += O.Same_Served;
         Quarter_Served += O.Quarter_Served;
         Quarter_Stopped += O.Quarter_Stopped;
@@ -1362,6 +1364,7 @@ struct Mm_Lane {
     unsigned long Exact_Count[2];        // the read's exact occurrences by strand, from OP_COUNT_EXACT (0: none)
     unsigned long Same_Hit;              // the size at which Same_Count dropped the last search (0: none)
     bool Same_By_Quarter;                // the target is a quarter's, smaller than the half's (statistics)
+    bool Same_By_Exact;                  // the target is the exact read's: a seed in neither half (statistics)
     bool Known_Pending;                  // MM_LOCATE located Cur: Known_Add it at MM_LOCATED
 };
 
@@ -1652,6 +1655,7 @@ inline bool Mm_Search_Step(Mm_Lane& L) {
 #endif
 #ifdef BATMAN_BATCH_STATS
                 Batch_Stats.Quarter_Stopped += L.Same_By_Quarter;
+                Batch_Stats.Exact_Seed += L.Same_By_Exact;
 #endif
                 L.Same_Hit = L.Same_Target;
                 return Mm_Search_End(L, false);
@@ -2124,6 +2128,7 @@ void Mm_Run(Mm_Lane& L, unsigned MaxHits) {
                 const unsigned long Same = Same_Target_Of(L, P);
 #ifdef BATMAN_BATCH_STATS
                 L.Same_By_Quarter = Same && P.Half && Same != L.Same_Count[L.Strand][P.Half - 1];
+                L.Same_By_Exact = Same && !P.Half;
 #endif
                 if (P.Win && !Windows_Possible(Window_Set(P.Win, static_cast<int>(L.All.size()), L.LH_Fail, L.RH_Fail))) {
 #ifdef BATMAN_BATCH_STATS
@@ -2141,6 +2146,7 @@ void Mm_Run(Mm_Lane& L, unsigned MaxHits) {
                     L.Same_Hit = Same;
 #ifdef BATMAN_BATCH_STATS
                     Batch_Stats.Quarter_Served += L.Same_By_Quarter;
+                    Batch_Stats.Exact_Seed += L.Same_By_Exact;
                     Batch_Stats.Same_Served++;
 #endif
                 };
@@ -4095,7 +4101,8 @@ int main(int argc, char** argv) {
                       << (Batch_Stats.Same_Stopped ? double(Batch_Stats.Same_Depth) / Batch_Stats.Same_Stopped : 0.0)
                       << " by_quarter: served=" << double(Batch_Stats.Quarter_Served) / records
                       << " stopped=" << double(Batch_Stats.Quarter_Stopped) / records
-                      << " exact_rh=" << double(Batch_Stats.Exact_RH) / records << " (per record)\n";
+                      << " exact_rh=" << double(Batch_Stats.Exact_RH) / records
+                      << " exact_seed=" << double(Batch_Stats.Exact_Seed) / records << " (per record)\n";
             std::cerr << "known: tries=" << double(Batch_Stats.Known_Tries) / records
                       << " found=" << double(Batch_Stats.Known_Found) / records
                       << " checks=" << double(Batch_Stats.Known_Checks) / records
