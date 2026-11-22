@@ -189,7 +189,8 @@ bool Use_Ref = false;
 bool Use_Known = false;
 int Known_Limit = MAX_MISMATCH_SEARCH;  // -n: a position kept has at most this many mismatches
 // Same_Count (benchmark/same_count.md): a seed case inside a half is dropped once its exact
-// string is as rare as the exact half. Off with --no-same-count.
+// string is as rare as the exact half (or quarter), and RH's k|0 cases once RH is as rare
+// as the exact read. Off with --no-same-count.
 bool Use_Same = true;
 // Without the reference, but with the SA samples loaded (SAM/BAM output): a single-row
 // path records its genome position in Pos at the first sampled row (Mark_Sampled).
@@ -1264,7 +1265,9 @@ struct Batch_Stats_Counts {
     unsigned long Known_Tries = 0, Known_Found = 0, Known_Checks = 0, Known_Adds = 0;  // Known_Find, Known_Add
     unsigned long Same_Served = 0, Same_Stopped = 0, Same_Depth = 0;  // Same_Count
     unsigned long Quarter_Served = 0, Quarter_Stopped = 0;           // ... of those, by a quarter alone
+    unsigned long Exact_RH = 0;                                      // 1|0 extensions dropped (Mm_Exact_Only)
     void Add(const Batch_Stats_Counts& O) {
+        Exact_RH += O.Exact_RH;
         Same_Served += O.Same_Served;
         Quarter_Served += O.Quarter_Served;
         Quarter_Stopped += O.Quarter_Stopped;
@@ -1356,6 +1359,7 @@ struct Mm_Lane {
     // Same_Count's sizes by strand (indexed by Strand, not swapped): the exact LH and RH
     // searches' (0: no match), then the exact quarters' by Quarter_Id + 1 (0: unknown).
     unsigned long Same_Count[2][6];
+    unsigned long Exact_Count[2];        // the read's exact occurrences by strand, from OP_COUNT_EXACT (0: none)
     unsigned long Same_Hit;              // the size at which Same_Count dropped the last search (0: none)
     bool Same_By_Quarter;                // the target is a quarter's, smaller than the half's (statistics)
     bool Known_Pending;                  // MM_LOCATE located Cur: Known_Add it at MM_LOCATED
@@ -1570,9 +1574,11 @@ inline unsigned long Range_Count(const SARange& T) {
 // The size Same_Count compares step P's seed with (a seed case's step), or 0: none. A seed
 // inside a quarter Q of half H (P.Super) is compared with Q, when Q's size is known: X ⊂ Q
 // keeps |X| >= |Q| >= |H|, so the search can meet |Q| but never pass it to |H|. Otherwise
-// with H.
+// with H. A seed in neither half (T2 at -n 2) is compared with the exact read R: X ⊂ R
+// as rare as R lies only in exact R, and every case needs a mismatch.
 inline unsigned long Same_Target_Of(const Mm_Lane& L, const Mm_Step& P) {
-    if (!Use_Same || !P.Half) return 0;
+    if (!Use_Same) return 0;
+    if (!P.Half) return P.Seg == SEG_LH || P.Seg == SEG_RH ? 0 : L.Exact_Count[L.Strand];
     const unsigned long* C = L.Same_Count[L.Strand];
     return P.Super && C[P.Super + 1] ? C[P.Super + 1] : C[P.Half - 1];
 }
@@ -1582,6 +1588,17 @@ inline unsigned long Same_Target_Of(const Mm_Lane& L, const Mm_Step& P) {
 // has that size too; otherwise 0 when it did not match.
 inline void Mm_Quarter_Done(Mm_Lane& L, const Mm_Step& P) {
     if (P.Records) L.Same_Count[L.Strand][P.Records + 1] = L.Found ? Range_Count(L.Cur) : L.Same_Hit;
+}
+
+// RH exact and as rare as the exact read R (Exact_Count): every exact RH lies inside an
+// exact R, so the 1|0 extension of RH over LH and its chain (k|0) find only the 0|0 hits.
+[[gnu::noinline]] bool Mm_Exact_Only(Mm_Lane& L, const Mm_Step& P) {
+    if (!Use_Same || P.Right || P.Seg != SEG_LH || Range_Count(L.Cur) != L.Exact_Count[L.Strand])
+        return false;
+#ifdef BATMAN_BATCH_STATS
+    Batch_Stats.Exact_RH++;
+#endif
+    return true;
 }
 
 // An exact search of half P.Seg has finished (L.Found, L.Cur): its size for Same_Count.
@@ -2106,7 +2123,7 @@ void Mm_Run(Mm_Lane& L, unsigned MaxHits) {
                 L.Same_Hit = 0;
                 const unsigned long Same = Same_Target_Of(L, P);
 #ifdef BATMAN_BATCH_STATS
-                L.Same_By_Quarter = Same && Same != L.Same_Count[L.Strand][P.Half - 1];
+                L.Same_By_Quarter = Same && P.Half && Same != L.Same_Count[L.Strand][P.Half - 1];
 #endif
                 if (P.Win && !Windows_Possible(Window_Set(P.Win, static_cast<int>(L.All.size()), L.LH_Fail, L.RH_Fail))) {
 #ifdef BATMAN_BATCH_STATS
@@ -2220,7 +2237,8 @@ void Mm_Run(Mm_Lane& L, unsigned MaxHits) {
                     L.PC++;
                     continue;
                 }
-                if (!L.Found || !L.Cur.Start || (P.Limited && MaxHits && Mm_Used(L) >= MaxHits)) {
+                if (!L.Found || !L.Cur.Start || (P.Limited && MaxHits && Mm_Used(L) >= MaxHits) ||
+                    (L.Exact_Count[L.Strand] && Mm_Exact_Only(L, P))) {
                     L.PC++;  // nothing to extend, or no hits left to find (a budget of 0 is no limit)
                     continue;
                 }
@@ -2248,6 +2266,8 @@ void Mm_Run(Mm_Lane& L, unsigned MaxHits) {
                     if (MaxHits > 0 && hitCount > MaxHits) hitCount = MaxHits;
                     L.ReadHits += hitCount;
                 }
+                L.Exact_Count[L.Strand] = 0;
+                for (const SARange& hit : L.Res[P.From].hits) L.Exact_Count[L.Strand] += Range_Count(hit);
                 L.PC++;
                 continue;
             case OP_RESUME: {
@@ -2437,6 +2457,7 @@ void Batch_Search(const char* Reads, unsigned Count, int Len, unsigned B, unsign
             L.Ck_Next = 0;
             std::memset(L.Walk_St, 0, sizeof L.Walk_St);
             std::memset(L.Same_Count, 0, sizeof L.Same_Count);
+            L.Exact_Count[0] = L.Exact_Count[1] = 0;
             Mm_Run(L, MaxHits);
             if (!L.Done_Read) return true;
             Finish(L);
@@ -3802,7 +3823,8 @@ void Usage(const char* prog) {
         "  --no-ref  do not load the SA samples (.sa) and packed genome (.pac); single-row\n"
         "            paths then walk the index to the end (less memory, slower)\n"
         "  --no-same-count  keep searching a half's seed cases after a seed is as rare as\n"
-        "            the exact half (they then find no hits); for timing, same output\n"
+        "            the exact half, and RH's k|0 cases after RH is as rare as the\n"
+        "            exact read (they then find no hits); for timing, same output\n"
         "            (see benchmark/same_count.md)\n"
         "  --known   locate single-row paths at the read's positions already located,\n"
         "            instead of walking them to a sampled row; same output. Faster only on\n"
@@ -4072,7 +4094,8 @@ int main(int argc, char** argv) {
                       << " stopped=" << double(Batch_Stats.Same_Stopped) / records << " depth="
                       << (Batch_Stats.Same_Stopped ? double(Batch_Stats.Same_Depth) / Batch_Stats.Same_Stopped : 0.0)
                       << " by_quarter: served=" << double(Batch_Stats.Quarter_Served) / records
-                      << " stopped=" << double(Batch_Stats.Quarter_Stopped) / records << " (per record)\n";
+                      << " stopped=" << double(Batch_Stats.Quarter_Stopped) / records
+                      << " exact_rh=" << double(Batch_Stats.Exact_RH) / records << " (per record)\n";
             std::cerr << "known: tries=" << double(Batch_Stats.Known_Tries) / records
                       << " found=" << double(Batch_Stats.Known_Found) / records
                       << " checks=" << double(Batch_Stats.Known_Checks) / records
