@@ -242,6 +242,13 @@ What it prunes:
   - **Exact reads:** at `-n 7` batmis1 0.97, batmis2 0.98; at `-n 2` batmis1 0.89,
     batmis2 0.91.
   - **Random reads:** 1.00–1.02 at +0.2% instructions, which is code layout as above.
+- **The middle third's share at `-n 2`:**
+  - **Firing rate:** T2 is dropped 1.00 times per exact read on E. coli and 1.02 on chr21
+    (`exact_seed`). That is 0 at `-n 7`, which has no seed outside a half.
+  - **Exact-read cycles, batmis1, relative to 1421df9:**
+    - RH drop alone: 0.95 on both genomes.
+    - With T2 too: 0.90 on both.
+  - So T2 gives about half the `-n 2` gain.
 - **Search and output time, exact reads:**
   - **`-n 7`:** E. coli 150 bp 0.97–0.98, chr21 150 bp 0.98–0.99, chr21 100 bp 1.00.
   - **Every other layout:** within ±2%.
