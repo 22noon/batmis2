@@ -136,6 +136,80 @@ batmis2 gives 0.72, 0.87, 0.95, 0.99, 0.82 and 1.02.
 Differences of 2–3% on chr21 are within run-to-run noise. On 100 bp chr21 reads, Columba
 takes 4–16 times as long as batmis1 at `-n 7`.
 
+## Quarters as super-seeds
+
+- **The general form:** a case's exact seed X lies inside an earlier exact string Y whose
+  count is known, and |X| = |Y| ≥ 1. If the case needs a mismatch inside Y (it can only be
+  in Y \ X), the case has no hit.
+- **Super-seeds:** besides the halves, the program knows four exact counts when the seed
+  cases run:
+  - **The outer quarters** [0,37) and [112,150) at 150 bp, kept by the half searches in
+    round 1 (`Mm_Keep_Rest`).
+  - **The inner quarters** [37,75) and [75,112), searched whole as the s=1 seeds in rounds 2
+    and 3 (steps marked `Records`).
+  - **Nothing else:** no other searched string (the thirds and eighths on the walks, or the
+    middle seeds) contains another case's seed together with the region where that case
+    needs its mismatch.
+
+Every seed case of `-n 7` at 150 bp. Steps are the single-strand program's; RH mirrors are
+in brackets.
+
+| step (RH) | round | case | seed | needs a mismatch in | dropped when the seed is as rare as |
+|---|---|---|---|---|---|
+| 15 (30) | 2 (3) | s=1, in Q_in | Q_out [0,37) | Q_in | the half |
+| 17 (32) | 2 (3) | s=1, in Q_out | Q_in [37,75) | Q_out | the half |
+| 47 (73) | 4 (5) | A, 2 in Q_out | Q_in | Q_out | the half |
+| 49 (75) | 4 (5) | B, 2 in Q_in | Q_out | Q_in | the half |
+| 51 (77) | 4 (5) | C1, p in [25,37) | H_out [0,25) | [25,37) | the half, or **Q_out** |
+| 53 (79) | 4 (5) | C2, one in [37,50) | H_in [50,75) | [37,50) | the half, or **Q_in** |
+| 55 (81) | 4 (5) | C3 | H_mid [25,50) | H_out, H_in | the half |
+| 101 (134) | 6 (7) | (0,3) | Q_out | Q_in | the half |
+| 103 (136) | 6 (7) | (3,0) | Q_in | Q_out | the half |
+| 105 (138) | 6 (7) | (1,2), p in E2 | E1 [0,18) | E2 | the half, or **Q_out** |
+| 107 (140) | 6 (7) | (1,2), p in E1 | E2 [18,37) | E1 | the half, or **Q_out** |
+| 110 (143) | 6 (7) | (2,1), r in E3 | E4 [56,75) | E3 | the half, or **Q_in** |
+| 112 (145) | 6 (7) | (2,1), r in E4 | E3 [37,56) | E4 | the half, or **Q_in** |
+
+- **How many cases the quarters add:** 4 at `-n 5` (C1 and C2 of each half), 8 at `-n 6`,
+  12 at `-n 7`. The same containments hold at 100 bp (`Part_Position`'s fractions).
+- **Where they help:** only when the half has a mismatch but the quarter is exact. Reads
+  with both halves exact were already handled by the half rule.
+- **Implementation:**
+  - `Mm_Step::Super` names the quarter.
+  - The quarter's count is used in place of the half's when it is known. X ⊂ Q keeps
+    |X| ≥ |Q| ≥ |H|, so a search can meet |Q| but never pass it.
+  - If the inner quarter's own search was stopped by the half rule, its count is |H|.
+  - None of these searches is a shared walk, which the builder checks.
+  - The sizes are kept per strand in `Mm_Lane::Same_Count`, indexed by the strand and not
+    swapped. Swapping them at every strand switch cost random reads 2.4%.
+
+Seed cases dropped by a quarter alone, per read, batmis1, `-n 7`, E. coli 150 bp: u1 3.1,
+u2 3.8, u4 3.1, u7 1.5, s1_6 3.1, s3_4 1.1, q3_4 0.3. None on exact or random reads.
+
+Search + output time, new / the half rule alone (e07b661), default-built indexes, `-n 7`:
+
+| reads | batmis1 E. coli 150 bp | batmis2 E. coli 150 bp | batmis1 chr21 150 bp | batmis2 chr21 150 bp | batmis1 chr21 100 bp |
+|---|---:|---:|---:|---:|---:|
+| u1 | 0.95 | 0.97 | 0.99 | 0.99 | 1.00 |
+| u2 | 0.95 | 0.97 | 0.97 | 0.97 | 1.01 |
+| u4 | 0.95 | 0.96 | 0.99 | 0.99 | 1.00 |
+| u7 | 0.99 | 1.00 | 1.00 | 0.99 | 1.00 |
+| s1_6 | 0.95 | 0.97 | 0.98 | 0.98 | 1.01 |
+| s2_5 | 0.98 | 0.98 | 0.99 | 1.00 | – |
+| cluster7 | 0.96 | 0.98 | 0.97 | 1.00 | – |
+| u0, s0_7, s3_4, q3_4 | 1.00–1.01 | 1.00–1.01 | 0.99–1.02 | 1.00–1.01 | – |
+| spread7 | 1.02 | 1.02 | 1.00 | 1.01 | – |
+| random | 1.01 | 1.04 | 1.00 | 1.02 | 1.01 |
+
+- **At `-n 5`:** batmis1 u2 0.98, s1_6 0.97.
+- **In cycles (`perf stat`):**
+  - **u2:** batmis1 −5%, batmis2 −4%.
+  - **Random and spread7, batmis1:** within 1%.
+  - **Random and spread7, batmis2:** 1.3–3% higher at the same instruction count, and
+    1.3–1.7% with aligned builds (`-falign-functions=64 -falign-loops=64`). That is within
+    the 3% that repeated runs of one binary vary, so it is code layout, not work.
+- **At 100 bp, no gain:** the 12-base eighths rarely become as rare as their quarter.
+
 ## Pruning extension branches by the same rule (not adopted)
 
 - **The rule is valid in extensions too.** Take a branch of a seed case's windowed
