@@ -188,6 +188,9 @@ bool Use_Ref = false;
 // default: it pays only where single rows walk far to a sampled row (benchmark/known_positions.md).
 bool Use_Known = false;
 int Known_Limit = MAX_MISMATCH_SEARCH;  // -n: a position kept has at most this many mismatches
+// Same_Count (benchmark/same_count.md): a seed case inside a half is dropped once its exact
+// string is as rare as the exact half. Off with --no-same-count.
+bool Use_Same = true;
 // Without the reference, but with the SA samples loaded (SAM/BAM output): a single-row
 // path records its genome position in Pos at the first sampled row (Mark_Sampled).
 bool Track_Pos = false;
@@ -863,6 +866,8 @@ struct Mm_Step {
     unsigned char Strand;     // two-strand programs (Zig_Zag): 0 the read, 1 its reverse complement
     unsigned char Walk_Make = 0;  // OP_SEARCH(_KEEP) walks: its Walk_Table entry, the later searches it serves (0: none)
     unsigned char Walk_Use = 0;   // OP_SEARCH: 1 + the shared-walk slot it is served from (Share_Walks)
+    unsigned char Half = 0;       // OP_SEARCH: a seed case's, inside half 1 LH or 2 RH, the case
+                                  // needing a mismatch there (Same_Count; 0: none)
 };
 constexpr unsigned MM_PROGRAM_MAX = 320;  // longest program (-n 7 zig-zag: 307 steps), for the stats
 constexpr unsigned MM_LISTS = RL_LISTS;  // each read's lists (Result_List)
@@ -936,6 +941,12 @@ class Mm_Builder {
 
     static unsigned char U(int X) { return static_cast<unsigned char>(X); }
     void Add(const Mm_Step& S) { P.Steps.push_back(S); }
+    // Marks the OP_SEARCH steps from step First on as seeds of half Side's cases
+    // (Mm_Step::Half): each seed lies inside the half, and its case needs a mismatch there.
+    void Mark_Half(std::size_t First, Mm_Part Side) {
+        for (std::size_t i = First; i < P.Steps.size(); i++)
+            if (P.Steps[i].Op == OP_SEARCH) P.Steps[i].Half = Side == PART_LH ? 1 : 2;
+    }
     void End_Stage(bool Right, int Mismatches, unsigned Keep) {
         Add({OP_END_STAGE, false, 0, U(P.Stages.size()), U(Keep)});
         P.Stages.push_back({Right ? "F" : "B", Mismatches});
@@ -1077,10 +1088,12 @@ class Mm_Builder {
                             Win_C3 = Windows({{T3, 1, WIN_NARROW}}), Win_C1 = Windows({{T1, 1, WIN_NARROW}});
         Add({OP_STOP_IF_MAXHITS});
         Add({OP_SEARCH, true, T1, 0, 0, 0, false, false, Win_A, 0, 1});
+        P.Steps.back().Half = 1;  // (a) needs p in [a, LH): T1 as rare as LH has no hit
         Add({OP_EXTEND, true, A_End, 0, RL_HITS, 0, true, false, Win_A});
         End_Stage(true, 2, RL_NONE);
         Add({OP_STOP_IF_MAXHITS});
         Add({OP_SEARCH, false, T3, 0, 0, 0, false, false, Win_B, 0, 2});
+        P.Steps.back().Half = 2;  // (b) needs q in [LH, b): T3 as rare as RH has no hit
         Add({OP_EXTEND, false, Start_B, 0, RL_HITS, 0, true, false, Win_B});
         End_Stage(false, 2, RL_NONE);
         Add({OP_STOP_IF_MAXHITS});
@@ -1126,6 +1139,11 @@ class Mm_Builder {
     //          C3, p in H_out, the other in H_in: H_mid exact, extended inward over H_in,
     //          switched and extended outward over H_out.
     void Seeds(Mm_Part Side, int S) {
+        const std::size_t First = P.Steps.size();
+        Seeds_Of(Side, S);
+        Mark_Half(First, Side);
+    }
+    void Seeds_Of(Mm_Part Side, int S) {
         const bool D = Side == PART_LH;  // inward: right in LH, left in RH
         const unsigned char Slot = D ? 1 : 2;  // the half scan's kept outer quarter
         auto Seg = [&](int LoNum, int LoDen, int HiNum, int HiDen) {
@@ -1224,7 +1242,11 @@ struct Batch_Stats_Counts {
     unsigned long Steps[MM_PROGRAM_MAX][4][6] = {};  // [program step][task][sub]
     unsigned long Skipped[MM_PROGRAM_MAX] = {};      // searches skipped by their windows
     unsigned long Known_Tries = 0, Known_Found = 0, Known_Checks = 0, Known_Adds = 0;  // Known_Find, Known_Add
+    unsigned long Same_Served = 0, Same_Stopped = 0, Same_Depth = 0;  // Same_Count
     void Add(const Batch_Stats_Counts& O) {
+        Same_Served += O.Same_Served;
+        Same_Stopped += O.Same_Stopped;
+        Same_Depth += O.Same_Depth;
         Known_Tries += O.Known_Tries;
         Known_Found += O.Known_Found;
         Known_Checks += O.Known_Checks;
@@ -1251,6 +1273,7 @@ struct Mm_Strand {
     ForwardResults* Res;
     unsigned long ReadHits;
     int LH_Fail, RH_Fail;
+    unsigned long LH_Count, RH_Count;
     SARange Stored[2];
     bool Stored_Valid[2];
     std::size_t Tagged;
@@ -1276,6 +1299,8 @@ struct Mm_Lane {
     std::size_t Resume;   // OP_RESUME / OP_CROSS: next deferred range or seed
     bool Switching;       // the task is an index switch (Tag points into Patched)
     int LH_Fail, RH_Fail; // the exact LH / RH searches' failure bounds (Window_Set)
+    unsigned long LH_Count, RH_Count;  // the exact LH / RH searches' range sizes (0: no match)
+    unsigned long Same_Target;         // the running search's Same_Count size (0: none)
     SARange Stored[2];    // OP_SEARCH_KEEP's kept ranges, if Stored_Valid
     bool Stored_Valid[2];
     bool Keeping;         // OP_SEARCH_KEEP is searching its kept segment (else the rest)
@@ -1321,6 +1346,8 @@ inline void Mm_Set_Strand(Mm_Lane& L, unsigned S) {
     std::swap(L.ReadHits, O.ReadHits);
     std::swap(L.LH_Fail, O.LH_Fail);
     std::swap(L.RH_Fail, O.RH_Fail);
+    std::swap(L.LH_Count, O.LH_Count);
+    std::swap(L.RH_Count, O.RH_Count);
     std::swap(L.Stored, O.Stored);
     std::swap(L.Stored_Valid, O.Stored_Valid);
     std::swap(L.Tagged, O.Tagged);
@@ -1504,6 +1531,30 @@ inline void Walk_Done(Mm_Lane& L) {
     L.Ck_Next = 0;
 }
 
+// Same_Count. Every occurrence of a half H contains each of its substrings X at the same
+// offset, so |X| >= |H| (range sizes), and if they are equal every occurrence of X lies in
+// one of H: wherever X matches exactly, so does H. A seed case of H (Mm_Step::Half) needs a
+// mismatch in H, so once its exact seed is as rare as H, the case has no hit: the seed's
+// search stops there as not found. A search's range only shrinks, and each longer prefix
+// of the seed lies in H too, so the test can end the search at the first depth it holds.
+// (The same test on the exact branches of the cases' extensions is valid too, but saved
+// under 1%: benchmark/same_count.md.)
+inline unsigned long Range_Count(const SARange& T) {
+    return T.Skip ? 1UL : (T.End >= T.Start ? T.End - T.Start + 1UL : 0UL);  // as OP_COUNT_EXACT
+}
+
+// The exact half's size for step P (a seed case's step), or 0: no Same_Count.
+inline unsigned long Same_Target_Of(const Mm_Lane& L, const Mm_Step& P) {
+    if (!Use_Same || !P.Half) return 0;
+    return P.Half == 1 ? L.LH_Count : L.RH_Count;
+}
+
+// An exact search of half P.Seg has finished (L.Found, L.Cur): its size for Same_Count.
+inline void Mm_Half_Done(Mm_Lane& L, const Mm_Step& P) {
+    if (P.Seg == SEG_LH) L.LH_Count = L.Found ? Range_Count(L.Cur) : 0;
+    else if (P.Seg == SEG_RH) L.RH_Count = L.Found ? Range_Count(L.Cur) : 0;
+}
+
 // The top of an exact search's loop: a wide range steps both ends, a single row walks.
 inline void Mm_Search_Enter(Mm_Lane& L) {
     SARange& T = L.Cur;
@@ -1543,6 +1594,13 @@ inline bool Mm_Search_Step(Mm_Lane& L) {
         case MM_WIDE:
             Get_SARange(Mm_Base(L, T.Level), T, L.Fmi);
             if (!T.Start) return Mm_Search_End(L, false);
+            if (L.Same_Target && T.End - T.Start + 1 == L.Same_Target) {  // as rare as the half: no hit
+#ifdef BATMAN_BATCH_STATS
+                Batch_Stats.Same_Stopped++;
+                Batch_Stats.Same_Depth += T.Level;
+#endif
+                return Mm_Search_End(L, false);
+            }
             if (T.Level == L.Ck_Next) Walk_Capture(L, T);
             if (T.Level == Len) return Mm_Search_End(L, true);
             T.Level++;
@@ -1742,6 +1800,7 @@ inline bool Mm_Extend_Step(Mm_Lane& L) {
 }
 
 inline void Mm_Start_Search(Mm_Lane& L, bool Right, std::string_view Tag, int Offset, const SARange& R, ActiveBWT* Fmi) {
+    L.Same_Target = 0;
     L.Task = TASK_SEARCH;
     L.Right = Right;
     L.Tag = Tag;
@@ -1996,11 +2055,13 @@ void Mm_Run(Mm_Lane& L, unsigned MaxHits) {
                 if (L.InTask) {  // the search has finished; Level is the failure depth if it failed
                     L.InTask = false;
                     if (!L.Found) Mm_Search_Failed(L, P, L.Cur.Level);
+                    Mm_Half_Done(L, P);
                     Walk_Done(L);
                     L.PC++;
                     continue;
                 }
                 Walk_Reset(L, P);
+                const unsigned long Same = Same_Target_Of(L, P);
                 if (P.Win && !Windows_Possible(Window_Set(P.Win, static_cast<int>(L.All.size()), L.LH_Fail, L.RH_Fail))) {
 #ifdef BATMAN_BATCH_STATS
                     Batch_Stats.Skipped[L.PC]++;
@@ -2009,9 +2070,18 @@ void Mm_Run(Mm_Lane& L, unsigned MaxHits) {
                     L.PC++;
                     continue;
                 }
+                // A seed served, or from the lookup table, as rare as the half: no hit (Same_Count).
+                auto Same_Served = [&]() {
+                    if (!Same || !L.Found || Range_Count(L.Cur) != Same) return;
+                    L.Found = false;
+#ifdef BATMAN_BATCH_STATS
+                    Batch_Stats.Same_Served++;
+#endif
+                };
                 if (P.Stored && L.Stored_Valid[P.Stored - 1]) {
                     L.Cur = L.Stored[P.Stored - 1];
                     L.Found = true;
+                    Same_Served();
                     L.PC++;
                     continue;
                 }
@@ -2022,6 +2092,7 @@ void Mm_Run(Mm_Lane& L, unsigned MaxHits) {
                         L.Found = St == WALK_FOUND;
                         if (L.Found) L.Cur = L.Walk_Saved[L.Strand][Slot];
                         else L.Cur.Start = 0;
+                        Same_Served();
                         L.PC++;
                         continue;
                     }
@@ -2032,10 +2103,20 @@ void Mm_Run(Mm_Lane& L, unsigned MaxHits) {
                     L.Cur = R;
                     L.Found = R.Start != 0;
                     if (!L.Found) Mm_Search_Failed(L, P, R.Level - 1);
+                    Mm_Half_Done(L, P);
+                    Same_Served();
+                    L.PC++;
+                    continue;
+                }
+                if (Same && Range_Count(R) == Same) {  // already as rare at the lookup's depth
+                    L.Cur = R;
+                    L.Found = true;
+                    Same_Served();
                     L.PC++;
                     continue;
                 }
                 Mm_Start_Search(L, P.Right, Seg, Offset, R, P.Right ? revfmi : fwfmi);
+                L.Same_Target = Same;
                 Walk_Arm(L, P, R.Level);
                 L.InTask = true;
                 return;
@@ -2054,6 +2135,7 @@ void Mm_Run(Mm_Lane& L, unsigned MaxHits) {
                         return;
                     }
                     if (!L.Found) Mm_Search_Failed(L, P, L.Cur.Level);
+                    Mm_Half_Done(L, P);
                     Walk_Done(L);
                     L.PC++;
                     continue;
@@ -2065,6 +2147,7 @@ void Mm_Run(Mm_Lane& L, unsigned MaxHits) {
                     L.Cur = R;
                     L.Found = R.Start != 0;
                     if (!L.Found) Mm_Search_Failed(L, P, R.Level - 1);
+                    Mm_Half_Done(L, P);
                     L.PC++;
                     continue;
                 }
@@ -2276,6 +2359,7 @@ void Batch_Search(const char* Reads, unsigned Count, int Len, unsigned B, unsign
         L.ReadHits = 0;
         L.LH_Fail = Len;
         L.RH_Fail = 0;
+        L.LH_Count = L.RH_Count = 0;
         L.Stored_Valid[0] = L.Stored_Valid[1] = false;
         if (Use_Ref) Pack_Read(L.All, L.Packed);
     };
@@ -3668,6 +3752,9 @@ void Usage(const char* prog) {
         "  -m  maximum hits per read (default 1, 0 = all)\n"
         "  --no-ref  do not load the SA samples (.sa) and packed genome (.pac); single-row\n"
         "            paths then walk the index to the end (less memory, slower)\n"
+        "  --no-same-count  keep searching a half's seed cases after a seed is as rare as\n"
+        "            the exact half (they then find no hits); for timing, same output\n"
+        "            (see benchmark/same_count.md)\n"
         "  --known   locate single-row paths at the read's positions already located,\n"
         "            instead of walking them to a sampled row; same output. Faster only on\n"
         "            indexes whose SA samples are sparse (benchmark/known_positions.md)\n"
@@ -3761,6 +3848,8 @@ int main(int argc, char** argv) {
             useRef = false;
         } else if (std::strcmp(argv[i], "--known") == 0) {
             Use_Known = true;
+        } else if (std::strcmp(argv[i], "--no-same-count") == 0) {
+            Use_Same = false;
         } else if (std::strcmp(argv[i], "--no-mmap") == 0) {
             Use_Mmap = false;
         } else if (std::strcmp(argv[i], "--sam") == 0) {
@@ -3930,6 +4019,10 @@ int main(int argc, char** argv) {
                       << " occupancy=" << double(Batch_Stats.Lane_Rounds) / Batch_Stats.Rounds << "/" << Batch_Stats.Lanes
                       << " drain_rounds=" << Batch_Stats.Drain_Rounds << " steps_per_record="
                       << double(Batch_Stats.Lane_Rounds) / records << '\n';
+            std::cerr << "same_count: served=" << double(Batch_Stats.Same_Served) / records
+                      << " stopped=" << double(Batch_Stats.Same_Stopped) / records << " depth="
+                      << (Batch_Stats.Same_Stopped ? double(Batch_Stats.Same_Depth) / Batch_Stats.Same_Stopped : 0.0)
+                      << " (per record)\n";
             std::cerr << "known: tries=" << double(Batch_Stats.Known_Tries) / records
                       << " found=" << double(Batch_Stats.Known_Found) / records
                       << " checks=" << double(Batch_Stats.Known_Checks) / records
