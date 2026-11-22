@@ -981,7 +981,13 @@ struct Mm_Step {
     unsigned char Walk_Use = 0;   // OP_SEARCH: 1 + the shared-walk slot it is served from (Share_Walks)
     unsigned char Half = 0;       // OP_SEARCH: a seed case's, inside half 1 LH or 2 RH, the case
                                   // needing a mismatch there (Same_Count; 0: none)
+    unsigned char Super = 0;      // OP_SEARCH: a seed case's, inside quarter Super (Quarter_Id), the
+                                  // case needing a mismatch there too (Same_Count; 0: none)
+    unsigned char Records = 0;    // OP_SEARCH of a whole quarter: its size goes to that quarter's
+                                  // count (Quarter_Id; 0: none)
 };
+// The half's quarters whose exact sizes Same_Count uses (Mm_Lane::Same_Count[Strand][Id + 1]).
+enum Quarter_Id : unsigned char { QUARTER_NONE, LQ_OUT, LQ_IN, RQ_OUT, RQ_IN };
 constexpr unsigned MM_PROGRAM_MAX = 320;  // longest program (-n 7 zig-zag: 307 steps), for the stats
 constexpr unsigned MM_LISTS = RL_LISTS;  // each read's lists (Result_List)
 
@@ -1040,6 +1046,13 @@ class Mm_Builder {
         }
         Add({OP_END});
         Share_Walks();
+        // Same_Count stops a Super search on its quarter's size, which may leave longer
+        // prefixes unsettled: no such search may serve others.
+        for (const Mm_Step& S : P.Steps)
+            if (S.Super && S.Walk_Make) {
+                std::fprintf(stderr, "-n %d: a Same_Count quarter search is a shared walk\n", K);
+                std::exit(1);
+            }
         return P;
     }
 
@@ -1268,6 +1281,7 @@ class Mm_Builder {
             Add({OP_SEARCH, D, Q_Out, 0, 0, 0, false, false, W_In, 0, Slot});
             Add({OP_EXTEND, D, Q_In, 0, RL_SEED_1, 0, false, false, W_In});
             Add({OP_SEARCH, !D, Q_In});
+            P.Steps.back().Records = D ? LQ_IN : RQ_IN;  // the inner quarter's size, for Same_Count
             Add({OP_EXTEND, !D, Q_Out, 0, RL_SEED_2, 0, false, false, W_Out});
             return;
         }
@@ -1289,8 +1303,10 @@ class Mm_Builder {
         Add({OP_SEARCH, D, Q_Out, 0, 0, 0, false, false, W_B, 0, Slot});  // B
         Add({OP_EXTEND, D, Q_In, 0, RL_SEED_1, 0, false, false, W_B});
         Add({OP_SEARCH, D, H_Out, 0, 0, 0, false, false, W_C1});  // C1
+        P.Steps.back().Super = D ? LQ_OUT : RQ_OUT;  // needs p in [1/3, 1/2), in Q_out
         Add({OP_EXTEND, D, Seg(1, 3, 1, 1), 0, RL_SEED_1, 0, false, false, W_C1});
         Add({OP_SEARCH, !D, H_In, 0, 0, 0, false, false, W_C2});  // C2
+        P.Steps.back().Super = D ? LQ_IN : RQ_IN;  // needs one in [1/2, 2/3), in Q_in
         Add({OP_EXTEND, !D, Seg(0, 1, 2, 3), 0, RL_SEED_2, 0, false, false, W_C2});
         Add({OP_SEARCH, D, H_Mid, 0, 0, 0, false, false, W_H_Out});  // C3
         Add({OP_EXTEND, D, H_In, 0, RL_SEED_3, 0, false, false, W_H_In});
@@ -1323,13 +1339,17 @@ class Mm_Builder {
         Add({OP_SEARCH, !D, Q_In});  // (3, 0)
         Add({OP_EXTEND, !D, Q_Out, 0, RL_SEED_2, 0, false, false, W_30});
         Add({OP_SEARCH, D, E1, 0, 0, 0, false, false, W_12a});  // (1, 2), p in E2
+        P.Steps.back().Super = D ? LQ_OUT : RQ_OUT;  // p in E2, in Q_out
         Add({OP_EXTEND, D, Seg(1, 4, 1, 1), 0, RL_SEED_1, 0, false, false, W_12a});
         Add({OP_SEARCH, !D, E2, 0, 0, 0, false, false, W_E1});  // (1, 2), p in E1
+        P.Steps.back().Super = D ? LQ_OUT : RQ_OUT;  // p in E1, in Q_out
         Add({OP_EXTEND, !D, E1, 0, RL_SEED_3, 0, false, false, W_E1});
         Add({OP_CROSS, D, Q_In, 0, RL_SEED_1, RL_SEED_3, false, true, W_Q_In2, Q_Out});
         Add({OP_SEARCH, !D, E4, 0, 0, 0, false, false, W_21a});  // (2, 1), r in E3
+        P.Steps.back().Super = D ? LQ_IN : RQ_IN;  // r in E3, in Q_in
         Add({OP_EXTEND, !D, Seg(0, 1, 3, 4), 0, RL_SEED_2, 0, false, false, W_21a});
         Add({OP_SEARCH, D, E3});  // (2, 1), r in E4
+        P.Steps.back().Super = D ? LQ_IN : RQ_IN;  // r in E4, in Q_in
         Add({OP_EXTEND, D, E4, 0, RL_SEED_4, 0, false, false, W_E4});
         Add({OP_CROSS, !D, Q_Out, 0, RL_SEED_2, RL_SEED_4, false, true, W_Q_Out2, Q_In});
     }
@@ -1356,8 +1376,11 @@ struct Batch_Stats_Counts {
     unsigned long Skipped[MM_PROGRAM_MAX] = {};      // searches skipped by their windows
     unsigned long Known_Tries = 0, Known_Found = 0, Known_Checks = 0, Known_Adds = 0;  // Known_Find, Known_Add
     unsigned long Same_Served = 0, Same_Stopped = 0, Same_Depth = 0;  // Same_Count
+    unsigned long Quarter_Served = 0, Quarter_Stopped = 0;           // ... of those, by a quarter alone
     void Add(const Batch_Stats_Counts& O) {
         Same_Served += O.Same_Served;
+        Quarter_Served += O.Quarter_Served;
+        Quarter_Stopped += O.Quarter_Stopped;
         Same_Stopped += O.Same_Stopped;
         Same_Depth += O.Same_Depth;
         Known_Tries += O.Known_Tries;
@@ -1386,7 +1409,6 @@ struct Mm_Strand {
     ForwardResults* Res;
     unsigned long ReadHits;
     int LH_Fail, RH_Fail;
-    unsigned long LH_Count, RH_Count;
     SARange Stored[2];
     bool Stored_Valid[2];
     std::size_t Tagged;
@@ -1413,7 +1435,6 @@ struct Mm_Lane {
     bool Switching;       // the task is an index switch (Tag points into Patched)
     bool Locate_Other;    // MM_LOCATE: from the other index's row (Both_Rows)
     int LH_Fail, RH_Fail; // the exact LH / RH searches' failure bounds (Window_Set)
-    unsigned long LH_Count, RH_Count;  // the exact LH / RH searches' range sizes (0: no match)
     unsigned long Same_Target;         // the running search's Same_Count size (0: none)
     SARange Stored[2];    // OP_SEARCH_KEEP's kept ranges, if Stored_Valid
     bool Stored_Valid[2];
@@ -1448,6 +1469,11 @@ struct Mm_Lane {
     Mm_Strand Other;
     std::unique_ptr<Known_Table> Known;  // the read's known positions (Known_Find)
     unsigned char Known_Here;            // Known->N[Strand]: the test before each lookup
+    // Same_Count's sizes by strand (indexed by Strand, not swapped): the exact LH and RH
+    // searches' (0: no match), then the exact quarters' by Quarter_Id + 1 (0: unknown).
+    unsigned long Same_Count[2][6];
+    unsigned long Same_Hit;              // the size at which Same_Count dropped the last search (0: none)
+    bool Same_By_Quarter;                // the target is a quarter's, smaller than the half's (statistics)
     bool Known_Pending;                  // MM_LOCATE located Cur: Known_Add it at MM_LOCATED
 };
 
@@ -1462,8 +1488,6 @@ inline void Mm_Set_Strand(Mm_Lane& L, unsigned S) {
     std::swap(L.ReadHits, O.ReadHits);
     std::swap(L.LH_Fail, O.LH_Fail);
     std::swap(L.RH_Fail, O.RH_Fail);
-    std::swap(L.LH_Count, O.LH_Count);
-    std::swap(L.RH_Count, O.RH_Count);
     std::swap(L.Stored, O.Stored);
     std::swap(L.Stored_Valid, O.Stored_Valid);
     std::swap(L.Tagged, O.Tagged);
@@ -1654,16 +1678,26 @@ inline unsigned long Range_Count(const SARange& T) {
     return T.Skip ? 1UL : (T.End >= T.Start ? T.End - T.Start + 1UL : 0UL);  // as OP_COUNT_EXACT
 }
 
-// The exact half's size for step P (a seed case's step), or 0: no Same_Count.
+// The size Same_Count compares step P's seed with (a seed case's step), or 0: none. A seed
+// inside a quarter Q of half H (P.Super) is compared with Q, when Q's size is known: X ⊂ Q
+// keeps |X| >= |Q| >= |H|, so the search can meet |Q| but never pass it to |H|. Otherwise
+// with H.
 inline unsigned long Same_Target_Of(const Mm_Lane& L, const Mm_Step& P) {
     if (!Use_Same || !P.Half) return 0;
-    return P.Half == 1 ? L.LH_Count : L.RH_Count;
+    const unsigned long* C = L.Same_Count[L.Strand];
+    return P.Super && C[P.Super + 1] ? C[P.Super + 1] : C[P.Half - 1];
+}
+
+// A search of a whole quarter (P.Records) has finished: its exact size for Same_Count. If
+// Same_Count stopped it on the half's size, the quarter, between that prefix and the half,
+// has that size too; otherwise 0 when it did not match.
+inline void Mm_Quarter_Done(Mm_Lane& L, const Mm_Step& P) {
+    if (P.Records) L.Same_Count[L.Strand][P.Records + 1] = L.Found ? Range_Count(L.Cur) : L.Same_Hit;
 }
 
 // An exact search of half P.Seg has finished (L.Found, L.Cur): its size for Same_Count.
 inline void Mm_Half_Done(Mm_Lane& L, const Mm_Step& P) {
-    if (P.Seg == SEG_LH) L.LH_Count = L.Found ? Range_Count(L.Cur) : 0;
-    else if (P.Seg == SEG_RH) L.RH_Count = L.Found ? Range_Count(L.Cur) : 0;
+    if (P.Seg == SEG_LH || P.Seg == SEG_RH) L.Same_Count[L.Strand][P.Seg == SEG_RH] = L.Found ? Range_Count(L.Cur) : 0;
 }
 
 // The top of an exact search's loop: a wide range steps both ends, a single row walks.
@@ -1706,11 +1740,15 @@ inline bool Mm_Search_Step(Mm_Lane& L) {
         case MM_WIDE:
             Get_SARange(Mm_Base(L, T.Level), T, L.Fmi);
             if (!T.Start) return Mm_Search_End(L, false);
-            if (L.Same_Target && T.End - T.Start + 1 == L.Same_Target) {  // as rare as the half: no hit
+            if (L.Same_Target && T.End - T.Start + 1 == L.Same_Target) {  // as rare as the half or quarter: no hit
 #ifdef BATMAN_BATCH_STATS
                 Batch_Stats.Same_Stopped++;
                 Batch_Stats.Same_Depth += T.Level;
 #endif
+#ifdef BATMAN_BATCH_STATS
+                Batch_Stats.Quarter_Stopped += L.Same_By_Quarter;
+#endif
+                L.Same_Hit = L.Same_Target;
                 return Mm_Search_End(L, false);
             }
             if (T.Level == L.Ck_Next) Walk_Capture(L, T);
@@ -1917,6 +1955,7 @@ inline bool Mm_Extend_Step(Mm_Lane& L) {
 
 inline void Mm_Start_Search(Mm_Lane& L, bool Right, std::string_view Tag, int Offset, const SARange& R, ActiveBWT* Fmi) {
     L.Same_Target = 0;
+    L.Same_Hit = 0;
     L.Task = TASK_SEARCH;
     L.Right = Right;
     L.Tag = Tag;
@@ -2177,6 +2216,8 @@ inline void Mm_Search_Failed(Mm_Lane& L, const Mm_Step& P, int Depth) {
 inline void Mm_Keep_Rest(Mm_Lane& L, const Mm_Step& P, std::string_view Seg, int Offset, int Stop) {
     L.Stored[P.Stored - 1] = L.Cur;
     L.Stored_Valid[P.Stored - 1] = true;
+    if (P.Seg == SEG_LH || P.Seg == SEG_RH)  // the half's outer quarter, for Same_Count
+        L.Same_Count[L.Strand][(P.Seg == SEG_LH ? LQ_OUT : RQ_OUT) + 1] = Range_Count(L.Cur);
     L.Keeping = false;
     SARange R = L.Cur;
     const bool Located = Use_Ref && R.Skip;
@@ -2201,12 +2242,17 @@ void Mm_Run(Mm_Lane& L, unsigned MaxHits) {
                     L.InTask = false;
                     if (!L.Found) Mm_Search_Failed(L, P, L.Cur.Level);
                     Mm_Half_Done(L, P);
+                    Mm_Quarter_Done(L, P);
                     Walk_Done(L);
                     L.PC++;
                     continue;
                 }
                 Walk_Reset(L, P);
+                L.Same_Hit = 0;
                 const unsigned long Same = Same_Target_Of(L, P);
+#ifdef BATMAN_BATCH_STATS
+                L.Same_By_Quarter = Same && Same != L.Same_Count[L.Strand][P.Half - 1];
+#endif
                 if (P.Win && !Windows_Possible(Window_Set(P.Win, static_cast<int>(L.All.size()), L.LH_Fail, L.RH_Fail))) {
 #ifdef BATMAN_BATCH_STATS
                     Batch_Stats.Skipped[L.PC]++;
@@ -2217,9 +2263,12 @@ void Mm_Run(Mm_Lane& L, unsigned MaxHits) {
                 }
                 // A seed served, or from the lookup table, as rare as the half: no hit (Same_Count).
                 auto Same_Served = [&]() {
+                    Mm_Quarter_Done(L, P);
                     if (!Same || !L.Found || Range_Count(L.Cur) != Same) return;
                     L.Found = false;
+                    L.Same_Hit = Same;
 #ifdef BATMAN_BATCH_STATS
+                    Batch_Stats.Quarter_Served += L.Same_By_Quarter;
                     Batch_Stats.Same_Served++;
 #endif
                 };
@@ -2517,7 +2566,6 @@ void Batch_Search(const char* Reads, unsigned Count, int Len, unsigned B, unsign
         L.ReadHits = 0;
         L.LH_Fail = Len;
         L.RH_Fail = 0;
-        L.LH_Count = L.RH_Count = 0;
         L.Stored_Valid[0] = L.Stored_Valid[1] = false;
         if (Use_Ref) Pack_Read(L.All, L.Packed);
     };
@@ -2546,6 +2594,7 @@ void Batch_Search(const char* Reads, unsigned Count, int Len, unsigned B, unsign
             L.Ck_N = L.Ck_I = 0;
             L.Ck_Next = 0;
             std::memset(L.Walk_St, 0, sizeof L.Walk_St);
+            std::memset(L.Same_Count, 0, sizeof L.Same_Count);
             Mm_Run(L, MaxHits);
             if (!L.Done_Read) return true;
             Finish(L);
@@ -4190,7 +4239,8 @@ int main(int argc, char** argv) {
             std::cerr << "same_count: served=" << double(Batch_Stats.Same_Served) / records
                       << " stopped=" << double(Batch_Stats.Same_Stopped) / records << " depth="
                       << (Batch_Stats.Same_Stopped ? double(Batch_Stats.Same_Depth) / Batch_Stats.Same_Stopped : 0.0)
-                      << " (per record)\n";
+                      << " by_quarter: served=" << double(Batch_Stats.Quarter_Served) / records
+                      << " stopped=" << double(Batch_Stats.Quarter_Stopped) / records << " (per record)\n";
             std::cerr << "known: tries=" << double(Batch_Stats.Known_Tries) / records
                       << " found=" << double(Batch_Stats.Known_Found) / records
                       << " checks=" << double(Batch_Stats.Known_Checks) / records
