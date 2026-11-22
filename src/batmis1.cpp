@@ -16,6 +16,7 @@
 #include <fstream>
 #include <iostream>
 #include <iomanip>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -55,6 +56,7 @@ constexpr int BRANCHTHRESHOLD = BATMAN_BRANCHTHRESHOLD;
 constexpr int BRANCHTHRESHOLD = 128;
 #endif
 constexpr unsigned char NO_BASE = 4;
+constexpr unsigned char NO_ANCHOR = 0xFF;  // SARange::Anchor unknown (or past 254)
 
 // An SA range during the search. Level-1 bases of the current segment (lh, rh or
 // the whole read) are accounted for, with Mismatches mismatches at Mismatch_Pos
@@ -72,6 +74,10 @@ struct SARange {
     char Mismatches;
     unsigned char Skip;          // nonzero: single row; with the reference, located (Pos valid)
     unsigned char Forbidden_Base = NO_BASE;  // threshold reject: base already tried at Level
+    // The read position where the path's string starts (Right: its first base; else one
+    // past its last), so that it spans [Anchor, matched end) or [matched start, Anchor).
+    // Set where a search or switch starts; NO_ANCHOR: unknown (no Known_Find).
+    unsigned char Anchor = NO_ANCHOR;
     int Stage;                   // a reported mismatch hit: its stage (Result_List, Hit_Stage)
     unsigned char Mismatch_Pos[MAX_MISMATCHES_BOUND];
     unsigned Mismatch_Char;
@@ -178,6 +184,10 @@ thread_local SARange Branch_Ranges[4];
 
 // Reference for located singletons (see Locate). Off with --no-ref.
 bool Use_Ref = false;
+// Known positions (Known_Find) for single-row paths, with the reference: --known. Off by
+// default: it pays only where single rows walk far to a sampled row (benchmark/known_positions.md).
+bool Use_Known = false;
+int Known_Limit = MAX_MISMATCH_SEARCH;  // -n: a position kept has at most this many mismatches
 // Without the reference, but with the SA samples loaded (SAM/BAM output): a single-row
 // path records its genome position in Pos at the first sampled row (Mark_Sampled).
 bool Track_Pos = false;
@@ -817,6 +827,7 @@ inline bool Windows_Hold(const SARange& T, const Mm_Windows& W, int A, int B) {
 // Branch_Detect's globals are written and read within one step.
 // See benchmark/batched_reads.md.
 constexpr unsigned MAX_BATCH = 64;
+constexpr unsigned KNOWN_MAX = 8;  // known positions kept per read strand (Known_Table)
 
 enum Mm_Sub : unsigned char { MM_POP, MM_WIDE, MM_SINGLE, MM_LOCATE, MM_LOCATED, MM_SWITCH };
 // A lane's task: an exact search, a depth-first extension (Count mismatches, deferring
@@ -1212,7 +1223,12 @@ struct Batch_Stats_Counts {
     unsigned long Rounds = 0, Lane_Rounds = 0, Drain_Rounds = 0, Lanes = 0;
     unsigned long Steps[MM_PROGRAM_MAX][4][6] = {};  // [program step][task][sub]
     unsigned long Skipped[MM_PROGRAM_MAX] = {};      // searches skipped by their windows
+    unsigned long Known_Tries = 0, Known_Found = 0, Known_Checks = 0, Known_Adds = 0;  // Known_Find, Known_Add
     void Add(const Batch_Stats_Counts& O) {
+        Known_Tries += O.Known_Tries;
+        Known_Found += O.Known_Found;
+        Known_Checks += O.Known_Checks;
+        Known_Adds += O.Known_Adds;
         Rounds += O.Rounds;
         Lane_Rounds += O.Lane_Rounds;
         Drain_Rounds += O.Drain_Rounds;
@@ -1239,6 +1255,14 @@ struct Mm_Strand {
     bool Stored_Valid[2];
     std::size_t Tagged;
     uint64_t Packed[MAXTAG / 32 + 1];
+};
+
+// Known positions of a read, by strand (indexed by the lane's Strand, not swapped): read
+// starts that a Locate accepted. Kept apart from Mm_Lane, whose layout the walk's speed
+// depends on.
+struct Known_Table {
+    unsigned char N[2];
+    unsigned long Pos[2][KNOWN_MAX];
 };
 
 struct Mm_Lane {
@@ -1281,6 +1305,9 @@ struct Mm_Lane {
     bool Two_Strands;
     unsigned char Strand;
     Mm_Strand Other;
+    std::unique_ptr<Known_Table> Known;  // the read's known positions (Known_Find)
+    unsigned char Known_Here;            // Known->N[Strand]: the test before each lookup
+    bool Known_Pending;                  // MM_LOCATE located Cur: Known_Add it at MM_LOCATED
 };
 
 // Makes strand S the lane's active one (between steps only): swaps the per-strand fields.
@@ -1299,6 +1326,7 @@ inline void Mm_Set_Strand(Mm_Lane& L, unsigned S) {
     std::swap(L.Tagged, O.Tagged);
     if (Use_Ref) std::swap_ranges(L.Packed, L.Packed + Words, O.Packed);
     L.Strand = static_cast<unsigned char>(S);
+    L.Known_Here = L.Known->N[S];
 }
 
 // The read base at Level and its read position, for the task's direction.
@@ -1307,6 +1335,101 @@ inline unsigned Mm_Base(const Mm_Lane& L, int Level) {
 }
 inline int Mm_Read_Pos(const Mm_Lane& L, int Level) {
     return L.Right ? L.Offset + Level - 1 : L.Offset + static_cast<int>(L.Tag.size()) - Level;
+}
+
+// Known positions. A single-row path's string occurs once in the genome; if the read, with
+// the path's own mismatches and no others, matches the genome over that string's interval
+// at a position already located for this read strand, that one occurrence is there. The
+// path is then located at that position without walking to a sampled row: the compare
+// that follows (MM_LOCATED) gives the same failure depth, mismatches and hit as the walk.
+
+// Anchor of a search or switch of read[Offset, Offset + Len) (SARange::Anchor).
+inline unsigned char Known_Anchor(bool Right, int Offset, int Len) {
+    const int A = Right ? Offset : Offset + Len;
+    return A < NO_ANCHOR ? static_cast<unsigned char>(A) : NO_ANCHOR;
+}
+
+// A Locate accepted Pos: keep it, unless known, the table is full, or the read has more
+// mismatches there than -n allows. Such a position can give no hit, and most of them are
+// where a seed of a read that maps elsewhere (or nowhere) happens to occur: looking them up
+// would only read the genome there again.
+[[gnu::noinline]] void Known_Add_Slow(Mm_Lane& L, unsigned long Pos, int Done) {
+    Known_Table& K = *L.Known;
+    unsigned char& N = K.N[L.Strand];
+    for (unsigned e = 0; e < N; e++)
+        if (K.Pos[L.Strand][e] == Pos) return;
+    if (N == KNOWN_MAX) return;
+#ifdef BATMAN_BATCH_STATS
+    Batch_Stats.Known_Checks++;
+#endif
+    // From the word the task's compare reads first (the read position after the Done bases
+    // matched), which most of the positions that fail need alone, and which that compare
+    // then finds in cache.
+    const int Len = static_cast<int>(L.All.size()), Words = (Len + 31) / 32;
+    const int First = L.Right ? L.Offset + Done : L.Offset + static_cast<int>(L.Tag.size()) - Done - 1;
+    int D = 0;
+    for (int i = 0, W = std::min(std::max(First, 0) / 32, Words - 1); i < Words && D <= Known_Limit; i++, W = W + 1 == Words ? 0 : W + 1)
+        D += __builtin_popcountll(Mismatch_Bits(Genome_Word(Pos + W * 32), W, 0, std::min(Len - W * 32, 32), L.Packed));
+    if (D > Known_Limit) return;
+    K.Pos[L.Strand][N++] = Pos;
+    L.Known_Here = N;
+#ifdef BATMAN_BATCH_STATS
+    Batch_Stats.Known_Adds++;
+#endif
+}
+
+// T, a single-row path not yet located, its task's first Level - 1 bases matched: if it lies
+// at a known position (see above), locates it there (Pos, Skip, End = Start) and returns true.
+// The genome is read here, not kept with the position: at the read's true position its words
+// are in cache.
+[[gnu::noinline]] bool Known_Find_Slow(Mm_Lane& L, SARange& T) {
+    const Known_Table& K = *L.Known;
+    const unsigned N = K.N[L.Strand];
+#ifdef BATMAN_BATCH_STATS
+    Batch_Stats.Known_Tries++;
+#endif
+    const int Done = T.Level - 1;
+    const int A = L.Right ? T.Anchor : L.Offset + static_cast<int>(L.Tag.size()) - Done;
+    const int B = L.Right ? L.Offset + Done : T.Anchor;
+    if (A >= B || A < 0 || B > static_cast<int>(L.All.size())) return false;
+    for (unsigned e = 0; e < N; e++) {
+        const unsigned long Pos = K.Pos[L.Strand][e];
+        unsigned D = 0;
+        for (int W = A / 32; W * 32 < B && D <= static_cast<unsigned>(T.Mismatches); W++)
+            D += __builtin_popcountll(Mismatch_Bits(Genome_Word(Pos + W * 32), W, std::max(A - W * 32, 0), std::min(B - W * 32, 32), L.Packed));
+        if (D != static_cast<unsigned>(T.Mismatches)) continue;
+        bool Same = true;
+        for (int i = 0; i < T.Mismatches && Same; i++) {
+            const int x = T.Mismatch_Pos[i];
+            const unsigned g = (Genome_Word(Pos + x) >> 62) & 3;  // the genome's base at x
+            Same = x >= A && x < B && g != ((L.Packed[x / 32] >> (62 - 2 * (x % 32))) & 3) &&
+                   g == ((T.Mismatch_Char >> (2 * i)) & 3);
+        }
+        if (!Same) continue;
+        T.Pos = Pos;
+        T.Skip = 1;
+        T.End = T.Start;
+#ifdef BATMAN_BATCH_STATS
+        Batch_Stats.Known_Found++;
+#endif
+        return true;
+    }
+    return false;
+}
+
+// Out of line, so that the walk's loops keep their code as before; most calls end at the test.
+inline void Known_Add(Mm_Lane& L, unsigned long Pos, int Done) {
+    if (Use_Known) Known_Add_Slow(L, Pos, Done);
+}
+// At MM_LOCATED, whose genome words Mm_Prefetch has fetched: keeps a position MM_LOCATE
+// has just located (not one Known_Find gave, nor a tag located before).
+inline void Known_Located(Mm_Lane& L, const SARange& T, int Done) {
+    if (!L.Known_Pending) return;
+    L.Known_Pending = false;
+    Known_Add(L, T.Pos, Done);
+}
+inline bool Known_Find(Mm_Lane& L, SARange& T) {
+    return L.Known_Here && T.Anchor != NO_ANCHOR && Known_Find_Slow(L, T);
 }
 
 // Shared walks (Mm_Builder::Share_Walks). Point I of the running walk: state St, and T
@@ -1389,6 +1512,11 @@ inline void Mm_Search_Enter(Mm_Lane& L) {
         return;
     }
     L.Sub = MM_SINGLE;
+    if (Use_Ref && !T.Skip && Known_Find(L, T)) {  // at a known position: as a located row
+        L.Done = T.Level - 1;
+        L.Sub = MM_LOCATED;
+        return;
+    }
     if (Sampled(T.Start) && !T.Skip) {
         if (Use_Ref) {
             L.Done = T.Level - 1;
@@ -1453,9 +1581,11 @@ inline bool Mm_Search_Step(Mm_Lane& L) {
                 T.Level = Len;  // as Search_Located
                 return Mm_Search_End(L, false);
             }
+            L.Known_Pending = true;
             L.Sub = MM_LOCATED;
             return false;
         case MM_LOCATED:
+            Known_Located(L, T, L.Done);
             if (!Located_Matches(T, L.Right, L.Offset, Len, L.Done, L.Packed)) {
                 if (L.Ck_I < L.Ck_N) Walk_Settle(L, T, Len, T.Level);
                 return Mm_Search_End(L, false);
@@ -1479,7 +1609,7 @@ inline bool Mm_Single_Done(Mm_Lane& L) {
 inline bool Mm_Single_Enter(Mm_Lane& L) {
     SARange& T = L.Cur;
     if (T.Start == 0) return Mm_Single_Done(L);
-    if (Use_Ref && T.Skip) {
+    if (Use_Ref && (T.Skip || Known_Find(L, T))) {
         L.Sub = MM_LOCATED;
         return false;
     }
@@ -1599,9 +1729,11 @@ inline bool Mm_Extend_Step(Mm_Lane& L) {
         }
         case MM_LOCATE:
             if (!Locate(L.Fmi, L.Cur, L.Right, L.Offset, Len, L.Cur.Level - 1)) return Mm_Single_Done(L);
+            L.Known_Pending = true;
             L.Sub = MM_LOCATED;
             return false;
         case MM_LOCATED:
+            Known_Located(L, L.Cur, L.Cur.Level - 1);
             Extend_Located(L.Cur, L.Right, L.Offset, Len, L.Count, Out, L.Packed);
             return Mm_Single_Done(L);
         default:
@@ -1616,6 +1748,7 @@ inline void Mm_Start_Search(Mm_Lane& L, bool Right, std::string_view Tag, int Of
     L.Offset = Offset;
     L.Fmi = Fmi;
     L.Cur = R;
+    L.Cur.Anchor = Known_Anchor(Right, Offset, static_cast<int>(Tag.size()));
     L.Found = false;
     Mm_Search_Enter(L);
 }
@@ -1734,9 +1867,11 @@ inline bool Mm_Window_Step(Mm_Lane& L) {
         }
         case MM_LOCATE:
             if (!Locate(L.Fmi, L.Cur, L.Right, L.Offset, Len, L.Cur.Level - 1)) return Mm_Single_Done(L);
+            L.Known_Pending = true;
             L.Sub = MM_LOCATED;
             return false;
         case MM_LOCATED: {
+            Known_Located(L, L.Cur, L.Cur.Level - 1);
             SARange Hit = L.Cur;
             const int Done = Hit.Level - 1;
             if (L.Right) Record_Mismatches(Hit, true, L.Offset + Done, L.Offset + Len, L.Packed);
@@ -1773,6 +1908,7 @@ inline void Mm_Start_Switch(Mm_Lane& L, const SARange& Seed, unsigned Seg, bool 
     L.Offset = Offset;
     L.Width = Seed.Skip ? 1 : Seed.End - Seed.Start + 1;
     L.Cur = Segment_Start(L.Tag, Right);
+    L.Cur.Anchor = Known_Anchor(Right, Offset, static_cast<int>(S.size()));
     L.Cur.Mismatches = Seed.Mismatches;
     L.Cur.Mismatch_Char = Seed.Mismatch_Char;
     std::memcpy(L.Cur.Mismatch_Pos, Seed.Mismatch_Pos, sizeof L.Cur.Mismatch_Pos);
@@ -2146,6 +2282,10 @@ void Batch_Search(const char* Reads, unsigned Count, int Len, unsigned B, unsign
     auto Fill = [&](Mm_Lane& L) {
         while (Next < Last) {
             const unsigned I = Next++;
+            if (!L.Known) L.Known = std::make_unique<Known_Table>();
+            L.Known->N[0] = L.Known->N[1] = 0;
+            L.Known_Here = 0;
+            L.Known_Pending = false;
             L.Two_Strands = false;
             L.Strand = 0;
             if (Two_Strands) {  // the reverse complement first, then swapped out
@@ -3528,6 +3668,9 @@ void Usage(const char* prog) {
         "  -m  maximum hits per read (default 1, 0 = all)\n"
         "  --no-ref  do not load the SA samples (.sa) and packed genome (.pac); single-row\n"
         "            paths then walk the index to the end (less memory, slower)\n"
+        "  --known   locate single-row paths at the read's positions already located,\n"
+        "            instead of walking them to a sampled row; same output. Faster only on\n"
+        "            indexes whose SA samples are sparse (benchmark/known_positions.md)\n"
         "  --no-mmap  read the SA samples and packed genome into memory instead of mapping\n"
         "            them (mapping shares the page cache and loads faster)\n"
         "  --sam, --bam  write SAM / BAM (htslib; also chosen by an -o ending .sam / .bam;\n"
@@ -3616,6 +3759,8 @@ int main(int argc, char** argv) {
             }
         } else if (std::strcmp(argv[i], "--no-ref") == 0) {
             useRef = false;
+        } else if (std::strcmp(argv[i], "--known") == 0) {
+            Use_Known = true;
         } else if (std::strcmp(argv[i], "--no-mmap") == 0) {
             Use_Mmap = false;
         } else if (std::strcmp(argv[i], "--sam") == 0) {
@@ -3713,6 +3858,7 @@ int main(int argc, char** argv) {
         }
     }
     Use_Ref = useRef;
+    Known_Limit = maxMismatches;
     Track_Pos = samFormat && !useRef && samplingOk;
     Text_Length = revfmi->textLength;
 
@@ -3784,6 +3930,10 @@ int main(int argc, char** argv) {
                       << " occupancy=" << double(Batch_Stats.Lane_Rounds) / Batch_Stats.Rounds << "/" << Batch_Stats.Lanes
                       << " drain_rounds=" << Batch_Stats.Drain_Rounds << " steps_per_record="
                       << double(Batch_Stats.Lane_Rounds) / records << '\n';
+            std::cerr << "known: tries=" << double(Batch_Stats.Known_Tries) / records
+                      << " found=" << double(Batch_Stats.Known_Found) / records
+                      << " checks=" << double(Batch_Stats.Known_Checks) / records
+                      << " adds=" << double(Batch_Stats.Known_Adds) / records << " (per record)\n";
             for (unsigned p = 0; p < MM_PROGRAM_MAX; p++) {
                 std::cerr << "  program step " << p << ":";
                 for (int e = 0; e < 4; e++)
