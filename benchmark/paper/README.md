@@ -97,6 +97,15 @@ Run by hand, `bench.py` needs `BENCH_WORK` set as for the jobs; `BENCH_RESULTS` 
 collect`, then `report.py <results>`. `bench.py list --set ...` shows the matrix and what is
 done; `bench.py run --set ... --dry-run` prints the commands.
 
+While jobs run: `bench.py status --set ...` gives done/timeout/error counts per tool, the newest
+finished run, and the runs in progress with the age of their phase (one over its time limit is a
+hung process, or was left by a job that stopped). A run writes `run.json` only when it finishes,
+so a job can be cancelled and resubmitted with the same `SELECT`: only the run in progress is
+redone. Never run two jobs whose `SELECT`s overlap; they delete each other's run directories.
+`sbatch interim.sbatch` writes an interim report from the finished runs into
+`interim_<date>/` beside the work directory (`SELECT` limits its scoring, default the small
+genomes); `bench.py collect` plus `report.py` by hand does the same without the scoring.
+
 Run behaviour:
 - Each run is one directory under `<work>/runs/<kind>/<read set>/<tool>/k<K>/<mode>/t<threads>/r<rep>`
   with `run.json`; existing runs are skipped, so jobs can be resubmitted after a time limit.

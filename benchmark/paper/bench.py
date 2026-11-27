@@ -9,6 +9,8 @@
                                                   calibrated genomes, and size their timing runs
   bench.py [-c ...] estimate                      node time of the sized runs still to do
   bench.py [-c ...] list [filters]                the runs of the matrix, and which are done
+  bench.py [-c ...] status [filters]              done/timeout/error per tool, the newest finished
+                                                  run, and the runs in progress with their age
   bench.py [-c ...] run [filters] [--dry-run]     run the matrix's missing runs, in order
   bench.py [-c ...] truth [--datasets d,..]       brute-force hits of the correctness sets
   bench.py [-c ...] correct [filters]             score the correctness runs
@@ -393,14 +395,22 @@ def done(cfg, r):
     return os.path.exists(os.path.join(run_dir(cfg, r), "run.json"))
 
 
+def time_limit(cfg, r):
+    """The run's time limit: time_limit_s, or the genome's entry in time_limit_s_genome."""
+    return (cfg.get("time_limit_s_genome") or {}).get(r["genome"], cfg["time_limit_s"])
+
+
 def blocked(cfg, r):
-    """A reason not to run r: a smaller K of the same series timed out, or its warm-up ran
-    longer than single_repeat_above_s (then one timed repeat is enough)."""
-    if r["rep"] >= 2:
+    """A reason not to run r: a smaller K of the same series timed out, its warm-up timed out
+    (a timed repeat would only time out again), or its warm-up ran longer than
+    single_repeat_above_s (then one timed repeat is enough)."""
+    if r["rep"] >= 1:
         warm = os.path.join(wpath(cfg, "runs", r["id"].rsplit("/r", 1)[0] + "/r0"), "run.json")
         if os.path.exists(warm):
             w = json.load(open(warm))
-            if w.get("wall_s", 0) > cfg.get("single_repeat_above_s", 1800):
+            if w.get("status") == "timeout":
+                return "warm-up timed out"
+            if r["rep"] >= 2 and w.get("wall_s", 0) > cfg.get("single_repeat_above_s", 1800):
                 return "long run: one timed repeat"
     if r["k"] > 0:
         for k in range(r["k"]):
@@ -534,7 +544,7 @@ def estimate_matrix(cfg, gens):
         if t is None or reads is None:
             continue
         speed = r["threads"] if T.THREADED.get(r["tool"], True) else 1
-        est = min(cfg["time_limit_s"], startup_seconds(cfg, r["genome"], r["tool"]) + t * reads / speed)
+        est = min(time_limit(cfg, r), startup_seconds(cfg, r["genome"], r["tool"]) + t * reads / speed)
         total += est
         n += 1
         key = f"{r['kind']} {r['mode']} t{r['threads']}"
@@ -625,7 +635,7 @@ def execute(cfg, r, dry_run=False):
     if od != d:  # a stale local directory from an interrupted run
         shutil.rmtree(od, ignore_errors=True)
         os.makedirs(od)
-    res = run_phases(phases, d, cfg["time_limit_s"])
+    res = run_phases(phases, d, time_limit(cfg, r))
     status = "ok" if all(p["status"] == "ok" for p in res) and len(res) == len(phases) else \
         ("timeout" if any(p["status"] == "timeout" for p in res) else "error")
     rec = dict(r, status=status, reads_file=reads, phases=res,
@@ -678,6 +688,48 @@ def cmd_list(cfg, a):
             n = f"  [{p} reads]" if p else "  [not calibrated]"
         print(("done " if done(cfg, r) else "     ") + r["id"] + n)
     print(f"{len(runs)} runs, {n_done} done", file=sys.stderr)
+
+
+def ago(s):
+    s = int(s)
+    return f"{s // 86400}d {s % 86400 // 3600}h" if s >= 86400 else f"{s // 3600}h {s % 3600 // 60}m"
+
+
+def cmd_status(cfg, a):
+    """Progress of the selected runs, read-only: done, timeouts, errors and skips per tool; the
+    newest finished run; and the runs in progress (phase files but no run.json) with the age
+    of their current phase. A run in progress longer than its time limit has a process the
+    timeout could not kill, or was left by a job that is no longer running (it is redone)."""
+    now, tools, newest, active = time.time(), {}, None, []
+    for r in select(matrix(cfg), a):
+        t = tools.setdefault(r["tool"], dict(runs=0, done=0, ok=0, timeout=0, error=0, skipped=0))
+        t["runs"] += 1
+        d = run_dir(cfg, r)
+        rp = os.path.join(d, "run.json")
+        if os.path.exists(rp):
+            t["done"] += 1
+            st = json.load(open(rp)).get("status", "error")
+            t[st if st in t else "error"] += 1
+            m = os.path.getmtime(rp)
+            if newest is None or m > newest[0]:
+                newest = (m, st, r["id"])
+        else:
+            if glob.glob(os.path.join(d, "*.stderr")):
+                started = os.path.getmtime(d)  # the last file created there: the current phase's start
+                last = max(os.path.getmtime(p) for p in glob.glob(os.path.join(d, "*")))
+                active.append((now - started, now - last, time_limit(cfg, r), r["id"]))
+    tot = {k: sum(t[k] for t in tools.values()) for k in ("runs", "done", "ok", "timeout", "error", "skipped")}
+    print(f"{'tool':16s} {'runs':>6s} {'done':>6s} {'ok':>6s} {'timeout':>7s} {'error':>6s} {'skipped':>7s}")
+    for name, t in sorted(tools.items()) + [("all", tot)]:
+        print(f"{name:16s} {t['runs']:6d} {t['done']:6d} {t['ok']:6d} {t['timeout']:7d} {t['error']:6d} {t['skipped']:7d}")
+    if newest:
+        print(f"newest finished: {time.strftime('%Y-%m-%d %H:%M', time.localtime(newest[0]))} "
+              f"({ago(now - newest[0])} ago) {newest[1]} {newest[2]}")
+    for age, quiet, limit, rid in sorted(active):
+        print(f"in progress: {rid}  phase started {ago(age)} ago, last write {ago(quiet)} ago"
+              + (f"  OVER THE {ago(limit)} LIMIT, a hung process, or left by a stopped job" if age > limit + 600 else ""))
+    if not active:
+        print("in progress: none (no job is running these runs)")
 
 
 def cmd_run(cfg, a):
@@ -864,7 +916,7 @@ def main():
     p = sub.add_parser("index"); p.add_argument("--genomes"); p.add_argument("--indexes")
     sub.add_parser("calibrate")
     sub.add_parser("estimate")
-    for name in ("list", "run", "correct", "discrepancies"):
+    for name in ("list", "status", "run", "correct", "discrepancies"):
         p = sub.add_parser(name); p.add_argument("--set")
         if name == "run":
             p.add_argument("--dry-run", action="store_true")

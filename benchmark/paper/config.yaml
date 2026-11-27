@@ -9,6 +9,9 @@ threads: [1, 16]                     # main tables
 scaling_threads: [1, 2, 4, 8, 16, 32]
 repeats: 3                           # timed repeats after one warm-up run
 time_limit_s: 21600                  # a run over this is recorded as TIMEOUT; larger K of the series are skipped
+# Optional per-genome limits (seconds), e.g. for the small genomes, where an hour-long run is
+# a pathology rather than a timing:
+# time_limit_s_genome: {sarscov2: 3600, ecoli: 3600}
 index_time_limit_s: 86400
 single_repeat_above_s: 1800          # a warm-up longer than this: one timed repeat instead of `repeats`
 single_thread_reads: 1000000         # 1-thread runs on real data use the first this many reads

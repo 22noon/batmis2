@@ -227,7 +227,13 @@ for (dataset, k, mode), rs in sorted(scal.items()):
 
 # ---------------------------------------------------------------- tables
 lines = ["# Paper benchmark results", ""]
-man = os.path.join(OUT, "manifest.json")
+# An interim report: fewer run records than runs in the matrix (collect.py's matrix_ids.txt).
+_ids = os.path.join(OUT, "matrix_ids.txt")
+if os.path.exists(_ids):
+    _m, _n = len(open(_ids).read().split()), len(read_tsv("runs.tsv"))
+    if _n < _m:
+        lines += [f"**Interim:** {_n:,} of {_m:,} runs done; missing runs leave cells and lines empty.", ""]
+man =os.path.join(OUT, "manifest.json")
 if os.path.exists(man):
     m = json.load(open(man))
     lines += [f"Machine: {m['cpu']}, {m['cores']} CPUs, {m['memory']}; {m['compiler']}; flags `{m['opt_flags']}`.", "",
